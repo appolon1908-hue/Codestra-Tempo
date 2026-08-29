@@ -135,12 +135,9 @@ storage:
       insecure: ${TEMPO_S3_INSECURE:-false}
     wal:
       path: /var/lib/tempo/wal
-      v2_encoding: snappy
     block:
       version: vParquet4
       bloom_filter_false_positive: 0.01
-      index_downsample_bytes: 1000
-      encoding: zstd
 
 cache:
   caches:
