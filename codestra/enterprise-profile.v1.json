@@ -38,7 +38,8 @@
     "backend": "s3_compatible",
     "blockVersion": "vParquet4",
     "wal": true,
-    "compression": "zstd",
+    "formatTuningAuthority": "locked_tempo_source",
+    "deprecatedStorageKnobsAllowed": false,
     "credentialsFromRuntimeSecretFile": true,
     "tlsVerificationRequired": true
   },
