@@ -1,0 +1,101 @@
+{
+  local k = import 'ksonnet-util/kausal.libsonnet',
+
+  local container = k.core.v1.container,
+  local containerPort = k.core.v1.containerPort,
+  local volumeMount = k.core.v1.volumeMount,
+  local statefulset = k.apps.v1.statefulSet,
+  local volume = k.core.v1.volume,
+  local envVar = k.core.v1.envVar,
+  local configMap = k.core.v1.configMap,
+
+  local target_name = 'block-builder',
+  local tempo_config_volume = 'tempo-conf',
+  local tempo_data_volume = 'block-builder-data',
+  local tempo_overrides_config_volume = 'overrides',
+
+  // Statefulset
+
+  tempo_block_builder_ports:: [containerPort.new('prom-metrics', $._config.port)],
+
+  tempo_block_builder_args:: {
+    target: target_name,
+    'config.file': '/conf/tempo.yaml',
+  },
+
+  // Block-builder mirrors live-store zone-a replica count. This intentionally lags
+  // behind the ReplicaTemplate: the rollout-operator enforces the drain window before
+  // reducing zone-a, so block-builder stays alive while live-store data is still present.
+  tempo_block_builder_follow_controller:: $.tempo_live_store_zone_a_statefulset,
+
+  tempo_block_builder_container::
+    container.new(target_name, $._images.tempo_block_builder) +
+    container.withPorts($.tempo_block_builder_ports) +
+    container.withArgs($.util.mapToFlags($.tempo_block_builder_args)) +
+    container.withVolumeMounts([
+      volumeMount.new(tempo_config_volume, '/conf'),
+      volumeMount.new(tempo_data_volume, '/var/tempo'),
+      volumeMount.new(tempo_overrides_config_volume, '/overrides'),
+    ]) +
+    $.util.withResources($._config.block_builder.resources) +
+    (if $._config.variables_expansion then container.withEnvMixin($._config.variables_expansion_env_mixin) else {}) +
+    $.util.readinessProbe +
+    (if $._config.variables_expansion then container.withArgsMixin(['-config.expand-env=true']) else {}),
+
+  newBlockBuilderStatefulSet(concurrent_rollout_enabled=false, max_unavailable=1, terminationGracePeriod=60)::
+    statefulset.new(target_name, $._config.block_builder.replicas, $.tempo_block_builder_container, [], { app: target_name }) +
+    statefulset.mixin.spec.withServiceName(target_name) +
+    statefulset.spec.template.spec.securityContext.withFsGroup(10001) +  // 10001 is the UID of the tempo user
+    statefulset.mixin.spec.template.metadata.withAnnotations(
+      { config_hash: std.md5(std.toString($.tempo_block_builder_configmap.data['tempo.yaml'])) }
+    ) +
+    // The rollout-operator reads grafana.com/rollout-mirror-replicas-from-resource-* from the
+    // StatefulSet's own metadata.annotations, not the pod template. Keep these separate.
+    (
+      if $._config.block_builder.keda.enabled && $._config.block_builder.keda.scaling == 'rollout-operator' then
+        statefulset.mixin.metadata.withAnnotationsMixin({
+          'grafana.com/rollout-mirror-replicas-from-resource-name': $.tempo_block_builder_follow_controller.metadata.name,
+          'grafana.com/rollout-mirror-replicas-from-resource-kind': $.tempo_block_builder_follow_controller.kind,
+          'grafana.com/rollout-mirror-replicas-from-resource-api-version': $.tempo_block_builder_follow_controller.apiVersion,
+        })
+      else {}
+    ) +
+    statefulset.mixin.spec.template.spec.withVolumes([
+      volume.fromConfigMap(tempo_config_volume, $.tempo_block_builder_configmap.metadata.name),
+      volume.fromConfigMap(tempo_overrides_config_volume, $._config.overrides_configmap_name),
+      volume.fromEmptyDir(tempo_data_volume) + volume.mixin.emptyDir.withSizeLimit($._config.block_builder.data_volume_size),
+    ]) +
+    statefulset.mixin.spec.withPodManagementPolicy('Parallel') +
+    statefulset.mixin.spec.template.spec.withTerminationGracePeriodSeconds(terminationGracePeriod) +
+    statefulset.mixin.spec.template.metadata.withLabelsMixin({ [$._config.gossip_member_label]: 'true' }) +
+    (
+      if !concurrent_rollout_enabled then {} else
+        statefulset.mixin.spec.selector.withMatchLabels({ name: 'block-builder', 'rollout-group': 'block-builder' }) +
+        statefulset.mixin.spec.updateStrategy.withType('OnDelete') +
+        statefulset.mixin.metadata.withLabelsMixin({ 'rollout-group': 'block-builder' }) +
+        statefulset.mixin.metadata.withAnnotationsMixin({ 'rollout-max-unavailable': std.toString(max_unavailable) }) +
+        statefulset.mixin.spec.template.metadata.withLabelsMixin({ 'rollout-group': 'block-builder' })
+    ),
+
+  tempo_block_builder_statefulset:
+    $.newBlockBuilderStatefulSet($._config.block_builder_concurrent_rollout_enabled, $._config.block_builder_max_unavailable),
+
+  // Configmap
+
+  tempo_block_builder_configmap:
+    configMap.new('tempo-block-builder') +
+    configMap.withData({
+      'tempo.yaml': k.util.manifestYaml($.tempo_block_builder_config),
+    }),
+
+  // Service
+
+  tempo_block_builder_service:
+    k.util.serviceFor($.tempo_block_builder_statefulset, $._config.service_ignored_labels),
+
+  // Vertical Pod Autoscaler
+  tempo_block_builder_vpa: $.vpaForController($.tempo_block_builder_statefulset, 'block_builder'),
+
+  // Pod Disruption Budget
+  tempo_block_builder_pdb: $.pdbForController($.tempo_block_builder_statefulset, 'block_builder'),
+}

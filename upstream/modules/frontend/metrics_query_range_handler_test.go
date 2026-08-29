@@ -1,0 +1,1577 @@
+package frontend
+
+import (
+	"bytes"
+	"context"
+	"flag"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"sync"
+	"testing"
+	"testing/synctest"
+	"time"
+
+	"github.com/gogo/protobuf/jsonpb"
+	"github.com/gogo/protobuf/proto"
+	"github.com/gogo/status"
+	"github.com/grafana/dskit/user"
+	"github.com/grafana/tempo/modules/frontend/combiner"
+	"github.com/grafana/tempo/modules/frontend/pipeline"
+	"github.com/grafana/tempo/modules/overrides"
+	"github.com/grafana/tempo/pkg/api"
+	"github.com/grafana/tempo/pkg/cache"
+	"github.com/grafana/tempo/pkg/tempopb"
+	v1 "github.com/grafana/tempo/pkg/tempopb/common/v1"
+	"github.com/grafana/tempo/pkg/util/test"
+	"github.com/grafana/tempo/tempodb/backend"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/common/model"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/codes"
+)
+
+func TestQueryRangeHandlerSucceeds(t *testing.T) {
+	resp := &tempopb.QueryRangeResponse{
+		Metrics: &tempopb.SearchMetrics{
+			InspectedTraces: 1,
+			InspectedBytes:  1,
+		},
+		Series: []*tempopb.TimeSeries{
+			{
+				Labels: []v1.KeyValue{
+					{Key: "foo", Value: &v1.AnyValue{Value: &v1.AnyValue_StringValue{StringValue: "bar"}}},
+				},
+				Samples: []tempopb.Sample{
+					{
+						TimestampMs: 1200_000,
+						Value:       2,
+					},
+					{
+						TimestampMs: 1100_000,
+						Value:       1,
+					},
+				},
+			},
+		},
+	}
+
+	f := frontendWithSettings(t, &mockRoundTripper{
+		responseFn: func() proto.Message {
+			return resp
+		},
+	}, nil, nil, nil, func(c *Config, _ *overrides.Config) {
+		c.Metrics.Sharder.Interval = time.Hour
+	})
+
+	tenant := "foo"
+
+	httpReq := httptest.NewRequest("GET", api.PathMetricsQueryRange, nil)
+	httpReq = api.BuildQueryRangeRequest(httpReq, &tempopb.QueryRangeRequest{
+		Query: "{} | rate()",
+		Start: uint64(1100 * time.Second),
+		End:   uint64(1300 * time.Second),
+		Step:  uint64(100 * time.Second),
+	}, "")
+
+	ctx := user.InjectOrgID(httpReq.Context(), tenant)
+	httpReq = httpReq.WithContext(ctx)
+
+	httpResp := httptest.NewRecorder()
+
+	f.MetricsQueryRangeHandler.ServeHTTP(httpResp, httpReq)
+
+	require.Equal(t, 200, httpResp.Code)
+
+	expectedResp := &tempopb.QueryRangeResponse{
+		Metrics: &tempopb.SearchMetrics{
+			CompletedJobs:   4, // 2 blocks, each with 2 row groups that take 1 job
+			InspectedTraces: 4,
+			InspectedBytes:  4,
+			TotalJobs:       4,
+			TotalBlocks:     2,
+			TotalBlockBytes: 419430400,
+		},
+		Series: []*tempopb.TimeSeries{
+			{
+				Labels: []v1.KeyValue{
+					{Key: "foo", Value: &v1.AnyValue{Value: &v1.AnyValue_StringValue{StringValue: "bar"}}},
+				},
+				Samples: []tempopb.Sample{
+					{
+						TimestampMs: 1100_000,
+						Value:       4,
+					},
+					{
+						TimestampMs: 1200_000,
+						Value:       8,
+					},
+					{
+						TimestampMs: 1300_000,
+						Value:       0,
+					},
+				},
+			},
+		},
+	}
+
+	actualResp := &tempopb.QueryRangeResponse{}
+	err := jsonpb.Unmarshal(httpResp.Body, actualResp)
+	require.NoError(t, err)
+	require.Equal(t, expectedResp, actualResp)
+}
+
+func TestMetricsHandlersRejectOversizedQueryBeforeParsing(t *testing.T) {
+	f := frontendWithSettings(t, nil, nil, nil, nil, func(c *Config, _ *overrides.Config) {
+		c.MaxQueryExpressionSizeBytes = 10
+	})
+	query := oversizedTraceQLQuery()
+
+	t.Run("range http", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, api.PathMetricsQueryRange, nil)
+		req = api.BuildQueryRangeRequest(req, &tempopb.QueryRangeRequest{
+			Query: query,
+			Start: uint64(1100 * time.Second),
+			End:   uint64(1300 * time.Second),
+			Step:  uint64(100 * time.Second),
+		}, "")
+		req = req.WithContext(user.InjectOrgID(req.Context(), "tenant"))
+		resp := httptest.NewRecorder()
+
+		f.MetricsQueryRangeHandler.ServeHTTP(resp, req)
+
+		require.Equal(t, http.StatusBadRequest, resp.Code)
+		require.Contains(t, resp.Body.String(), "TraceQL expression exceeds the configured maximum size")
+		require.NotContains(t, resp.Body.String(), "parse error")
+	})
+
+	t.Run("range http rejects q when query alias is safe", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, api.PathMetricsQueryRange, nil)
+		params := req.URL.Query()
+		params.Set("query", "{}")
+		params.Set("q", query)
+		params.Set("start", "1100")
+		params.Set("end", "1300")
+		params.Set("step", "100")
+		req.URL.RawQuery = params.Encode()
+		req = req.WithContext(user.InjectOrgID(req.Context(), "tenant"))
+		resp := httptest.NewRecorder()
+
+		f.MetricsQueryRangeHandler.ServeHTTP(resp, req)
+
+		require.Equal(t, http.StatusBadRequest, resp.Code)
+		require.Contains(t, resp.Body.String(), "TraceQL expression exceeds the configured maximum size")
+		require.NotContains(t, resp.Body.String(), "parse error")
+	})
+
+	t.Run("range grpc", func(t *testing.T) {
+		err := f.streamingQueryRange(&tempopb.QueryRangeRequest{
+			Query: query,
+			Start: uint64(1100 * time.Second),
+			End:   uint64(1300 * time.Second),
+			Step:  uint64(100 * time.Second),
+		}, newMockStreamingServer[*tempopb.QueryRangeResponse]("tenant", nil))
+
+		require.Equal(t, codes.InvalidArgument, status.Code(err))
+		require.Contains(t, err.Error(), "TraceQL expression exceeds the configured maximum size")
+		require.NotContains(t, err.Error(), "parse error")
+	})
+
+	t.Run("instant http", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, api.PathMetricsQueryInstant, nil)
+		req = api.BuildQueryInstantRequest(req, &tempopb.QueryInstantRequest{
+			Query: query,
+			Start: uint64(1100 * time.Second),
+			End:   uint64(1300 * time.Second),
+		})
+		req = req.WithContext(user.InjectOrgID(req.Context(), "tenant"))
+		resp := httptest.NewRecorder()
+
+		f.MetricsQueryInstantHandler.ServeHTTP(resp, req)
+
+		require.Equal(t, http.StatusBadRequest, resp.Code)
+		require.Contains(t, resp.Body.String(), "TraceQL expression exceeds the configured maximum size")
+		require.NotContains(t, resp.Body.String(), "parse error")
+	})
+
+	t.Run("instant grpc", func(t *testing.T) {
+		err := f.streamingQueryInstant(&tempopb.QueryInstantRequest{
+			Query: query,
+			Start: uint64(1100 * time.Second),
+			End:   uint64(1300 * time.Second),
+		}, newMockStreamingServer[*tempopb.QueryInstantResponse]("tenant", nil))
+
+		require.Equal(t, codes.InvalidArgument, status.Code(err))
+		require.Contains(t, err.Error(), "TraceQL expression exceeds the configured maximum size")
+		require.NotContains(t, err.Error(), "parse error")
+	})
+}
+
+func TestQueryRangeAccessesCache(t *testing.T) {
+	tenant := "foo"
+	meta := &backend.BlockMeta{
+		StartTime:         time.Unix(150, 0),
+		EndTime:           time.Unix(160, 0),
+		Size_:             defaultTargetBytesPerRequest,
+		TotalRecords:      1,
+		BlockID:           backend.MustParse("00000000-0000-0000-0000-000000000123"),
+		ReplicationFactor: 1,
+	}
+	retResp := &tempopb.QueryRangeResponse{
+		Metrics: &tempopb.SearchMetrics{
+			InspectedTraces: 1,
+			InspectedBytes:  1,
+		},
+		Series: []*tempopb.TimeSeries{
+			{
+				Labels: []v1.KeyValue{
+					{Key: "foo", Value: &v1.AnyValue{Value: &v1.AnyValue_StringValue{StringValue: "bar"}}},
+				},
+				Samples: []tempopb.Sample{
+					{
+						TimestampMs: 12_000_000,
+						Value:       2,
+					},
+					{
+						TimestampMs: 11_000_000,
+						Value:       1,
+					},
+				},
+			},
+		},
+	}
+
+	rdr := &mockReader{
+		metas: []*backend.BlockMeta{meta},
+	}
+
+	// setup mock cache
+	c := test.NewMockClient()
+	p := test.NewMockProvider()
+	err := p.AddCache(cache.RoleFrontendSearch, c)
+	require.NoError(t, err)
+	f := frontendWithSettings(t, &mockRoundTripper{
+		responseFn: func() proto.Message {
+			return retResp
+		},
+	}, rdr, nil, p)
+
+	// setup query
+	step := 1000000000
+	query := "{} | rate()"
+	hash := hashForQueryRangeRequest(&tempopb.QueryRangeRequest{Query: query, Step: uint64(step)})
+	startNS := 100 * time.Second
+	endNS := 200 * time.Second
+	cacheKey := queryRangeCacheKey(tenant, hash, time.Unix(0, int64(startNS)), time.Unix(0, int64(endNS)), meta, 0, 1)
+
+	// confirm cache key coesn't exist
+	_, bufs, _ := c.Fetch(context.Background(), []string{cacheKey})
+	require.Equal(t, 0, len(bufs))
+
+	// execute query
+	path := fmt.Sprintf("/?start=%d&end=%d&q=%s", startNS, endNS, url.QueryEscape(query)) // encapsulates block above
+	req := httptest.NewRequest("GET", path, nil)
+	ctx := req.Context()
+	ctx = user.InjectOrgID(ctx, tenant)
+	req = req.WithContext(ctx)
+
+	respWriter := httptest.NewRecorder()
+	f.MetricsQueryRangeHandler.ServeHTTP(respWriter, req)
+
+	resp := respWriter.Result()
+	require.Equal(t, 200, resp.StatusCode)
+
+	actualResp := &tempopb.QueryRangeResponse{}
+	bytesResp, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	err = jsonpb.Unmarshal(bytes.NewReader(bytesResp), actualResp)
+	require.NoError(t, err)
+
+	// confirm cache key exists and matches the response above
+	_, bufs, _ = c.Fetch(context.Background(), []string{cacheKey})
+	require.Equal(t, 1, len(bufs))
+
+	actualCache := &tempopb.QueryRangeResponse{}
+	err = jsonpb.Unmarshal(bytes.NewReader(bufs[0]), actualCache)
+	require.NoError(t, err)
+}
+
+func TestQueryRangeHandlerV2MaxSeries(t *testing.T) {
+	resp := &tempopb.QueryRangeResponse{
+		Metrics: &tempopb.SearchMetrics{
+			InspectedTraces: 1,
+			InspectedBytes:  1,
+		},
+		Series: []*tempopb.TimeSeries{
+			{
+				Labels: []v1.KeyValue{
+					{Key: "foo", Value: &v1.AnyValue{Value: &v1.AnyValue_StringValue{StringValue: "bar"}}},
+				},
+				Samples: []tempopb.Sample{
+					{
+						TimestampMs: 1200_000,
+						Value:       2,
+					},
+					{
+						TimestampMs: 1100_000,
+						Value:       1,
+					},
+				},
+			},
+			{
+				Labels: []v1.KeyValue{
+					{Key: "abc", Value: &v1.AnyValue{Value: &v1.AnyValue_StringValue{StringValue: "xyz"}}},
+				},
+				Samples: []tempopb.Sample{
+					{
+						TimestampMs: 1200_000,
+						Value:       2,
+					},
+					{
+						TimestampMs: 1100_000,
+						Value:       1,
+					},
+				},
+			},
+		},
+	}
+
+	maxSeries := 1
+
+	f := frontendWithSettings(t, &mockRoundTripper{
+		responseFn: func() proto.Message {
+			return resp
+		},
+	}, nil, nil, nil, func(c *Config, _ *overrides.Config) {
+		c.Metrics.Sharder.Interval = time.Hour
+		c.Metrics.Sharder.MaxResponseSeries = maxSeries
+	})
+
+	tenant := "foo"
+
+	httpReq := httptest.NewRequest("GET", api.PathMetricsQueryRange, nil)
+	httpReq = api.BuildQueryRangeRequest(httpReq, &tempopb.QueryRangeRequest{
+		Query: "{} | rate()",
+		Start: uint64(1100 * time.Second),
+		End:   uint64(1200 * time.Second),
+		Step:  uint64(100 * time.Second),
+	}, "")
+
+	ctx := user.InjectOrgID(httpReq.Context(), tenant)
+	httpReq = httpReq.WithContext(ctx)
+
+	httpResp := httptest.NewRecorder()
+
+	f.MetricsQueryRangeHandler.ServeHTTP(httpResp, httpReq)
+
+	require.Equal(t, 200, httpResp.Code)
+
+	actualResp := &tempopb.QueryRangeResponse{}
+	err := jsonpb.Unmarshal(httpResp.Body, actualResp)
+	require.NoError(t, err)
+	require.Equal(t, maxSeries, len(actualResp.Series))
+	require.Equal(t, tempopb.PartialStatus_PARTIAL, actualResp.Status)
+}
+
+func TestQueryRangeCachedMetrics(t *testing.T) {
+	// set up backend
+	tenant := "foo"
+	meta := &backend.BlockMeta{
+		StartTime:         time.Unix(150, 0),
+		EndTime:           time.Unix(160, 0),
+		Size_:             defaultTargetBytesPerRequest,
+		TotalRecords:      1,
+		BlockID:           backend.MustParse("00000000-0000-0000-0000-000000000123"),
+		ReplicationFactor: 1,
+	}
+	rdr := &mockReader{
+		metas: []*backend.BlockMeta{meta},
+	}
+
+	// set up cache
+	c := test.NewMockClient()
+	p := test.NewMockProvider()
+	err := p.AddCache(cache.RoleFrontendSearch, c)
+	require.NoError(t, err)
+	f := frontendWithSettings(t, &mockRoundTripper{
+		responseFn: func() proto.Message {
+			return &tempopb.QueryRangeResponse{
+				Metrics: &tempopb.SearchMetrics{
+					InspectedTraces: 2,
+					InspectedBytes:  33,
+					AdditionalMetrics: map[string]int64{
+						tempopb.AdditionalMetricCacheHits:   5,  // not cacheable
+						tempopb.AdditionalMetricEngineBytes: 42, // cacheable
+					},
+				},
+				Series: []*tempopb.TimeSeries{
+					{
+						Labels: []v1.KeyValue{
+							{Key: "foo", Value: &v1.AnyValue{Value: &v1.AnyValue_StringValue{StringValue: "bar"}}},
+						},
+						Samples: []tempopb.Sample{
+							{
+								TimestampMs: 11_000_000,
+								Value:       1,
+							},
+						},
+					},
+				},
+			}
+		},
+	}, rdr, nil, p, func(c *Config, _ *overrides.Config) {
+		c.Metrics.Sharder.Interval = time.Hour
+	})
+
+	// set up query
+	query := "{} | rate()"
+	var step uint64 = 1000000000
+	hash := hashForQueryRangeRequest(&tempopb.QueryRangeRequest{Query: query, Step: step})
+	startNS := uint64(100 * time.Second)
+	endNS := uint64(200 * time.Second)
+	cacheKey := queryRangeCacheKey(tenant, hash, time.Unix(0, int64(startNS)), time.Unix(0, int64(endNS)), meta, 0, 1)
+
+	// confirm cache key doesn't exist
+	_, bufs, _ := c.Fetch(context.Background(), []string{cacheKey})
+	require.Equal(t, 0, len(bufs))
+
+	// execute query
+	path := fmt.Sprintf("/?start=%d&end=%d&q=%s", startNS, endNS, url.QueryEscape(query))
+	req := httptest.NewRequest("GET", path, nil)
+	ctx := req.Context()
+	ctx = user.InjectOrgID(ctx, tenant)
+	req = req.WithContext(ctx)
+	respWriter := httptest.NewRecorder()
+	f.MetricsQueryRangeHandler.ServeHTTP(respWriter, req)
+	resp := respWriter.Result()
+	require.Equal(t, 200, resp.StatusCode)
+
+	// parse response
+	actualResp := &tempopb.QueryRangeResponse{}
+	bytesResp, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	err = jsonpb.Unmarshal(bytes.NewReader(bytesResp), actualResp)
+	require.NoError(t, err)
+
+	// verify metrics are collected
+	require.Equal(t, uint64(33), actualResp.Metrics.InspectedBytes)
+	require.Equal(t, uint32(2), actualResp.Metrics.InspectedTraces)
+	require.Equal(t, uint32(1), actualResp.Metrics.CompletedJobs)
+	require.Equal(t, uint32(1), actualResp.Metrics.TotalJobs)
+	require.Equal(t, uint32(1), actualResp.Metrics.TotalBlocks)
+	require.Equal(t, uint64(defaultTargetBytesPerRequest), actualResp.Metrics.TotalBlockBytes)
+	require.Equal(t, int64(42), actualResp.Metrics.AdditionalMetrics[tempopb.AdditionalMetricEngineBytes])
+	require.Equal(t, int64(5), actualResp.Metrics.AdditionalMetrics[tempopb.AdditionalMetricCacheHits])
+
+	// execute query again
+	respWriter = httptest.NewRecorder()
+	f.MetricsQueryRangeHandler.ServeHTTP(respWriter, req)
+	resp = respWriter.Result()
+	require.Equal(t, 200, resp.StatusCode)
+
+	// parse cached response
+	actualResp = &tempopb.QueryRangeResponse{}
+	bytesResp, err = io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	err = jsonpb.Unmarshal(bytes.NewReader(bytesResp), actualResp)
+	require.NoError(t, err)
+
+	// I/O metrics are 0 because the response was cached
+	require.Equal(t, uint64(0), actualResp.Metrics.InspectedBytes)
+	require.Equal(t, uint32(0), actualResp.Metrics.InspectedTraces)
+	require.Equal(t, uint32(1), actualResp.Metrics.CompletedJobs)
+	// these are metadata metrics and are not affected by caching
+	require.Equal(t, uint32(1), actualResp.Metrics.TotalJobs)
+	require.Equal(t, uint32(1), actualResp.Metrics.TotalBlocks)
+	require.Equal(t, uint64(defaultTargetBytesPerRequest), actualResp.Metrics.TotalBlockBytes)
+	// cacheable AdditionalMetrics survive the hit; non-cacheable ones do not
+	require.Equal(t, int64(42), actualResp.Metrics.AdditionalMetrics[tempopb.AdditionalMetricEngineBytes])
+	_, ok := actualResp.Metrics.AdditionalMetrics[tempopb.AdditionalMetricCacheHits]
+	require.False(t, ok)
+}
+
+func TestQueryRangeHandlerWithEndCutoff(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		step := 10 * time.Second
+
+		time.Sleep(123 * time.Millisecond) // to make default time for synctest imperfect
+		now := time.Now()
+		alignedNow := now.Truncate(step) // align back to step
+
+		start := now.Add(-100 * time.Second).UnixNano()
+		cutoff := 30 * time.Second
+
+		tenant := "foo"
+		meta := &backend.BlockMeta{
+			StartTime:         now.Add(-100 * time.Second),
+			EndTime:           now,
+			Size_:             defaultTargetBytesPerRequest,
+			TotalRecords:      1,
+			BlockID:           backend.MustParse("00000000-0000-0000-0000-000000000123"),
+			ReplicationFactor: 1,
+		}
+		retResp := &tempopb.QueryRangeResponse{
+			Metrics: &tempopb.SearchMetrics{
+				InspectedTraces: 1,
+				InspectedBytes:  1,
+			},
+			Series: []*tempopb.TimeSeries{
+				{
+					Labels: []v1.KeyValue{
+						{Key: "foo", Value: &v1.AnyValue{Value: &v1.AnyValue_StringValue{StringValue: "bar"}}},
+					},
+					Samples: []tempopb.Sample{
+						{
+							TimestampMs: 12_000_000,
+							Value:       2,
+						},
+						{
+							TimestampMs: 11_000_000,
+							Value:       1,
+						},
+					},
+				},
+			},
+		}
+
+		rdr := &mockReader{
+			metas: []*backend.BlockMeta{meta},
+		}
+		rt := &mockRoundTripperWithCapture{
+			rt: mockRoundTripper{
+				responseFn: func() proto.Message {
+					return retResp
+				},
+			},
+		}
+
+		for _, tc := range []struct {
+			name        string
+			end         time.Time
+			expectedEnd time.Time
+		}{
+			{
+				name:        "now",
+				end:         now,
+				expectedEnd: alignedNow.Add(-cutoff),
+			},
+			{
+				name:        "unaligned",
+				end:         now.Add(-100 * time.Millisecond),
+				expectedEnd: alignedNow.Add(-cutoff),
+			},
+			{
+				name:        "before cutoff",
+				end:         now.Add(-cutoff - 20*time.Second),
+				expectedEnd: alignedNow.Add(-cutoff - 10*time.Second), // aligned to right
+			},
+			{
+				name:        "before unaligned",
+				end:         now.Add(-cutoff - 3*time.Second),
+				expectedEnd: alignedNow.Add(-cutoff),
+			},
+		} {
+			f := frontendWithSettings(t, rt, rdr, nil, nil, func(c *Config, _ *overrides.Config) {
+				c.Metrics.Sharder.Interval = time.Hour
+				c.QueryEndCutoff = cutoff
+			})
+
+			httpReq := httptest.NewRequest("GET", api.PathMetricsQueryRange, nil)
+			httpReq = api.BuildQueryRangeRequest(httpReq, &tempopb.QueryRangeRequest{
+				Query: "{} | rate()",
+				Start: uint64(start),
+				End:   uint64(tc.end.UnixNano()),
+				Step:  uint64(step),
+			}, "")
+
+			ctx := user.InjectOrgID(httpReq.Context(), tenant)
+			httpReq = httpReq.WithContext(ctx)
+
+			httpResp := httptest.NewRecorder()
+
+			f.MetricsQueryRangeHandler.ServeHTTP(httpResp, httpReq)
+
+			resp := httpResp.Result()
+			require.Equal(t, 200, resp.StatusCode)
+
+			actualResp := &tempopb.QueryRangeResponse{}
+			bytesResp, err := io.ReadAll(resp.Body)
+			require.NoError(t, err)
+			err = jsonpb.Unmarshal(bytes.NewReader(bytesResp), actualResp)
+			require.NoError(t, err)
+
+			require.NotNil(t, rt.req)
+			actualEnd := time.Unix(0, int64(rt.req.End))
+			assert.Equal(t, tc.expectedEnd, actualEnd, "[%s] actual end %s is not equal to expected end %s", tc.name, actualEnd, tc.expectedEnd)
+		}
+	})
+}
+
+// TestQueryRangeHandlerExemplarNormalization verifies that exemplars from shard responses are
+// kept in the final response when the client omits req.Exemplars (sends 0). Before the fix,
+// the frontend combiner was created with req.Exemplars=0 which caused it to immediately discard
+// all exemplars returned by backend shards.
+func TestQueryRangeHandlerExemplarNormalization(t *testing.T) {
+	start := uint64(1100 * time.Second)
+	end := uint64(1200 * time.Second)
+	step := uint64(100 * time.Second)
+	// Exemplar timestamp in the middle of the query range (milliseconds)
+	exemplarTS := int64(1150 * 1000)
+
+	mockResp := &tempopb.QueryRangeResponse{
+		Metrics: &tempopb.SearchMetrics{InspectedTraces: 1, InspectedBytes: 1},
+		Series: []*tempopb.TimeSeries{
+			{
+				Labels: []v1.KeyValue{
+					{Key: "foo", Value: &v1.AnyValue{Value: &v1.AnyValue_StringValue{StringValue: "bar"}}},
+				},
+				Samples: []tempopb.Sample{
+					{TimestampMs: 1100_000, Value: 1},
+					{TimestampMs: 1200_000, Value: 2},
+				},
+				Exemplars: []tempopb.Exemplar{
+					{TimestampMs: exemplarTS, Value: 1.5},
+				},
+			},
+		},
+	}
+
+	makeRequestWithQuery := func(query string, exemplars uint32) *http.Request {
+		httpReq := httptest.NewRequest("GET", api.PathMetricsQueryRange, nil)
+		httpReq = api.BuildQueryRangeRequest(httpReq, &tempopb.QueryRangeRequest{
+			Query:     query,
+			Start:     start,
+			End:       end,
+			Step:      step,
+			Exemplars: exemplars,
+		}, "")
+		ctx := user.InjectOrgID(httpReq.Context(), "foo")
+		return httpReq.WithContext(ctx)
+	}
+	makeRequest := func(exemplars uint32) *http.Request {
+		return makeRequestWithQuery("{} | rate()", exemplars)
+	}
+
+	t.Run("client omits exemplars defaults to cfg.MaxExemplars", func(t *testing.T) {
+		f := frontendWithSettings(t, &mockRoundTripper{
+			responseFn: func() proto.Message { return mockResp },
+		}, nil, nil, nil, func(c *Config, _ *overrides.Config) {
+			c.Metrics.Sharder.Interval = time.Hour
+			c.Metrics.Sharder.MaxExemplars = 10
+		})
+
+		httpResp := httptest.NewRecorder()
+		f.MetricsQueryRangeHandler.ServeHTTP(httpResp, makeRequest(0))
+		require.Equal(t, 200, httpResp.Code)
+
+		actualResp := &tempopb.QueryRangeResponse{}
+		require.NoError(t, jsonpb.Unmarshal(httpResp.Body, actualResp))
+
+		var total int
+		for _, s := range actualResp.Series {
+			total += len(s.Exemplars)
+		}
+		assert.Greater(t, total, 0, "exemplars should be kept when client omits exemplars and MaxExemplars > 0")
+	})
+
+	t.Run("exemplars disabled when cfg.MaxExemplars is zero", func(t *testing.T) {
+		f := frontendWithSettings(t, &mockRoundTripper{
+			responseFn: func() proto.Message { return mockResp },
+		}, nil, nil, nil, func(c *Config, _ *overrides.Config) {
+			c.Metrics.Sharder.Interval = time.Hour
+			c.Metrics.Sharder.MaxExemplars = 0
+		})
+
+		httpResp := httptest.NewRecorder()
+		f.MetricsQueryRangeHandler.ServeHTTP(httpResp, makeRequest(0))
+		require.Equal(t, 200, httpResp.Code)
+
+		actualResp := &tempopb.QueryRangeResponse{}
+		require.NoError(t, jsonpb.Unmarshal(httpResp.Body, actualResp))
+
+		for _, s := range actualResp.Series {
+			assert.Empty(t, s.Exemplars, "exemplars should be empty when MaxExemplars is disabled")
+		}
+	})
+
+	t.Run("client requests exemplars but MaxExemplars is zero disables them", func(t *testing.T) {
+		f := frontendWithSettings(t, &mockRoundTripper{
+			responseFn: func() proto.Message { return mockResp },
+		}, nil, nil, nil, func(c *Config, _ *overrides.Config) {
+			c.Metrics.Sharder.Interval = time.Hour
+			c.Metrics.Sharder.MaxExemplars = 0
+		})
+
+		httpResp := httptest.NewRecorder()
+		f.MetricsQueryRangeHandler.ServeHTTP(httpResp, makeRequest(5)) // client requests exemplars
+		require.Equal(t, 200, httpResp.Code)
+
+		actualResp := &tempopb.QueryRangeResponse{}
+		require.NoError(t, jsonpb.Unmarshal(httpResp.Body, actualResp))
+
+		for _, s := range actualResp.Series {
+			assert.Empty(t, s.Exemplars, "exemplars should be empty when MaxExemplars is zero even if client requests them")
+		}
+	})
+
+	t.Run("client-specified exemplars capped to cfg.MaxExemplars", func(t *testing.T) {
+		f := frontendWithSettings(t, &mockRoundTripper{
+			responseFn: func() proto.Message { return mockResp },
+		}, nil, nil, nil, func(c *Config, _ *overrides.Config) {
+			c.Metrics.Sharder.Interval = time.Hour
+			c.Metrics.Sharder.MaxExemplars = 10
+		})
+
+		httpResp := httptest.NewRecorder()
+		f.MetricsQueryRangeHandler.ServeHTTP(httpResp, makeRequest(1000)) // request more than cfg cap
+		require.Equal(t, 200, httpResp.Code)
+
+		actualResp := &tempopb.QueryRangeResponse{}
+		require.NoError(t, jsonpb.Unmarshal(httpResp.Body, actualResp))
+
+		var total int
+		for _, s := range actualResp.Series {
+			total += len(s.Exemplars)
+		}
+		assert.Greater(t, total, 0, "exemplars should be kept when client requests more than cfg cap")
+	})
+
+	t.Run("math operation query succeeds", func(t *testing.T) {
+		for _, tc := range []struct {
+			query     string
+			fragments []string
+		}{
+			{"({} | rate()) + ({} | rate())", []string{"{ true } | rate()"}},
+			{"({} | rate()) - ({} | rate())", []string{"{ true } | rate()"}},
+			{"({} | rate()) * ({} | count_over_time())", []string{"{ true } | rate()", "{ true } | count_over_time()"}},
+		} {
+			// Build mock response with __query_fragment labels so the math combiner can route series
+			var series []*tempopb.TimeSeries
+			for _, frag := range tc.fragments {
+				series = append(series, &tempopb.TimeSeries{
+					Labels: []v1.KeyValue{
+						{Key: "__query_fragment", Value: &v1.AnyValue{Value: &v1.AnyValue_StringValue{StringValue: frag}}},
+					},
+					Samples: []tempopb.Sample{
+						{TimestampMs: 1100_000, Value: 1},
+						{TimestampMs: 1200_000, Value: 2},
+					},
+					Exemplars: []tempopb.Exemplar{
+						{TimestampMs: exemplarTS, Value: 1.5},
+					},
+				})
+			}
+			mathMockResp := &tempopb.QueryRangeResponse{
+				Metrics: &tempopb.SearchMetrics{InspectedTraces: 1, InspectedBytes: 1},
+				Series:  series,
+			}
+
+			f := frontendWithSettings(t, &mockRoundTripper{
+				responseFn: func() proto.Message { return mathMockResp },
+			}, nil, nil, nil, func(c *Config, _ *overrides.Config) {
+				c.Metrics.Sharder.Interval = time.Hour
+				c.Metrics.Sharder.MaxExemplars = 10
+			})
+
+			httpResp := httptest.NewRecorder()
+			f.MetricsQueryRangeHandler.ServeHTTP(httpResp, makeRequestWithQuery(tc.query, 10))
+			require.Equal(t, 200, httpResp.Code, "query: %s", tc.query)
+
+			actualResp := &tempopb.QueryRangeResponse{}
+			require.NoError(t, jsonpb.Unmarshal(httpResp.Body, actualResp), "query: %s", tc.query)
+			require.GreaterOrEqual(t, len(actualResp.GetSeries()), 1, "expected at least one series for query: %s", tc.query)
+		}
+	})
+
+	t.Run("invalid query returns 400", func(t *testing.T) {
+		f := frontendWithSettings(t, &mockRoundTripper{
+			responseFn: func() proto.Message { return mockResp },
+		}, nil, nil, nil, func(c *Config, _ *overrides.Config) {
+			c.Metrics.Sharder.Interval = time.Hour
+			c.Metrics.Sharder.MaxExemplars = 10
+		})
+
+		httpResp := httptest.NewRecorder()
+		f.MetricsQueryRangeHandler.ServeHTTP(httpResp, makeRequestWithQuery("this is not valid traceql", 0))
+		require.Equal(t, http.StatusBadRequest, httpResp.Code)
+	})
+}
+
+func TestNormalizeRequestExemplars(t *testing.T) {
+	const maxExemplars = uint32(20)
+
+	tcs := []struct {
+		name          string
+		query         string
+		reqExemplars  uint32
+		wantExemplars uint32
+		wantErr       bool
+	}{
+		// no hint: 0 (unspecified) defaults to maxExemplars
+		{
+			name:          "no hint, unspecified defaults to max",
+			query:         "{} | rate()",
+			reqExemplars:  0,
+			wantExemplars: maxExemplars,
+		},
+		// no hint: explicit value is preserved
+		{
+			name:          "no hint, explicit value preserved",
+			query:         "{} | rate()",
+			reqExemplars:  10,
+			wantExemplars: 10,
+		},
+		// no hint: value above max is capped
+		{
+			name:          "no hint, above max capped",
+			query:         "{} | rate()",
+			reqExemplars:  maxExemplars + 5,
+			wantExemplars: maxExemplars,
+		},
+		// hint int: overrides req.Exemplars
+		{
+			name:          "hint int overrides req value",
+			query:         "{} | rate() with(exemplars=7)",
+			reqExemplars:  10,
+			wantExemplars: 7,
+		},
+		// hint int: overrides unspecified (0) req value without applying default
+		{
+			name:          "hint int=0 disables exemplars",
+			query:         "{} | rate() with(exemplars=0)",
+			reqExemplars:  0,
+			wantExemplars: 0,
+		},
+		// hint int: capped to maxExemplars when above max
+		{
+			name:          "hint int above max is capped",
+			query:         "{} | rate() with(exemplars=9999)",
+			reqExemplars:  0,
+			wantExemplars: maxExemplars,
+		},
+		// hint bool=false: disables exemplars regardless of req value
+		{
+			name:          "hint false disables exemplars",
+			query:         "{} | rate() with(exemplars=false)",
+			reqExemplars:  10,
+			wantExemplars: 0,
+		},
+		// hint bool=true: no-op, falls through to req.Exemplars / default path
+		{
+			name:          "hint true is no-op, falls through to default",
+			query:         "{} | rate() with(exemplars=true)",
+			reqExemplars:  0,
+			wantExemplars: maxExemplars,
+		},
+		// invalid query returns an error
+		{
+			name:    "invalid query returns error",
+			query:   "this is not valid traceql",
+			wantErr: true,
+		},
+	}
+
+	for _, tc := range tcs {
+		t.Run(tc.name, func(t *testing.T) {
+			req := &tempopb.QueryRangeRequest{
+				Query:     tc.query,
+				Exemplars: tc.reqExemplars,
+			}
+			err := normalizeRequestExemplars(req, maxExemplars)
+			if tc.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tc.wantExemplars, req.Exemplars)
+		})
+	}
+}
+
+func TestQueryRangeMaxDurationCheckCapturesPostAlignmentInflation(t *testing.T) {
+	// Captures the forwarded request to assert AlignRequest still inflates
+	// past the cap — locks in the property the fix is about.
+	rt := &mockRoundTripperWithCapture{
+		rt: mockRoundTripper{
+			responseFn: func() proto.Message {
+				return &tempopb.QueryRangeResponse{
+					Metrics: &tempopb.SearchMetrics{InspectedTraces: 1, InspectedBytes: 1},
+				}
+			},
+		},
+	}
+
+	f := frontendWithSettings(t, rt, nil, nil, nil, func(c *Config, _ *overrides.Config) {
+		c.Metrics.Sharder.Interval = time.Hour
+		c.Metrics.Sharder.MaxDuration = 48 * time.Hour
+		c.Metrics.Sharder.QueryBackendAfter = 1000 * time.Hour
+	})
+
+	end := time.Now().Truncate(time.Second).Add(123 * time.Millisecond)
+	start := end.Add(-48 * time.Hour)
+
+	httpReq := httptest.NewRequest("GET", api.PathMetricsQueryRange, nil)
+	httpReq = api.BuildQueryRangeRequest(httpReq, &tempopb.QueryRangeRequest{
+		Query: "{} | rate()",
+		Start: uint64(start.UnixNano()),
+		End:   uint64(end.UnixNano()),
+		Step:  uint64(time.Hour.Nanoseconds()),
+	}, "")
+	httpReq = httpReq.WithContext(user.InjectOrgID(httpReq.Context(), "foo"))
+
+	httpResp := httptest.NewRecorder()
+	f.MetricsQueryRangeHandler.ServeHTTP(httpResp, httpReq)
+
+	require.Equal(t, http.StatusOK, httpResp.Code, "body: %s", httpResp.Body.String())
+	require.NotNil(t, rt.req)
+	// The forwarded request must be inflated, otherwise this test isn't proving anything.
+	assert.Greater(t, time.Duration(rt.req.End-rt.req.Start), 48*time.Hour)
+}
+
+func TestQueryRangeMaxDurationCheckRespectsConfigFallback(t *testing.T) {
+	// When no per-tenant override is set, the config-level cap
+	// (cfg.Metrics.Sharder.MaxDuration) must be honored.
+	f := frontendWithSettings(t, &mockRoundTripper{}, nil, nil, nil, func(c *Config, _ *overrides.Config) {
+		c.Metrics.Sharder.Interval = time.Hour
+		c.Metrics.Sharder.MaxDuration = 200 * time.Second
+	})
+
+	httpReq := httptest.NewRequest("GET", api.PathMetricsQueryRange, nil)
+	httpReq = api.BuildQueryRangeRequest(httpReq, &tempopb.QueryRangeRequest{
+		Query: "{} | rate()",
+		Start: uint64(1100 * time.Second),
+		End:   uint64(1100*time.Second + 201*time.Second),
+		Step:  uint64(100 * time.Second),
+	}, "")
+	httpReq = httpReq.WithContext(user.InjectOrgID(httpReq.Context(), "foo"))
+
+	httpResp := httptest.NewRecorder()
+	f.MetricsQueryRangeHandler.ServeHTTP(httpResp, httpReq)
+	require.Equal(t, http.StatusBadRequest, httpResp.Code, "body: %s", httpResp.Body.String())
+	require.Contains(t, httpResp.Body.String(), "exceeds the maximum allowed duration of 3m20s")
+}
+
+func TestQueryRangeMaxDurationCheckSkippedWhenBothZero(t *testing.T) {
+	// Both override and config fallback zero ⇒ no cap, request proceeds.
+	resp := &tempopb.QueryRangeResponse{
+		Metrics: &tempopb.SearchMetrics{InspectedTraces: 1, InspectedBytes: 1},
+	}
+	f := frontendWithSettings(t, &mockRoundTripper{
+		responseFn: func() proto.Message { return resp },
+	}, nil, nil, nil, func(c *Config, _ *overrides.Config) {
+		c.Metrics.Sharder.Interval = time.Hour
+	})
+
+	end := time.Now().Truncate(time.Second)
+	start := end.Add(-10 * 24 * time.Hour)
+	httpReq := httptest.NewRequest("GET", api.PathMetricsQueryRange, nil)
+	httpReq = api.BuildQueryRangeRequest(httpReq, &tempopb.QueryRangeRequest{
+		Query: "{} | rate()",
+		Start: uint64(start.UnixNano()),
+		End:   uint64(end.UnixNano()),
+		Step:  uint64(time.Hour),
+	}, "")
+	httpReq = httpReq.WithContext(user.InjectOrgID(httpReq.Context(), "foo"))
+
+	httpResp := httptest.NewRecorder()
+	f.MetricsQueryRangeHandler.ServeHTTP(httpResp, httpReq)
+	require.Equal(t, http.StatusOK, httpResp.Code, "body: %s", httpResp.Body.String())
+}
+
+func TestQueryInstantMaxDurationCheckRejectsOverLimit(t *testing.T) {
+	// Instant handlers must enforce the cap; the sharder check that used to
+	// cover them was removed.
+	f := frontendWithSettings(t, &mockRoundTripper{}, nil, nil, nil, func(c *Config, _ *overrides.Config) {
+		c.Metrics.Sharder.MaxDuration = 48 * time.Hour
+	})
+
+	end := time.Now().Truncate(time.Second)
+	start := end.Add(-49 * time.Hour)
+
+	httpReq := httptest.NewRequest("GET", api.PathMetricsQueryInstant, nil)
+	httpReq = api.BuildQueryInstantRequest(httpReq, &tempopb.QueryInstantRequest{
+		Query: "{} | rate()",
+		Start: uint64(start.UnixNano()),
+		End:   uint64(end.UnixNano()),
+	})
+	httpReq = httpReq.WithContext(user.InjectOrgID(httpReq.Context(), "foo"))
+
+	httpResp := httptest.NewRecorder()
+	f.MetricsQueryInstantHandler.ServeHTTP(httpResp, httpReq)
+	require.Equal(t, http.StatusBadRequest, httpResp.Code)
+	assert.Contains(t, httpResp.Body.String(), "exceeds the maximum allowed duration of 48h0m0s")
+}
+
+func TestQueryInstantGRPCMaxDurationCheckRejectsOverLimit(t *testing.T) {
+	const maxDuration = 48 * time.Hour
+	f := frontendWithSettings(t, &mockRoundTripper{}, nil, nil, nil, func(c *Config, _ *overrides.Config) {
+		c.Metrics.Sharder.MaxDuration = maxDuration
+	})
+
+	end := time.Now().Truncate(time.Second)
+	start := end.Add(-49 * time.Hour)
+
+	srv := newMockStreamingServer[*tempopb.QueryInstantResponse]("foo", nil)
+	err := f.MetricsQueryInstant(&tempopb.QueryInstantRequest{
+		Query: "{} | rate()",
+		Start: uint64(start.UnixNano()),
+		End:   uint64(end.UnixNano()),
+	}, srv)
+	require.Error(t, err)
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
+	require.Contains(t, err.Error(), "exceeds the maximum allowed duration")
+}
+
+func TestQueryRangeMaxDurationCheckRespectsEndCutoff(t *testing.T) {
+	// End in the future (clock skew) must be clamped before the cap is checked,
+	// otherwise valid requests get rejected on the raw range.
+	resp := &tempopb.QueryRangeResponse{
+		Metrics: &tempopb.SearchMetrics{InspectedTraces: 1, InspectedBytes: 1},
+	}
+	f := frontendWithSettings(t, &mockRoundTripper{
+		responseFn: func() proto.Message { return resp },
+	}, nil, nil, nil, func(c *Config, _ *overrides.Config) {
+		c.Metrics.Sharder.Interval = time.Hour
+		c.Metrics.Sharder.MaxDuration = 168 * time.Hour
+		c.QueryEndCutoff = 5 * time.Minute
+	})
+
+	// Raw range 177h > cap; post-clamp ~167h < cap — must pass.
+	end := time.Now().Add(10 * time.Hour)
+	start := end.Add(-177 * time.Hour)
+
+	httpReq := httptest.NewRequest("GET", api.PathMetricsQueryRange, nil)
+	httpReq = api.BuildQueryRangeRequest(httpReq, &tempopb.QueryRangeRequest{
+		Query: "{} | rate()",
+		Start: uint64(start.UnixNano()),
+		End:   uint64(end.UnixNano()),
+		Step:  uint64(time.Hour),
+	}, "")
+	httpReq = httpReq.WithContext(user.InjectOrgID(httpReq.Context(), "foo"))
+
+	httpResp := httptest.NewRecorder()
+	f.MetricsQueryRangeHandler.ServeHTTP(httpResp, httpReq)
+	require.Equal(t, http.StatusOK, httpResp.Code, "body: %s", httpResp.Body.String())
+}
+
+func TestQueryRangeEndCutoffSurvivesAlignment(t *testing.T) {
+	// AlignRequest's alignEnd rounds end up to the next step boundary. For a
+	// user end just before now-QueryEndCutoff (so the pre-validation clamp is
+	// a no-op), that rounding can push end past the cutoff. The handler must
+	// re-clamp after AlignRequest to preserve the invariant. Uses synctest to
+	// guarantee end lands mid-step (not on a step boundary), otherwise alignEnd
+	// would be a no-op and the test would pass for the wrong reason.
+	synctest.Test(t, func(t *testing.T) {
+		// Advance to a non-step-aligned now: synctest starts at a known instant;
+		// 123ms makes time mod step != 0 so end (now - cutoff - 1s) is mid-step.
+		time.Sleep(123 * time.Millisecond)
+
+		rt := &mockRoundTripperWithCapture{
+			rt: mockRoundTripper{
+				responseFn: func() proto.Message {
+					return &tempopb.QueryRangeResponse{
+						Metrics: &tempopb.SearchMetrics{InspectedTraces: 1, InspectedBytes: 1},
+					}
+				},
+			},
+		}
+		cutoff := 30 * time.Second
+		step := time.Hour
+		f := frontendWithSettings(t, rt, nil, nil, nil, func(c *Config, _ *overrides.Config) {
+			c.Metrics.Sharder.Interval = time.Hour
+			c.QueryEndCutoff = cutoff
+			c.Metrics.Sharder.QueryBackendAfter = 1000 * time.Hour
+		})
+
+		now := time.Now()
+		end := now.Add(-cutoff - time.Second)
+		start := end.Add(-2 * time.Hour)
+
+		httpReq := httptest.NewRequest("GET", api.PathMetricsQueryRange, nil)
+		httpReq = api.BuildQueryRangeRequest(httpReq, &tempopb.QueryRangeRequest{
+			Query: "{} | rate()",
+			Start: uint64(start.UnixNano()),
+			End:   uint64(end.UnixNano()),
+			Step:  uint64(step),
+		}, "")
+		httpReq = httpReq.WithContext(user.InjectOrgID(httpReq.Context(), "foo"))
+
+		httpResp := httptest.NewRecorder()
+		f.MetricsQueryRangeHandler.ServeHTTP(httpResp, httpReq)
+		require.Equal(t, http.StatusOK, httpResp.Code, "body: %s", httpResp.Body.String())
+		require.NotNil(t, rt.req)
+		maxAllowedEnd := time.Now().Add(-cutoff)
+		assert.LessOrEqual(t, int64(rt.req.End), maxAllowedEnd.UnixNano(),
+			"end was %s; cutoff invariant says end <= now-cutoff (= %s)",
+			time.Unix(0, int64(rt.req.End)), maxAllowedEnd)
+	})
+}
+
+func TestQueryRangeGRPCEndCutoffSurvivesAlignment(t *testing.T) {
+	// gRPC streaming counterpart of TestQueryRangeEndCutoffSurvivesAlignment.
+	// Catches removal of the post-AlignRequest clampQueryEnd from the gRPC
+	// streaming range handler specifically.
+	synctest.Test(t, func(t *testing.T) {
+		time.Sleep(123 * time.Millisecond)
+
+		rt := &mockRoundTripperWithCapture{
+			rt: mockRoundTripper{
+				responseFn: func() proto.Message {
+					return &tempopb.QueryRangeResponse{
+						Metrics: &tempopb.SearchMetrics{InspectedTraces: 1, InspectedBytes: 1},
+					}
+				},
+			},
+		}
+		cutoff := 30 * time.Second
+		step := time.Hour
+		f := frontendWithSettings(t, rt, nil, nil, nil, func(c *Config, _ *overrides.Config) {
+			c.Metrics.Sharder.Interval = time.Hour
+			c.QueryEndCutoff = cutoff
+			c.Metrics.Sharder.QueryBackendAfter = 1000 * time.Hour
+		})
+
+		now := time.Now()
+		end := now.Add(-cutoff - time.Second)
+		start := end.Add(-2 * time.Hour)
+
+		srv := newMockStreamingServer[*tempopb.QueryRangeResponse]("foo", nil)
+		err := f.MetricsQueryRange(&tempopb.QueryRangeRequest{
+			Query: "{} | rate()",
+			Start: uint64(start.UnixNano()),
+			End:   uint64(end.UnixNano()),
+			Step:  uint64(step),
+		}, srv)
+		require.NoError(t, err)
+		require.NotNil(t, rt.req)
+		maxAllowedEnd := time.Now().Add(-cutoff)
+		assert.LessOrEqual(t, int64(rt.req.End), maxAllowedEnd.UnixNano(),
+			"end was %s; cutoff invariant says end <= now-cutoff (= %s)",
+			time.Unix(0, int64(rt.req.End)), maxAllowedEnd)
+	})
+}
+
+func TestQueryRangeEndCutoffRejectsWindowEntirelyInsideCutoff(t *testing.T) {
+	// A range query whose entire window falls inside QueryEndCutoff
+	// (start > end - cutoff) now returns 400 instead of an empty result from
+	// a silently-inverted window after the clamp pulls end below start.
+	cutoff := 30 * time.Second
+	f := frontendWithSettings(t, &mockRoundTripper{}, nil, nil, nil, func(c *Config, _ *overrides.Config) {
+		c.QueryEndCutoff = cutoff
+		c.Metrics.Sharder.QueryBackendAfter = 15 * time.Minute
+	})
+
+	now := time.Now()
+	httpReq := httptest.NewRequest("GET", api.PathMetricsQueryRange, nil)
+	httpReq = api.BuildQueryRangeRequest(httpReq, &tempopb.QueryRangeRequest{
+		Query: "{} | rate()",
+		Start: uint64(now.Add(-10 * time.Second).UnixNano()), // inside the 30s cutoff
+		End:   uint64(now.UnixNano()),
+		Step:  uint64(time.Second),
+	}, "")
+	httpReq = httpReq.WithContext(user.InjectOrgID(httpReq.Context(), "foo"))
+
+	httpResp := httptest.NewRecorder()
+	f.MetricsQueryRangeHandler.ServeHTTP(httpResp, httpReq)
+	require.Equal(t, http.StatusBadRequest, httpResp.Code, "body: %s", httpResp.Body.String())
+	require.Contains(t, httpResp.Body.String(), "query window falls entirely within query_end_cutoff")
+}
+
+func TestQueryRangeEndCutoffAllowsPartiallyQueryableCoarseStepWindow(t *testing.T) {
+	// Pre-validation clamping must not round end down to a step boundary. With a
+	// coarse step, the left-aligned cutoff can fall before start even though the
+	// raw cutoff leaves part of the requested window queryable.
+	synctest.Test(t, func(t *testing.T) {
+		targetNow := time.Now().Truncate(time.Hour).Add(34 * time.Minute)
+		if !targetNow.After(time.Now()) {
+			targetNow = targetNow.Add(time.Hour)
+		}
+		time.Sleep(time.Until(targetNow))
+
+		rt := &mockRoundTripperWithCapture{
+			rt: mockRoundTripper{
+				responseFn: func() proto.Message {
+					return &tempopb.QueryRangeResponse{
+						Metrics: &tempopb.SearchMetrics{InspectedTraces: 1, InspectedBytes: 1},
+					}
+				},
+			},
+		}
+		cutoff := 30 * time.Second
+		step := time.Hour
+		f := frontendWithSettings(t, rt, nil, nil, nil, func(c *Config, _ *overrides.Config) {
+			c.QueryEndCutoff = cutoff
+			c.Metrics.Sharder.QueryBackendAfter = 1000 * time.Hour
+		})
+
+		now := time.Now()
+		start := now.Truncate(time.Hour).Add(10 * time.Minute)
+		end := now
+
+		httpReq := httptest.NewRequest("GET", api.PathMetricsQueryRange, nil)
+		httpReq = api.BuildQueryRangeRequest(httpReq, &tempopb.QueryRangeRequest{
+			Query: "{} | rate()",
+			Start: uint64(start.UnixNano()),
+			End:   uint64(end.UnixNano()),
+			Step:  uint64(step),
+		}, "")
+		httpReq = httpReq.WithContext(user.InjectOrgID(httpReq.Context(), "foo"))
+
+		httpResp := httptest.NewRecorder()
+		f.MetricsQueryRangeHandler.ServeHTTP(httpResp, httpReq)
+		require.Equal(t, http.StatusOK, httpResp.Code, "body: %s", httpResp.Body.String())
+		require.NotNil(t, rt.req)
+	})
+}
+
+func TestQueryRangeGRPCMaxDurationCheckRespectsEndCutoff(t *testing.T) {
+	// gRPC streaming counterpart of TestQueryRangeMaxDurationCheckRespectsEndCutoff.
+	resp := &tempopb.QueryRangeResponse{
+		Metrics: &tempopb.SearchMetrics{InspectedTraces: 1, InspectedBytes: 1},
+	}
+	f := frontendWithSettings(t, &mockRoundTripper{
+		responseFn: func() proto.Message { return resp },
+	}, nil, nil, nil, func(c *Config, _ *overrides.Config) {
+		c.Metrics.Sharder.Interval = time.Hour
+		c.Metrics.Sharder.MaxDuration = 168 * time.Hour
+		c.QueryEndCutoff = 5 * time.Minute
+	})
+
+	end := time.Now().Add(10 * time.Hour)
+	start := end.Add(-177 * time.Hour)
+
+	srv := newMockStreamingServer[*tempopb.QueryRangeResponse]("foo", nil)
+	err := f.MetricsQueryRange(&tempopb.QueryRangeRequest{
+		Query: "{} | rate()",
+		Start: uint64(start.UnixNano()),
+		End:   uint64(end.UnixNano()),
+		Step:  uint64(time.Hour),
+	}, srv)
+	require.NoError(t, err)
+}
+
+func TestQueryInstantMaxDurationCheckRespectsEndCutoff(t *testing.T) {
+	// Instant HTTP counterpart of the range cutoff test.
+	resp := &tempopb.QueryRangeResponse{
+		Metrics: &tempopb.SearchMetrics{InspectedTraces: 1, InspectedBytes: 1},
+	}
+	f := frontendWithSettings(t, &mockRoundTripper{
+		responseFn: func() proto.Message { return resp },
+	}, nil, nil, nil, func(c *Config, _ *overrides.Config) {
+		c.Metrics.Sharder.MaxDuration = 168 * time.Hour
+		c.QueryEndCutoff = 5 * time.Minute
+	})
+
+	end := time.Now().Add(10 * time.Hour)
+	start := end.Add(-177 * time.Hour)
+
+	httpReq := httptest.NewRequest("GET", api.PathMetricsQueryInstant, nil)
+	httpReq = api.BuildQueryInstantRequest(httpReq, &tempopb.QueryInstantRequest{
+		Query: "{} | rate()",
+		Start: uint64(start.UnixNano()),
+		End:   uint64(end.UnixNano()),
+	})
+	httpReq = httpReq.WithContext(user.InjectOrgID(httpReq.Context(), "foo"))
+
+	httpResp := httptest.NewRecorder()
+	f.MetricsQueryInstantHandler.ServeHTTP(httpResp, httpReq)
+	require.Equal(t, http.StatusOK, httpResp.Code, "body: %s", httpResp.Body.String())
+}
+
+func TestQueryInstantGRPCMaxDurationCheckRespectsEndCutoff(t *testing.T) {
+	// gRPC streaming counterpart of the instant HTTP cutoff test.
+	resp := &tempopb.QueryRangeResponse{
+		Metrics: &tempopb.SearchMetrics{InspectedTraces: 1, InspectedBytes: 1},
+	}
+	f := frontendWithSettings(t, &mockRoundTripper{
+		responseFn: func() proto.Message { return resp },
+	}, nil, nil, nil, func(c *Config, _ *overrides.Config) {
+		c.Metrics.Sharder.MaxDuration = 168 * time.Hour
+		c.QueryEndCutoff = 5 * time.Minute
+	})
+
+	end := time.Now().Add(10 * time.Hour)
+	start := end.Add(-177 * time.Hour)
+
+	srv := newMockStreamingServer[*tempopb.QueryInstantResponse]("foo", nil)
+	err := f.MetricsQueryInstant(&tempopb.QueryInstantRequest{
+		Query: "{} | rate()",
+		Start: uint64(start.UnixNano()),
+		End:   uint64(end.UnixNano()),
+	}, srv)
+	require.NoError(t, err)
+}
+
+func TestQueryInstantMaxDurationCheckClampsFutureEndWithZeroCutoff(t *testing.T) {
+	// This test intentionally leaves the test harness QueryEndCutoff at 0.
+	// Pre-fix, the instant HTTP pipeline
+	// ran adjustEndWareNanos which clamped end to now even with cutoff=0
+	// (via ClampDateRangeReq with endBuffer=0 → maxEnd=now). The new clamp
+	// must preserve that fallback so clock-skewed clients don't fail the cap
+	// on a tiny overshoot.
+	resp := &tempopb.QueryRangeResponse{
+		Metrics: &tempopb.SearchMetrics{InspectedTraces: 1, InspectedBytes: 1},
+	}
+	f := frontendWithSettings(t, &mockRoundTripper{
+		responseFn: func() proto.Message { return resp },
+	}, nil, nil, nil, func(c *Config, _ *overrides.Config) {
+		c.Metrics.Sharder.MaxDuration = 24 * time.Hour
+		// QueryEndCutoff intentionally zero (test helper default; production default is 30s).
+	})
+
+	// Client clock skewed 15s ahead → computes end=now+15s, start=end-24h.
+	// Raw range = 24h, exceeds cap by 15s of skew (server sees start < server_now - 24h + 15s).
+	// Post-clamp end=server_now → range = 24h - 15s, fits.
+	end := time.Now().Add(15 * time.Second)
+	start := end.Add(-24 * time.Hour)
+
+	httpReq := httptest.NewRequest("GET", api.PathMetricsQueryInstant, nil)
+	httpReq = api.BuildQueryInstantRequest(httpReq, &tempopb.QueryInstantRequest{
+		Query: "{} | rate()",
+		Start: uint64(start.UnixNano()),
+		End:   uint64(end.UnixNano()),
+	})
+	httpReq = httpReq.WithContext(user.InjectOrgID(httpReq.Context(), "foo"))
+
+	httpResp := httptest.NewRecorder()
+	f.MetricsQueryInstantHandler.ServeHTTP(httpResp, httpReq)
+	require.Equal(t, http.StatusOK, httpResp.Code, "body: %s", httpResp.Body.String())
+}
+
+func TestQueryRangeMaxDurationCheckUsesUnalignedRange(t *testing.T) {
+	// Cap must be enforced against the user range, not the post-AlignRequest range.
+	const (
+		maxDuration = 200 * time.Second
+		step        = 100 * time.Second
+	)
+
+	tcs := []struct {
+		name     string
+		startNs  uint64
+		endNs    uint64
+		wantCode int
+	}{
+		{
+			name:     "range equals max duration passes",
+			startNs:  uint64(1100 * time.Second),
+			endNs:    uint64(1100*time.Second + maxDuration),
+			wantCode: http.StatusOK,
+		},
+		{
+			name:     "range below max duration passes",
+			startNs:  uint64(1100 * time.Second),
+			endNs:    uint64(1100*time.Second + maxDuration - time.Nanosecond),
+			wantCode: http.StatusOK,
+		},
+		{
+			name:     "range above max duration rejected",
+			startNs:  uint64(1100 * time.Second),
+			endNs:    uint64(1100*time.Second + maxDuration + time.Nanosecond),
+			wantCode: http.StatusBadRequest,
+		},
+	}
+
+	for _, tc := range tcs {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := &tempopb.QueryRangeResponse{
+				Metrics: &tempopb.SearchMetrics{InspectedTraces: 1, InspectedBytes: 1},
+			}
+			f := frontendWithSettings(t, &mockRoundTripper{
+				responseFn: func() proto.Message { return resp },
+			}, nil, nil, nil, func(c *Config, oc *overrides.Config) {
+				c.Metrics.Sharder.Interval = time.Hour
+				oc.Defaults.Read.MaxMetricsDuration = model.Duration(maxDuration)
+			})
+
+			httpReq := httptest.NewRequest("GET", api.PathMetricsQueryRange, nil)
+			httpReq = api.BuildQueryRangeRequest(httpReq, &tempopb.QueryRangeRequest{
+				Query: "{} | rate()",
+				Start: tc.startNs,
+				End:   tc.endNs,
+				Step:  uint64(step),
+			}, "")
+			httpReq = httpReq.WithContext(user.InjectOrgID(httpReq.Context(), "foo"))
+
+			httpResp := httptest.NewRecorder()
+			f.MetricsQueryRangeHandler.ServeHTTP(httpResp, httpReq)
+			require.Equal(t, tc.wantCode, httpResp.Code, "body: %s", httpResp.Body.String())
+		})
+	}
+}
+
+func TestQueryRangeGRPCMaxDurationCheckUsesUnalignedRange(t *testing.T) {
+	// Streaming gRPC counterpart of TestQueryRangeMaxDurationCheckUsesUnalignedRange.
+	const (
+		maxDuration = 200 * time.Second
+		step        = 100 * time.Second
+	)
+
+	tcs := []struct {
+		name    string
+		startNs uint64
+		endNs   uint64
+		wantErr bool
+	}{
+		{
+			name:    "range equals max duration passes",
+			startNs: uint64(1100 * time.Second),
+			endNs:   uint64(1100*time.Second + maxDuration),
+			wantErr: false,
+		},
+		{
+			name:    "range above max duration rejected",
+			startNs: uint64(1100 * time.Second),
+			endNs:   uint64(1100*time.Second + maxDuration + time.Nanosecond),
+			wantErr: true,
+		},
+	}
+
+	for _, tc := range tcs {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := &tempopb.QueryRangeResponse{
+				Metrics: &tempopb.SearchMetrics{InspectedTraces: 1, InspectedBytes: 1},
+			}
+			f := frontendWithSettings(t, &mockRoundTripper{
+				responseFn: func() proto.Message { return resp },
+			}, nil, nil, nil, func(c *Config, oc *overrides.Config) {
+				c.Metrics.Sharder.Interval = time.Hour
+				oc.Defaults.Read.MaxMetricsDuration = model.Duration(maxDuration)
+			})
+
+			srv := newMockStreamingServer[*tempopb.QueryRangeResponse]("foo", nil)
+			err := f.MetricsQueryRange(&tempopb.QueryRangeRequest{
+				Query: "{} | rate()",
+				Start: tc.startNs,
+				End:   tc.endNs,
+				Step:  uint64(step),
+			}, srv)
+			if tc.wantErr {
+				require.Error(t, err)
+				require.Equal(t, codes.InvalidArgument, status.Code(err))
+				require.Contains(t, err.Error(), "exceeds the maximum allowed duration")
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestQueryRangeGRPCHandlerInvalidQueryReturnsError(t *testing.T) {
+	f := frontendWithSettings(t, &mockRoundTripper{}, nil, nil, nil)
+
+	srv := newMockStreamingServer[*tempopb.QueryRangeResponse]("foo", nil)
+	err := f.MetricsQueryRange(&tempopb.QueryRangeRequest{
+		Query: "this is not valid traceql",
+		Start: 1,
+		End:   2,
+		Step:  1,
+	}, srv)
+	require.Error(t, err)
+}
+
+// mockRoundTripperWithCapture is a mitm helper that captures query range requests
+type mockRoundTripperWithCapture struct {
+	rt  mockRoundTripper
+	req *tempopb.QueryRangeRequest
+	mx  sync.Mutex
+}
+
+func (m *mockRoundTripperWithCapture) RoundTrip(req pipeline.Request) (*http.Response, error) {
+	qrReq, err := api.ParseQueryRangeRequest(req.HTTPRequest())
+	if err != nil {
+		panic("wrong test setup")
+	}
+	m.mx.Lock()
+	defer m.mx.Unlock()
+	m.req = qrReq
+
+	res, err := m.rt.RoundTrip(req)
+	return res, err
+}
+
+// recordingLogger records log lines so tests can assert on what was logged. It
+// satisfies the go-kit log.Logger interface (Log(...) error) without importing it.
+type recordingLogger struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (l *recordingLogger) Log(keyvals ...interface{}) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	fmt.Fprintln(&l.buf, keyvals...)
+	return nil
+}
+
+func (l *recordingLogger) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.String()
+}
+
+func TestLogQueryRangeResult_IncludesAdditionalMetrics(t *testing.T) {
+	logger := &recordingLogger{}
+	req := &tempopb.QueryRangeRequest{Query: "{} | rate()", Start: 1, End: 2}
+	resp := &tempopb.QueryRangeResponse{
+		Metrics: &tempopb.SearchMetrics{
+			InspectedBytes: 100,
+			AdditionalMetrics: map[string]int64{
+				tempopb.AdditionalMetricEngineBytes: 42,
+				"otherMetric":                       7,
+			},
+		},
+	}
+
+	logQueryRangeResult(context.Background(), logger, "tenant", 1.0, req, resp, nil)
+
+	got := logger.String()
+	require.Contains(t, got, tempopb.AdditionalMetricEngineBytes)
+	require.Contains(t, got, "42")
+	require.Contains(t, got, "otherMetric")
+	require.Contains(t, got, "7")
+}
+
+// TestQueryRangeHandlerLogsErrorReason is a regression test for the HTTP metrics
+// query-range handler dropping the failure reason. When the pipeline returns an
+// error response in-band (a frontend-generated 4xx carried on the http.Response
+// with a nil Go error, e.g. from the URL deny list or a sharder), the result log
+// must record why the request failed. Previously the handler discarded the
+// combiner's error and logged "query range response - no resp" with a nil error,
+// making frontend 4xx/5xx undiagnosable from query-frontend logs.
+func TestQueryRangeHandlerLogsErrorReason(t *testing.T) {
+	const reason = "this query has been identified as one that destabilizes our system"
+
+	var cfg Config
+	cfg.RegisterFlagsAndApplyDefaults("", flag.NewFlagSet("", flag.PanicOnError))
+
+	// next stands in for the rest of the pipeline and returns a frontend 400 with a
+	// nil Go error, exactly how NewBadRequest surfaces deny-list / sharder rejections.
+	next := pipeline.AsyncRoundTripperFunc[combiner.PipelineResponse](func(_ pipeline.Request) (pipeline.Responses[combiner.PipelineResponse], error) {
+		return pipeline.NewBadRequest(fmt.Errorf("%s", reason)), nil
+	})
+
+	o, err := overrides.NewOverrides(overrides.Config{}, nil, prometheus.NewRegistry())
+	require.NoError(t, err)
+
+	logger := &recordingLogger{}
+	handler := newMetricsQueryRangeHTTPHandler(cfg, next, o, logger, nil)
+
+	httpReq := httptest.NewRequest("GET", api.PathMetricsQueryRange, nil)
+	httpReq = api.BuildQueryRangeRequest(httpReq, &tempopb.QueryRangeRequest{
+		Query: "{} | rate()",
+		Start: uint64(1100 * time.Second),
+		End:   uint64(1300 * time.Second),
+		Step:  uint64(100 * time.Second),
+	}, "")
+	httpReq = httpReq.WithContext(user.InjectOrgID(httpReq.Context(), "foo"))
+
+	resp, err := handler.RoundTrip(httpReq)
+	require.NoError(t, err) // the 400 is carried in-band on resp, not as a Go error
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+
+	// the result log must record WHY the request failed, not a nil error
+	require.Contains(t, logger.String(), reason)
+}

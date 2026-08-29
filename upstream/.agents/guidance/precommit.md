@@ -1,0 +1,117 @@
+# Pre-Commit Checklist
+
+Run these before pushing. They cover the most common local checks; CI may run additional validation (e.g. jsonnetfmt, integration tests).
+
+---
+
+## Formatting
+
+```bash
+make fmt
+```
+
+Uses `gofumpt` and `goimports`. CI runs `make check-fmt` and fails if the tree is dirty — so run this first.
+
+---
+
+## Linting
+
+```bash
+make lint
+```
+
+Runs `golangci-lint`. CI lints only the diff against the base branch:
+
+```bash
+make lint base=origin/main
+```
+
+Run the diff-scoped version locally to match CI exactly when working on a large repo.
+
+---
+
+## Unit Tests
+
+```bash
+# All packages
+make test
+
+# With race detector and coverage (matches CI splits)
+make test-with-cover
+```
+
+CI splits tests into four jobs — `pkg`, `tempodb`, `tempodb/wal`, and `others`. You can run individual splits to match:
+
+```bash
+make test-with-cover-pkg
+make test-with-cover-tempodb
+make test-with-cover-tempodb-wal
+make test-with-cover-others
+```
+
+---
+
+## E2e Tests
+
+E2e tests require Docker. They build a local Tempo image before running.
+
+```bash
+# Full suite
+make test-e2e
+
+# Individual suites
+make test-e2e-api
+make test-e2e-operations
+make test-e2e-limits
+make test-e2e-metrics-generator
+make test-e2e-storage
+```
+
+E2e tests live in `integration/e2e/`. After a run, clean up Docker-owned test directories:
+
+```bash
+make test-e2e-clean
+```
+
+---
+
+## Minimum Bar Before Opening a PR
+
+1. `make fmt` — no dirty tree
+2. `make lint base=origin/main` — no new lint errors
+3. `make test` — all unit tests pass
+4. `go test -race ./...` (or `make test-with-cover`) — no races in changed packages
+5. `make chlog-validate` — a `.chloggen/` entry exists for user-facing changes
+   (never edit `CHANGELOG.md` directly; see `.chloggen/README.md`)
+
+---
+
+## PR Description
+
+When opening a PR,
+read [`.github/pull_request_template.md`](../../.github/pull_request_template.md)
+and use it as the structure for the PR body,
+filling in each section and checklist item.
+
+Note for non-interactive tooling:
+passing an explicit body to `gh pr create` (`--body` / `--body-file`)
+bypasses GitHub's template auto-fill,
+so the template must be applied manually.
+
+---
+
+## Pushing to a PR Under Review
+
+Once a PR has received a review,
+don't rewrite history the reviewer has already seen.
+
+- Address review feedback by pushing new commits —
+  don't amend, squash, or rebase commits that have been reviewed.
+- Don't force push to a branch under active review.
+  This includes `git push --force-with-lease`;
+  it protects against clobbering others' work,
+  but it still rewrites history
+  and breaks GitHub's "changes since your last review" view.
+- The one exception is rebasing on `main`, for example to resolve conflicts.
+  When you must, push the rebase on its own with no other changes mixed in,
+  and note it in a PR comment.

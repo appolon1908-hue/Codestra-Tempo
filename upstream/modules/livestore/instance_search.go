@@ -1,0 +1,1084 @@
+/*
+* livestore is based on ingester/instance_search.go any changes here should be reflected there and vice versa.
+ */
+package livestore
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"runtime/debug"
+	"sync"
+	"time"
+
+	"github.com/gogo/protobuf/proto"
+	"github.com/google/uuid"
+	"github.com/segmentio/fasthash/fnv1a"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	oteltrace "go.opentelemetry.io/otel/trace"
+	"go.uber.org/atomic"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	"github.com/go-kit/log/level"
+	"github.com/grafana/tempo/modules/overrides"
+	"github.com/grafana/tempo/pkg/api"
+	"github.com/grafana/tempo/pkg/boundedwaitgroup"
+	"github.com/grafana/tempo/pkg/collector"
+	tempo_io "github.com/grafana/tempo/pkg/io"
+	"github.com/grafana/tempo/pkg/model/trace"
+	"github.com/grafana/tempo/pkg/tempopb"
+	"github.com/grafana/tempo/pkg/traceql"
+	"github.com/grafana/tempo/pkg/util"
+	"github.com/grafana/tempo/pkg/validation"
+	"github.com/grafana/tempo/tempodb/backend"
+	"github.com/grafana/tempo/tempodb/encoding/common"
+)
+
+var (
+	tracer = otel.Tracer("modules/livestore")
+
+	errComplete = errors.New("complete")
+
+	// emptyTagValuesCacheEntry is a non-empty sentinel written to the tag-value disk
+	// cache when a block yields no values, so tag-less blocks aren't re-scanned on
+	// every query. 0x00 is not a valid protobuf tag (field 0), so it never collides
+	// with a marshaled SearchTagValuesV2Response.
+	emptyTagValuesCacheEntry = []byte{0x00}
+)
+
+const (
+	timeBuffer = 5 * time.Minute
+)
+
+type block interface {
+	common.Searcher
+	common.Finder
+}
+
+// blockFn defines a function that processes a single block
+type blockFn func(ctx context.Context, meta *backend.BlockMeta, b block) error
+
+// iterateBlocks provides a way to iterate over all blocks (head, wal, complete)
+// using concurrent processing with bounded concurrency.
+func (i *instance) iterateBlocks(ctx context.Context, reqStart, reqEnd time.Time, fn blockFn) error {
+	ctx, span := tracer.Start(ctx, "instance.iterateBlocks",
+		oteltrace.WithAttributes(attribute.String("tenant", i.tenantID)))
+	defer span.End()
+
+	snap := i.blocks.Load()
+
+	var anyErr atomic.Error
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	handleErr := func(err error) {
+		if err == nil {
+			return
+		}
+		cancel()
+
+		// we're not storing errComplete for obvious reasons. context.Canceled is ignored b/c it may be due to the
+		// cancel above which is not an error. if the context is cancelled, by something above this method than the caller
+		// can still detect and return it
+		if errors.Is(err, errComplete) || errors.Is(err, context.Canceled) {
+			return
+		}
+		anyErr.Store(err)
+	}
+
+	// headBlock meta is mutated in place by AppendTrace; use MetaSnapshot
+	// for a stable copy.
+	if snap.headBlock != nil {
+		meta := snap.headBlock.MetaSnapshot()
+		if includeBlock(meta, reqStart, reqEnd) {
+			ctx, span := tracer.Start(ctx, "process.headBlock")
+			span.SetAttributes(attribute.String("blockID", meta.BlockID.String()))
+
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						level.Error(i.logger).Log("msg", "panic in iterateBlocks head block", "blockID", meta.BlockID, "panic", r, "stack", string(debug.Stack()))
+						handleErr(fmt.Errorf("processing head block (%s): panic: %v", meta.BlockID, r))
+					}
+				}()
+				if err := fn(ctx, meta, snap.headBlock); err != nil {
+					handleErr(fmt.Errorf("processing head block (%s): %w", meta.BlockID, err))
+				}
+			}()
+			span.End()
+		}
+	}
+
+	if err := anyErr.Load(); err != nil {
+		return err
+	}
+
+	wg := boundedwaitgroup.New(i.Cfg.QueryBlockConcurrency)
+
+	// Process wal blocks
+	for _, b := range snap.walBlocks {
+		if ctx.Err() != nil {
+			continue
+		}
+
+		meta := b.BlockMeta()
+		if !includeBlock(meta, reqStart, reqEnd) {
+			continue
+		}
+
+		wg.Add(1)
+		go func(block common.WALBlock) {
+			defer wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					level.Error(i.logger).Log("msg", "panic in iterateBlocks wal block", "blockID", meta.BlockID, "panic", r, "stack", string(debug.Stack()))
+					handleErr(fmt.Errorf("processing wal block (%s): panic: %v", meta.BlockID, r))
+				}
+			}()
+
+			if ctx.Err() != nil {
+				return
+			}
+
+			ctx, span := tracer.Start(ctx, "process.walBlock")
+			span.SetAttributes(attribute.String("blockID", meta.BlockID.String()))
+			defer span.End()
+
+			if err := fn(ctx, meta, block); err != nil {
+				handleErr(fmt.Errorf("processing wal block (%s): %w", meta.BlockID, err))
+			}
+		}(b)
+	}
+
+	// Process complete blocks
+	for _, b := range snap.completeBlocks {
+		if ctx.Err() != nil {
+			continue
+		}
+
+		meta := b.BlockMeta()
+		if !includeBlock(meta, reqStart, reqEnd) {
+			continue
+		}
+
+		wg.Add(1)
+		go func(block *LocalBlock) {
+			defer wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					level.Error(i.logger).Log("msg", "panic in iterateBlocks complete block", "blockID", meta.BlockID, "panic", r, "stack", string(debug.Stack()))
+					handleErr(fmt.Errorf("processing complete block (%s): panic: %v", meta.BlockID, r))
+				}
+			}()
+
+			if ctx.Err() != nil {
+				return
+			}
+
+			ctx, span := tracer.Start(ctx, "process.completeBlock")
+			span.SetAttributes(attribute.String("blockID", meta.BlockID.String()))
+			defer span.End()
+
+			if err := fn(ctx, meta, block); err != nil {
+				handleErr(fmt.Errorf("processing complete block (%s): %w", meta.BlockID, err))
+			}
+		}(b)
+	}
+
+	wg.Wait()
+
+	if err := anyErr.Load(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (i *instance) Search(ctx context.Context, req *tempopb.SearchRequest) (*tempopb.SearchResponse, error) {
+	ctx, span := tracer.Start(ctx, "instance.Search")
+	defer span.End()
+
+	maxResults := int(req.Limit)
+	// if limit is not set, use a safe default
+	if maxResults == 0 {
+		maxResults = 20
+	}
+
+	span.AddEvent("SearchRequest", oteltrace.WithAttributes(attribute.String("request", req.String())))
+
+	mostRecent := false
+	if len(req.Query) > 0 {
+		rootExpr, err := traceql.ParseNoOptimizations(req.Query)
+		if err != nil {
+			return nil, fmt.Errorf("error parsing query: %w", err)
+		}
+
+		ok := false
+		if mostRecent, ok = rootExpr.Hints.GetBool(traceql.HintMostRecent, false); !ok {
+			mostRecent = false
+		}
+	}
+
+	var (
+		resultsMtx = sync.Mutex{}
+		combiner   = traceql.NewMetadataCombiner(maxResults, mostRecent)
+		metrics    = &tempopb.SearchMetrics{}
+		opts       = common.DefaultSearchOptions()
+	)
+
+	search := func(ctx context.Context, blockMeta *backend.BlockMeta, b block) error {
+		var resp *tempopb.SearchResponse
+		var err error
+
+		// if the combiner is complete for the block's end time, we can skip searching it
+		if combiner.IsCompleteFor(uint32(blockMeta.EndTime.Unix())) {
+			return errComplete
+		}
+
+		if api.IsTraceQLQuery(req) {
+			f := traceql.NewSpansetFetcherWrapperBoth(
+				func(ctx context.Context, req traceql.FetchSpansRequest) (traceql.FetchSpansResponse, error) {
+					return b.Fetch(ctx, req, opts)
+				},
+				func(ctx context.Context, req traceql.FetchSpansRequest) (traceql.FetchSpansOnlyResponse, error) {
+					return b.FetchSpans(ctx, req, opts)
+				},
+			)
+			// note: we are creating new engine for each wal block,
+			// and engine.ExecuteSearch is parsing the query for each block
+			var searchOpts []traceql.CompileOption
+			if i.overrides.UnsafeQueryHints(i.tenantID) {
+				searchOpts = append(searchOpts, traceql.WithUnsafeHints(true))
+			}
+			for _, name := range req.SkipASTTransformations {
+				searchOpts = append(searchOpts, traceql.WithSkipOptimization(name))
+			}
+			searchOpts = append(searchOpts, overrides.SpanPruningAwarenessCompileOptions(i.overrides.SpanPruningAwareness(i.tenantID))...)
+			if p := i.overrides.EngineBytesTracking(i.tenantID); p != nil {
+				searchOpts = append(searchOpts, traceql.WithEngineBytesTracking(*p))
+			}
+			resp, err = traceql.NewEngine().ExecuteSearch(ctx, req, f, searchOpts...)
+		} else {
+			resp, err = b.Search(ctx, req, opts)
+		}
+
+		if errors.Is(err, util.ErrUnsupported) {
+			level.Warn(i.logger).Log("msg", "block does not support search", "blockID", blockMeta.BlockID)
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+
+		if resp == nil {
+			return nil
+		}
+
+		resultsMtx.Lock()
+		defer resultsMtx.Unlock()
+
+		metrics = tempopb.MergeSearchMetrics(metrics, resp.Metrics)
+
+		for _, tr := range resp.Traces {
+			combiner.AddMetadata(tr)
+			if combiner.IsCompleteFor(traceql.TimestampNever) {
+				return errComplete
+			}
+		}
+
+		return nil
+	}
+
+	err := i.iterateBlocks(ctx, time.Unix(int64(req.Start), 0), time.Unix(int64(req.End), 0), search)
+	if err != nil {
+		level.Error(i.logger).Log("msg", "error in Search", "err", err)
+		return nil, fmt.Errorf("Search: %w", err)
+	}
+
+	metricQueryInspectedBytesTotal.WithLabelValues(i.tenantID, queryOpSearch).Add(float64(metrics.InspectedBytes))
+
+	return &tempopb.SearchResponse{
+		Traces:  combiner.Metadata(),
+		Metrics: metrics,
+	}, nil
+}
+
+func (i *instance) SearchTags(ctx context.Context, scope string) (*tempopb.SearchTagsResponse, error) {
+	v2Response, err := i.SearchTagsV2(ctx, &tempopb.SearchTagsRequest{Scope: scope})
+	if err != nil {
+		return nil, err
+	}
+
+	distinctValues := collector.NewDistinctString(0, 0, 0) // search tags v2 enforces the limit
+
+	// flatten v2 response
+	for _, s := range v2Response.Scopes {
+		for _, t := range s.Tags {
+			distinctValues.Collect(t)
+		}
+	}
+
+	return &tempopb.SearchTagsResponse{
+		TagNames: distinctValues.Strings(),
+		Metrics:  v2Response.Metrics, // send metrics with response
+	}, nil
+}
+
+// SearchTagsV2 calls SearchTags for each scope and returns the results.
+func (i *instance) SearchTagsV2(ctx context.Context, req *tempopb.SearchTagsRequest) (*tempopb.SearchTagsV2Response, error) {
+	ctx, span := tracer.Start(ctx, "instance.SearchTagsV2")
+	defer span.End()
+
+	userID, err := validation.ExtractValidTenantID(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	scope := req.Scope
+
+	if scope == api.ParamScopeIntrinsic {
+		// For the intrinsic scope there is nothing to do in the live store,
+		// these are always added by the frontend.
+		return &tempopb.SearchTagsV2Response{}, nil
+	}
+
+	// parse for normal scopes
+	attributeScope := traceql.AttributeScopeFromString(scope)
+	if attributeScope == traceql.AttributeScopeUnknown {
+		return nil, fmt.Errorf("unknown scope: %s", scope)
+	}
+
+	maxBytestPerTags := i.overrides.MaxBytesPerTagValuesQuery(userID)
+	distinctValues := collector.NewScopedDistinctString(maxBytestPerTags, req.MaxTagsPerScope, req.StaleValuesThreshold)
+	mc := collector.NewMetricsCollector()
+
+	engine := traceql.NewEngine()
+	conditionGroups, err := traceql.ExtractConditionGroups(req.Query, i.overrides.MaxConditionGroupsPerTagQuery())
+	if err != nil {
+		if errors.Is(err, traceql.ErrMaxConditionGroupsPerTagQueryReached) {
+			return nil, status.Errorf(codes.InvalidArgument, "%s", err)
+		}
+		return nil, err
+	}
+
+	searchBlock := func(ctx context.Context, _ *backend.BlockMeta, b block) error {
+		if b == nil {
+			return nil
+		}
+
+		if distinctValues.Exceeded() {
+			return errComplete
+		}
+
+		// if the query is empty, use the unfiltered search
+		if len(conditionGroups) == 0 {
+			err := b.SearchTags(ctx, attributeScope, func(t string, scope traceql.AttributeScope) {
+				distinctValues.Collect(scope.String(), t)
+			}, mc.Add, common.DefaultSearchOptions())
+
+			if err != nil && !errors.Is(err, util.ErrUnsupported) {
+				return err
+			}
+
+			return nil
+		}
+
+		// otherwise use the filtered search
+		fetcher := traceql.NewTagNamesFetcherWrapper(func(ctx context.Context, req traceql.FetchTagsRequest, cb traceql.FetchTagsCallback) error {
+			return b.FetchTagNames(ctx, req, cb, mc.Add, common.DefaultSearchOptions())
+		})
+
+		return engine.ExecuteTagNames(ctx, attributeScope, conditionGroups, func(tag string, scope traceql.AttributeScope) bool {
+			return distinctValues.Collect(scope.String(), tag)
+		}, fetcher)
+	}
+
+	err = i.iterateBlocks(ctx, time.Unix(int64(req.Start), 0), time.Unix(int64(req.End), 0), searchBlock)
+	if err != nil {
+		level.Error(i.logger).Log("msg", "error in SearchTagsV2", "err", err)
+		return nil, fmt.Errorf("SearchTagsV2: %w", err)
+	}
+
+	if distinctValues.Exceeded() {
+		level.Warn(i.logger).Log("msg", "Search of tags exceeded limit, reduce cardinality or size of tags", "orgID", userID, "stopReason", distinctValues.StopReason())
+	}
+
+	metricQueryInspectedBytesTotal.WithLabelValues(i.tenantID, queryOpSearchTags).Add(float64(mc.TotalValue()))
+
+	collected := distinctValues.Strings()
+	resp := &tempopb.SearchTagsV2Response{
+		Scopes: make([]*tempopb.SearchTagsV2Scope, 0, len(collected)+1), // +1 for intrinsic below
+		Metrics: &tempopb.MetadataMetrics{
+			InspectedBytes: mc.TotalValue(), // capture metrics
+		},
+	}
+	for scope, vals := range collected {
+		resp.Scopes = append(resp.Scopes, &tempopb.SearchTagsV2Scope{
+			Name: scope,
+			Tags: vals,
+		})
+	}
+
+	return resp, nil
+}
+
+func (i *instance) SearchTagValues(ctx context.Context, req *tempopb.SearchTagValuesRequest) (*tempopb.SearchTagValuesResponse, error) {
+	userID, err := validation.ExtractValidTenantID(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	tagName := req.TagName
+	limit := req.MaxTagValues
+	staleValueThreshold := req.StaleValueThreshold
+
+	maxBytesPerTagValues := i.overrides.MaxBytesPerTagValuesQuery(userID)
+	distinctValues := collector.NewDistinctString(maxBytesPerTagValues, limit, staleValueThreshold)
+	mc := collector.NewMetricsCollector()
+
+	var inspectedBlocks atomic.Int32
+	var maxBlocks int32
+	if limit := i.overrides.MaxBlocksPerTagValuesQuery(userID); limit > 0 {
+		maxBlocks = int32(limit)
+	}
+
+	search := func(ctx context.Context, _ *backend.BlockMeta, b block) error {
+		if b == nil {
+			return nil
+		}
+
+		if distinctValues.Exceeded() {
+			return errComplete
+		}
+
+		// Atomically reserve a slot
+		if maxBlocks > 0 && inspectedBlocks.Inc() > maxBlocks {
+			return errComplete
+		}
+
+		err := b.SearchTagValues(ctx, tagName, distinctValues.Collect, mc.Add, common.DefaultSearchOptions())
+		if err != nil && !errors.Is(err, util.ErrUnsupported) {
+			return fmt.Errorf("unexpected error searching tag values (%s): %w", tagName, err)
+		}
+
+		return nil
+	}
+
+	err = i.iterateBlocks(ctx, time.Unix(int64(req.Start), 0), time.Unix(int64(req.End), 0), search)
+	if err != nil {
+		level.Error(i.logger).Log("msg", "error in SearchTagValues", "err", err)
+		return nil, fmt.Errorf("SearchTagValues: %w", err)
+	}
+
+	if distinctValues.Exceeded() {
+		level.Warn(i.logger).Log("msg", "Search of tags exceeded limit,  reduce cardinality or size of tags", "tag", tagName, "orgID", userID, "stopReason", distinctValues.StopReason())
+	}
+
+	metricQueryInspectedBytesTotal.WithLabelValues(i.tenantID, queryOpSearchTagValues).Add(float64(mc.TotalValue()))
+
+	return &tempopb.SearchTagValuesResponse{
+		TagValues: distinctValues.Strings(),
+		Metrics:   &tempopb.MetadataMetrics{InspectedBytes: mc.TotalValue()},
+	}, nil
+}
+
+func (i *instance) SearchTagValuesV2(ctx context.Context, req *tempopb.SearchTagValuesRequest) (*tempopb.SearchTagValuesV2Response, error) {
+	userID, err := validation.ExtractValidTenantID(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	ctx, span := tracer.Start(ctx, "instance.SearchTagValuesV2")
+	defer span.End()
+
+	limit := i.overrides.MaxBytesPerTagValuesQuery(userID)
+	vCollector := collector.NewDistinctValue(limit, req.MaxTagValues, req.StaleValueThreshold, func(v tempopb.TagValue) int { return len(v.Type) + len(v.Value) })
+	mCollector := collector.NewMetricsCollector() // to collect bytesRead metric
+
+	engine := traceql.NewEngine()
+
+	var inspectedBlocks atomic.Int32
+	var maxBlocks int32
+	if limit := i.overrides.MaxBlocksPerTagValuesQuery(userID); limit > 0 {
+		maxBlocks = int32(limit)
+	}
+
+	tag, err := traceql.ParseIdentifier(req.TagName)
+	if err != nil {
+		return nil, err
+	}
+	if tag == traceql.IntrinsicLinkTraceIDAttribute ||
+		tag == traceql.IntrinsicLinkSpanIDAttribute ||
+		tag == traceql.IntrinsicSpanIDAttribute ||
+		tag == traceql.IntrinsicTraceIDAttribute ||
+		tag == traceql.IntrinsicParentIDAttribute {
+		// do not return tag values for IDs
+		return &tempopb.SearchTagValuesV2Response{}, nil
+	}
+
+	conditionGroups, err := traceql.ExtractConditionGroups(req.Query, i.overrides.MaxConditionGroupsPerTagQuery())
+	if err != nil {
+		if errors.Is(err, traceql.ErrMaxConditionGroupsPerTagQueryReached) {
+			return nil, status.Errorf(codes.InvalidArgument, "%s", err)
+		}
+		return nil, err
+	}
+	// cacheKey will be same for all blocks in a request so only compute it once
+	// NOTE: cacheKey tag name and query, so if we start respecting start and end, add them to the cacheKey
+	cacheKey := searchTagValuesV2CacheKey(req, limit, "cache_search_tagvaluesv2")
+
+	// helper functions as closures, to access local variables
+	search := func(ctx context.Context, s common.Searcher, collect func(tempopb.TagValue) bool) error {
+		// note the interaction below with searchWithCache. if we ever return errComplete for reasons besides this we may need to adjust the error handling there
+		if maxBlocks > 0 && inspectedBlocks.Inc() > maxBlocks {
+			return errComplete
+		}
+
+		if len(conditionGroups) == 0 {
+			return s.SearchTagValuesV2(ctx, tag, traceql.MakeCollectTagValueFunc(collect), mCollector.Add, common.DefaultSearchOptions())
+		}
+
+		// Otherwise, use the filtered search
+		fetcher := traceql.NewTagValuesFetcherWrapper(func(ctx context.Context, req traceql.FetchTagValuesRequest, cb traceql.FetchTagValuesCallback) error {
+			return s.FetchTagValues(ctx, req, cb, mCollector.Add, common.DefaultSearchOptions())
+		})
+
+		return engine.ExecuteTagValues(ctx, tag, conditionGroups, traceql.MakeCollectTagValueFunc(collect), fetcher, i.overrides.MaxConditionGroupsPerTagQuery())
+	}
+
+	searchWithCache := func(ctx context.Context, _ *backend.BlockMeta, b block) error {
+		// Only complete (Local) blocks are cached. Complete blocks are immutable, so a
+		// cached result -- including a negative/empty one -- stays correct for the block's
+		// lifetime. The head and WAL blocks (which still receive appends before being cut)
+		// are always searched fresh here, so newly-arrived values can never be masked by a
+		// cache entry: new data lands in the head block and is searched directly.
+		localB, ok := b.(*LocalBlock)
+		if !ok {
+			return search(ctx, b, vCollector.Collect)
+		}
+
+		// pulled from context to add attrs below
+		span := oteltrace.SpanFromContext(ctx)
+
+		// check the cache first. GetDiskCache maps a cache miss to (nil, nil), so a
+		// non-nil error here is a real read failure. Either way we fall through to
+		// search the block rather than dropping its values from the response.
+		cacheData, err := localB.GetDiskCache(ctx, cacheKey)
+		if err != nil {
+			_ = level.Warn(i.logger).Log("msg", "GetDiskCache failed", "err", err)
+			cacheData = nil
+		}
+
+		// we got data...unmarshall, and add values to central collector and add bytesRead
+		if len(cacheData) > 0 {
+			if bytes.Equal(cacheData, emptyTagValuesCacheEntry) {
+				// negative cache hit: this block has no values for the tag, so don't re-scan it
+				span.SetAttributes(attribute.Bool("cached", true))
+				mCollector.Add(uint64(len(cacheData)))
+				return nil
+			}
+			resp := &tempopb.SearchTagValuesV2Response{}
+			if err := proto.Unmarshal(cacheData, resp); err != nil {
+				// corrupt cache entry: log and fall through to search the block below
+				_ = level.Warn(i.logger).Log("msg", "GetDiskCache unmarshal failed", "err", err)
+			} else {
+				span.SetAttributes(attribute.Bool("cached", true))
+				// On a cache hit we only read the cache file, so report its size as the
+				// inspected bytes for this block. The cached payload stores only TagValues
+				// (not Metrics), so the original scan's byte count isn't available here.
+				mCollector.Add(uint64(len(cacheData)))
+
+				for _, v := range resp.TagValues {
+					if vCollector.Collect(*v) {
+						return errComplete
+					}
+				}
+				return nil
+			}
+		}
+
+		// cache miss or unusable cache entry, search the block and cache the result
+		// (empty results are cached too, via a sentinel; see below).
+		span.SetAttributes(attribute.Bool("cached", false))
+		// using local collector to collect values from the block and cache them.
+		localCol := collector.NewDistinctValue[tempopb.TagValue](limit, req.MaxTagValues, req.StaleValueThreshold, func(v tempopb.TagValue) int { return len(v.Type) + len(v.Value) })
+
+		if err := search(ctx, localB, localCol.Collect); err != nil { // note that errComplete could be returned here but it's ok to pass it up b/c it means no work was done and the localCol is invalid
+			return err
+		}
+
+		// marshal the values local collector and set the cache
+		values := localCol.Values()
+		v2RespProto, err := valuesToTagValuesV2RespProto(values)
+		if err == nil {
+			// cache the result, using a sentinel for empty results so a tag-less
+			// block records a hit and isn't re-scanned on the next query.
+			cacheEntry := v2RespProto
+			if len(cacheEntry) == 0 {
+				cacheEntry = emptyTagValuesCacheEntry
+			}
+			if err2 := localB.SetDiskCache(ctx, cacheKey, cacheEntry); err2 != nil {
+				_ = level.Warn(i.logger).Log("msg", "SetDiskCache failed", "err", err2)
+			}
+		}
+
+		// now add values to the central collector to make sure they are included in the response.
+		for _, v := range values {
+			if vCollector.Collect(v) {
+				return errComplete
+			}
+		}
+		return nil
+	}
+
+	err = i.iterateBlocks(ctx, time.Unix(int64(req.Start), 0), time.Unix(int64(req.End), 0), searchWithCache)
+	if err != nil {
+		level.Error(i.logger).Log("msg", "error in SearchTagValuesV2", "err", err)
+		return nil, fmt.Errorf("SearchTagValuesV2: %w", err)
+	}
+
+	if vCollector.Exceeded() {
+		_ = level.Warn(i.logger).Log("msg", "size of tag values exceeded limit, reduce cardinality or size of tags", "tag", req.TagName, "tenant", userID, "limit", limit, "size", vCollector.Size())
+	}
+
+	metricQueryInspectedBytesTotal.WithLabelValues(i.tenantID, queryOpSearchTagValues).Add(float64(mCollector.TotalValue()))
+
+	resp := &tempopb.SearchTagValuesV2Response{
+		Metrics: &tempopb.MetadataMetrics{InspectedBytes: mCollector.TotalValue()}, // include metrics in response
+	}
+
+	for _, v := range vCollector.Values() {
+		v2 := v
+		resp.TagValues = append(resp.TagValues, &v2)
+	}
+
+	return resp, nil
+}
+
+func (i *instance) FindByTraceID(ctx context.Context, traceID []byte, allowPartialTrace bool) (*tempopb.TraceByIDResponse, error) {
+	// TODO(issue/1274): populate metrics.BackendReads / BackendBytes / AdditionalMetrics
+	// from per-block FetchSpansStats. The new proto fields exist (Task B) but the
+	// trace-by-ID path here still only reports InspectedBytes.
+	var (
+		metricsMtx sync.Mutex
+		metrics    = tempopb.TraceByIDMetrics{}
+		maxBytes   = i.overrides.MaxBytesPerTrace(i.tenantID)
+		searchOpts = common.DefaultSearchOptions()
+		combiner   = trace.NewCombiner(maxBytes, allowPartialTrace)
+	)
+
+	if !allowPartialTrace {
+		searchOpts = common.DefaultSearchOptionsWithMaxBytes(maxBytes)
+	}
+
+	// Check live traces first
+	i.liveTracesMtx.Lock()
+	if liveTrace, ok := i.liveTraces.Traces[util.HashForTraceID(traceID)]; ok {
+		tempTrace := &tempopb.Trace{}
+		tempTrace.ResourceSpans = liveTrace.Batches
+		// Previously there was some logic here to add inspected bytes in the ingester. But its hard to do with the different
+		// live traces format and feels inaccurate.
+		_, err := combiner.Consume(tempTrace)
+		if err != nil {
+			i.liveTracesMtx.Unlock()
+			return nil, fmt.Errorf("unable to unmarshal liveTrace: %w", err)
+		}
+	}
+	i.liveTracesMtx.Unlock()
+
+	search := func(ctx context.Context, _ *backend.BlockMeta, b block) error {
+		trace, err := b.FindTraceByID(ctx, traceID, searchOpts)
+		if err != nil {
+			return err
+		}
+		if trace == nil {
+			return nil
+		}
+
+		_, err = combiner.Consume(trace.Trace)
+		if err != nil {
+			return err
+		}
+
+		if trace.Metrics != nil {
+			metricsMtx.Lock()
+			defer metricsMtx.Unlock()
+
+			metrics.InspectedBytes += trace.Metrics.InspectedBytes
+		}
+		return nil
+	}
+
+	err := i.iterateBlocks(ctx, time.Unix(0, 0), time.Unix(0, 0), search)
+	if err != nil {
+		level.Error(i.logger).Log("msg", "error in FindTraceByID", "err", err)
+		return nil, fmt.Errorf("error searching for trace: %w", err)
+	}
+
+	metricQueryInspectedBytesTotal.WithLabelValues(i.tenantID, queryOpTraceByID).Add(float64(metrics.InspectedBytes))
+
+	result, _ := combiner.Result()
+	response := &tempopb.TraceByIDResponse{
+		Trace:   result,
+		Metrics: &metrics,
+	}
+	return response, nil
+}
+
+// QueryRange returns metrics.
+func (i *instance) QueryRange(ctx context.Context, req *tempopb.QueryRangeRequest) (*tempopb.QueryRangeResponse, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	e := traceql.NewEngine()
+
+	// Parse without optimizations to read hints; optimizations are applied by CompileMetricsQueryRange.
+	expr, err := traceql.ParseNoOptimizations(req.Query)
+	if err != nil {
+		return nil, fmt.Errorf("compiling query: %w", err)
+	}
+
+	var compileOpts []traceql.CompileOption
+
+	unsafe := i.overrides.UnsafeQueryHints(i.tenantID)
+	if unsafe {
+		compileOpts = append(compileOpts, traceql.WithUnsafeHints(true))
+	}
+	for _, name := range req.SkipASTTransformations {
+		compileOpts = append(compileOpts, traceql.WithSkipOptimization(name))
+	}
+
+	if v, ok := expr.Hints.GetFloat(traceql.HintTimeOverlapCutoff, unsafe); ok && v >= 0 && v <= 1.0 {
+		compileOpts = append(compileOpts, traceql.WithTimeOverlapCutoff(v))
+	} else {
+		compileOpts = append(compileOpts, traceql.WithTimeOverlapCutoff(i.Cfg.Metrics.TimeOverlapCutoff))
+	}
+
+	if p := i.overrides.MetricsSpanOnlyFetch(i.tenantID); p != nil {
+		compileOpts = append(compileOpts, traceql.WithSpanOnlyFetch(*p))
+	}
+
+	compileOpts = append(compileOpts, overrides.SpanPruningAwarenessCompileOptions(i.overrides.SpanPruningAwareness(i.tenantID))...)
+	if p := i.overrides.EngineBytesTracking(i.tenantID); p != nil {
+		compileOpts = append(compileOpts, traceql.WithEngineBytesTracking(*p))
+	}
+
+	// Compile the raw version of the query for head and wal blocks
+	// These aren't cached and we put them all into the same evaluator
+	// for efficiency. iterateBlocks below evaluates wal blocks concurrently against this
+	// one evaluator, so it needs a lock; queryRangeCompleteBlock below compiles its own
+	// private evaluator per complete block and doesn't share one, so compileOpts (used there)
+	// intentionally omits the lock.
+	var rawEvalMtx sync.Mutex
+	rawCompileOpts := append([]traceql.CompileOption{traceql.WithLock(&rawEvalMtx)}, compileOpts...)
+	rawEval, err := e.CompileMetricsQueryRange(req, rawCompileOpts...)
+	if err != nil {
+		return nil, err
+	}
+
+	// This is a summation version of the query for complete blocks
+	// which can be cached. They are timeseries, so they need the job-level evaluator.
+	jobEval, err := traceql.NewEngine().CompileMetricsQueryRangeNonRaw(req, traceql.AggregateModeSum, compileOpts...)
+	if err != nil {
+		return nil, err
+	}
+
+	cutoff := time.Now().Add(-i.Cfg.CompleteBlockTimeout).Add(-timeBuffer)
+	if req.Start < uint64(cutoff.UnixNano()) {
+		return nil, fmt.Errorf("time range must be within last %v", i.Cfg.CompleteBlockTimeout)
+	}
+
+	var (
+		maxSeries        = int(req.MaxSeries)
+		maxSeriesReached atomic.Bool
+		metricsMtx       sync.Mutex
+		metrics          = &tempopb.SearchMetrics{}
+	)
+	mergeMetrics := func(src *tempopb.SearchMetrics) {
+		if src == nil {
+			return
+		}
+		metricsMtx.Lock()
+		defer metricsMtx.Unlock()
+		metrics = tempopb.MergeSearchMetrics(metrics, src)
+	}
+
+	search := func(ctx context.Context, _ *backend.BlockMeta, b block) error {
+		if walBlock, ok := b.(common.WALBlock); ok {
+			err := i.queryRangeWALBlock(ctx, walBlock, rawEval, maxSeries)
+			if err != nil {
+				return err
+			}
+			if maxSeries > 0 && rawEval.Length() > maxSeries {
+				maxSeriesReached.Store(true)
+				return errComplete
+			}
+			return nil
+		}
+
+		if localBlock, ok := b.(*LocalBlock); ok {
+			resp, err := i.queryRangeCompleteBlock(ctx, localBlock, *req, compileOpts)
+			if err != nil {
+				return err
+			}
+			if resp != nil {
+				mergeMetrics(resp.Metrics)
+				jobEval.ObserveSeries(resp.Series)
+			}
+			if maxSeries > 0 && jobEval.Length() > maxSeries {
+				maxSeriesReached.Store(true)
+				return errComplete
+			}
+			return nil
+		}
+
+		return fmt.Errorf("unexpected block type: %T", b)
+	}
+
+	err = i.iterateBlocks(ctx, time.Unix(0, int64(req.Start)), time.Unix(0, int64(req.End)), search)
+	if err != nil {
+		level.Error(i.logger).Log("msg", "error in QueryRange", "err", err)
+		return nil, err
+	}
+
+	// Combine the raw results into the job results
+	walResults := rawEval.Results().ToProto(req)
+	jobEval.ObserveSeries(walResults)
+
+	r := jobEval.Results()
+	rr := r.ToProto(req)
+
+	rawEm := rawEval.Metrics()
+	mergeMetrics(&tempopb.SearchMetrics{
+		InspectedBytes:    rawEm.Bytes,
+		BackendReads:      rawEm.BackendReads,
+		BackendBytes:      rawEm.BackendBytes,
+		AdditionalMetrics: rawEm.AdditionalMetrics,
+	})
+	metricQueryInspectedBytesTotal.WithLabelValues(i.tenantID, queryOpQueryRange).Add(float64(metrics.InspectedBytes))
+
+	if maxSeriesReached.Load() {
+		return &tempopb.QueryRangeResponse{
+			Series:  rr[:maxSeries],
+			Metrics: metrics,
+			Status:  tempopb.PartialStatus_PARTIAL,
+		}, nil
+	}
+
+	return &tempopb.QueryRangeResponse{
+		Series:  rr,
+		Metrics: metrics,
+	}, nil
+}
+
+func (i *instance) queryRangeWALBlock(ctx context.Context, b common.WALBlock, eval traceql.MetricsEvaluator, maxSeries int) error {
+	m := b.BlockMeta()
+	ctx, span := tracer.Start(ctx, "instance.QueryRange.WALBlock", oteltrace.WithAttributes(
+		attribute.String("block", m.BlockID.String()),
+		attribute.Int64("blockSize", int64(m.Size_)),
+	))
+	defer span.End()
+
+	fetcher := traceql.NewSpansetFetcherWrapperBoth(
+		func(ctx context.Context, req traceql.FetchSpansRequest) (traceql.FetchSpansResponse, error) {
+			return b.Fetch(ctx, req, common.DefaultSearchOptions())
+		},
+		func(ctx context.Context, req traceql.FetchSpansRequest) (traceql.FetchSpansOnlyResponse, error) {
+			return b.FetchSpans(ctx, req, common.DefaultSearchOptions())
+		},
+	)
+	return eval.Do(ctx, fetcher, uint64(m.StartTime.UnixNano()), uint64(m.EndTime.UnixNano()), maxSeries)
+}
+
+// queryRangeCompleteBlock returns the per-block QueryRangeResponse. A cache hit
+// reports InspectedBytes=0 since no parquet data was read, but still returns
+// cacheable AdditionalMetrics stored with the cached series. Returns nil when
+// the request does not overlap the block after alignment.
+func (i *instance) queryRangeCompleteBlock(ctx context.Context, b *LocalBlock, req tempopb.QueryRangeRequest, compileOpts []traceql.CompileOption) (*tempopb.QueryRangeResponse, error) {
+	m := b.BlockMeta()
+	ctx, span := tracer.Start(ctx, "instance.QueryRange.CompleteBlock", oteltrace.WithAttributes(
+		attribute.String("block", m.BlockID.String()),
+		attribute.Int64("blockSize", int64(m.Size_)),
+	))
+	defer span.End()
+
+	// Trim and align the request for this block. I.e. if the request is "Last Hour" we don't want to
+	// cache the response for that, we want only the few minutes time range for this block. This has
+	// size savings but the main thing is that the response is reuseable for any overlapping query.
+	req.Start, req.End, req.Step = traceql.TrimToBlockOverlap(&req, m.StartTime, m.EndTime)
+
+	if req.Start >= req.End {
+		// After alignment there is no overlap or something else isn't right
+		return nil, nil
+	}
+
+	name := queryRangeCacheName(req)
+
+	cached, err := i.queryRangeCacheGet(ctx, m, name)
+	if err != nil {
+		level.Warn(i.logger).Log("msg", "reading local query cache failed",
+			"block", m.BlockID.String(), "err", err)
+	}
+
+	span.SetAttributes(attribute.Bool("cached", cached != nil))
+
+	if cached != nil {
+		return cached, nil
+	}
+
+	eval, err := traceql.NewEngine().CompileMetricsQueryRange(&req, compileOpts...)
+	if err != nil {
+		return nil, err
+	}
+	f := traceql.NewSpansetFetcherWrapperBoth(
+		func(ctx context.Context, req traceql.FetchSpansRequest) (traceql.FetchSpansResponse, error) {
+			return b.Fetch(ctx, req, common.DefaultSearchOptions())
+		},
+		func(ctx context.Context, req traceql.FetchSpansRequest) (traceql.FetchSpansOnlyResponse, error) {
+			return b.FetchSpans(ctx, req, common.DefaultSearchOptions())
+		},
+	)
+	err = eval.Do(ctx, f, uint64(m.StartTime.UnixNano()), uint64(m.EndTime.UnixNano()), int(req.MaxSeries))
+	if err != nil {
+		return nil, err
+	}
+
+	results := eval.Results().ToProto(&req)
+	em := eval.Metrics()
+
+	resp := &tempopb.QueryRangeResponse{
+		Series: results,
+		Metrics: &tempopb.SearchMetrics{
+			InspectedBytes:    em.Bytes,
+			AdditionalMetrics: em.AdditionalMetrics,
+		},
+	}
+
+	// For caching only persist what is cacheable.
+	if err := i.queryRangeCacheSet(ctx, m, name, &tempopb.QueryRangeResponse{
+		Series: results,
+		Metrics: &tempopb.SearchMetrics{
+			AdditionalMetrics: tempopb.CacheableAdditionalMetrics(em.AdditionalMetrics),
+		},
+	}); err != nil {
+		level.Warn(i.logger).Log("msg", "writing local query cache failed",
+			"block", m.BlockID.String(), "err", err)
+	}
+
+	return resp, nil
+}
+
+func queryRangeCacheName(req tempopb.QueryRangeRequest) string {
+	return fmt.Sprintf("cache_query_range_%v.buf", queryRangeHashForBlock(req))
+}
+
+func (i *instance) queryRangeCacheGet(ctx context.Context, m *backend.BlockMeta, name string) (*tempopb.QueryRangeResponse, error) {
+	keyPath := backend.KeyPathForBlock(uuid.UUID(m.BlockID), m.TenantID)
+	reader, size, err := i.wal.LocalBackend().Read(ctx, name, keyPath, nil)
+	if err != nil {
+		if errors.Is(err, backend.ErrDoesNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	defer reader.Close()
+
+	data, err := tempo_io.ReadAllWithEstimate(reader, size)
+	if err != nil {
+		return nil, err
+	}
+
+	resp := &tempopb.QueryRangeResponse{}
+	if err := proto.Unmarshal(data, resp); err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
+func (i *instance) queryRangeCacheSet(ctx context.Context, m *backend.BlockMeta, name string, resp *tempopb.QueryRangeResponse) error {
+	data, err := proto.Marshal(resp)
+	if err != nil {
+		return err
+	}
+
+	keyPath := backend.KeyPathForBlock(uuid.UUID(m.BlockID), m.TenantID)
+	return i.wal.LocalBackend().WriteAtomic(ctx, name, keyPath, bytes.NewReader(data), int64(len(data)))
+}
+
+func queryRangeHashForBlock(req tempopb.QueryRangeRequest) uint64 {
+	h := fnv1a.HashString64(req.Query)
+	h = fnv1a.AddUint64(h, req.Start)
+	h = fnv1a.AddUint64(h, req.End)
+	h = fnv1a.AddUint64(h, req.Step)
+
+	// TODO - caching for WAL blocks
+	// Including trace count means we can safely cache results
+	// for wal blocks which might receive new data
+	// h = fnv1a.AddUint64(h, m.TotalObjects)
+
+	return h
+}
+
+// includeBlock uses the provided time range to determine if the block should be included in the search.
+func includeBlock(b *backend.BlockMeta, start, end time.Time) bool {
+	startNano := start.UnixNano()
+	endNano := end.UnixNano()
+
+	if startNano == 0 || endNano == 0 {
+		return true
+	}
+
+	blockStart := b.StartTime.UnixNano()
+	blockEnd := b.EndTime.UnixNano()
+
+	return blockStart <= endNano && blockEnd >= startNano
+}
+
+// searchTagValuesV2CacheKey generates a cache key for the searchTagValuesV2 request
+// cache key is used as the filename to store the protobuf data on disk
+func searchTagValuesV2CacheKey(req *tempopb.SearchTagValuesRequest, limit int, prefix string) string {
+	var cacheKey string
+	if req.Query != "" {
+		q := traceql.NormalizeQuery(req.Query)
+		if ast, err := traceql.ParseNoOptimizations(q); err == nil {
+			// forces the query into a canonical form
+			cacheKey = ast.String()
+		} else {
+			// In case of a bad TraceQL query, we ignore the query and return unfiltered results.
+			// if we fail to parse the query, we will assume query is empty and compute the cache key.
+			cacheKey = ""
+		}
+	}
+
+	// NOTE: we are not adding req.Start and req.End to the cache key because we don't respect the start and end
+	// please add them to cacheKey if we start respecting them
+	h := fnv1a.HashString64(req.TagName)
+	h = fnv1a.AddString64(h, cacheKey)
+	h = fnv1a.AddUint64(h, uint64(limit))
+	h = fnv1a.AddUint64(h, uint64(req.MaxTagValues))
+	h = fnv1a.AddUint64(h, uint64(req.StaleValueThreshold))
+
+	return fmt.Sprintf("%s_%v.buf", prefix, h)
+}
+
+// valuesToTagValuesV2RespProto converts TagValues to a protobuf marshalled bytes
+// this is slightly modified version of valuesToV2Response from querier.go
+func valuesToTagValuesV2RespProto(tagValues []tempopb.TagValue) ([]byte, error) {
+	// NOTE: we only cache TagValues and don't Marshal Metrics
+	resp := &tempopb.SearchTagValuesV2Response{}
+	resp.TagValues = make([]*tempopb.TagValue, 0, len(tagValues))
+
+	for _, v := range tagValues {
+		v2 := &v
+		resp.TagValues = append(resp.TagValues, v2)
+	}
+
+	data, err := proto.Marshal(resp)
+	if err != nil {
+		return nil, err
+	}
+	return data, nil
+}

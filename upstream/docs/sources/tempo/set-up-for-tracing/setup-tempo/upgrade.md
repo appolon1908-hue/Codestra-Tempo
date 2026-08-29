@@ -1,0 +1,381 @@
+---
+title: Upgrade your Tempo installation
+menuTitle: Upgrade
+description: Upgrade your Grafana Tempo installation to the latest version.
+weight: 510
+aliases:
+  - ../../setup/upgrade/ # /docs/tempo/<TEMPO_VERSION>/setup/upgrade
+---
+
+# Upgrade your Tempo installation
+
+<!-- vale Grafana.We = NO -->
+<!-- vale Grafana.Will = NO -->
+<!-- vale Grafana.Timeless = NO -->
+
+You can upgrade a Tempo installation to the next version.
+However, any release has the potential to have breaking changes.
+Before promoting an upgrade to production, test in a non-production environment.
+
+The upgrade process changes for each version, depending upon the changes made for the subsequent release.
+
+This upgrade guide applies to self-managed installations and not for Grafana Cloud.
+
+For information about updating to Tempo 2.x, refer to [Upgrade to Tempo 2.x](/docs/tempo/v2.10.x/set-up-for-tracing/setup-tempo/upgrade/) in the Tempo 2.10 documentation.
+
+For detailed information about any release, refer to the [Release notes](https://grafana.com/docs/tempo/<TEMPO_VERSION>/release-notes/).
+
+{{< admonition type="tip" >}}
+You can check your configuration options using the [`status` API endpoint](https://grafana.com/docs/tempo/<TEMPO_VERSION>/api_docs/#status) in your Tempo installation.
+{{< /admonition >}}
+
+## Upgrade to Tempo 3.1
+
+### Redis cache configuration changes
+
+Tempo upgrades the Redis cache client to [`github.com/redis/go-redis/v9`](https://github.com/redis/go-redis) and reworks the cache configuration. Redis Cluster is now the default routing mode, Redis Sentinel support is removed, several YAML keys are renamed, and the TLS block is replaced with a dskit-style block that fails closed on invalid configuration. [[PR 7337](https://github.com/grafana/tempo/pull/7337)]
+
+If you do not use the Redis cache, no action is needed.
+
+#### Opt single-node Redis into the single-node client
+
+Routing is now explicit. Previously, Tempo inferred routing from the number of endpoints, which silently selected single-node for cluster configuration endpoints that resolve to one host (for example, AWS ElastiCache configuration endpoints). The default now targets a Redis Cluster; set `single_node: true` to opt into the single-node client.
+
+Before:
+
+```yaml
+cache:
+  caches:
+    - redis:
+        endpoint: redis:6379
+```
+
+After:
+
+```yaml
+cache:
+  caches:
+    - redis:
+        endpoint: redis:6379
+        single_node: true
+```
+
+If a single-node configuration is left without `single_node: true`, Tempo starts but the cluster client fails on the first connection attempt when the server responds to `CLUSTER SLOTS` with an error.
+
+Redis Cluster deployments now require Redis 7+ because Tempo uses the `multi_shard` request policy advertised through `COMMAND INFO` to fan out cross-slot `MGET`/`DEL`.
+
+#### Migrate off Redis Sentinel
+
+Redis Sentinel support is removed. The following YAML keys and their corresponding CLI flags no longer exist:
+
+- `master_name` / `-redis.master-name`
+- `sentinel_username` / `-redis.sentinel-username`
+- `sentinel_password` / `-redis.sentinel-password`
+
+Migrate to either a single-node Redis or a Redis Cluster.
+
+#### Rename `idle_timeout` and `max_connection_age`
+
+Two pool keys are renamed to match the go-redis v9 API:
+
+| Previous            | New                  |
+| ------------------- | -------------------- |
+| `idle_timeout`      | `conn_max_idle_time` |
+| `max_connection_age`| `conn_max_lifetime`  |
+
+Before:
+
+```yaml
+cache:
+  caches:
+    - redis:
+        idle_timeout: 5m
+        max_connection_age: 1h
+```
+
+After:
+
+```yaml
+cache:
+  caches:
+    - redis:
+        conn_max_idle_time: 5m
+        conn_max_lifetime: 1h
+```
+
+#### Replace the TLS block
+
+The minimal `tls_enabled` / `tls_insecure_skip_verify` pair is replaced with the dskit-style TLS block. Existing settings keep working; new fields are optional.
+
+| New field                  | Purpose                                                                |
+| -------------------------- | ---------------------------------------------------------------------- |
+| `tls_cert_path`            | Path to the client certificate file                                    |
+| `tls_key_path`             | Path to the private client key file                                    |
+| `tls_ca_path`              | Path to the CA certificate file                                        |
+| `tls_server_name`          | Override the expected name on the server certificate                   |
+| `tls_insecure_skip_verify` | Skip validating the server certificate (unchanged)                     |
+| `tls_cipher_suites`        | Override the default cipher suite list, comma-separated                |
+| `tls_min_version`          | Override the default minimum TLS version (`VersionTLS12`, and so on)   |
+
+Invalid TLS settings now fail closed: if `tls_enabled: true` but the TLS configuration cannot be assembled, Tempo returns an error from cache construction instead of silently downgrading to a cleartext connection.
+
+#### New Redis Cluster routing options
+
+These options are additive and only apply when the default cluster client is used (`single_node: false`). They are ignored on the single-node path.
+
+```yaml
+cache:
+  caches:
+    - redis:
+        route_by_latency: false # Route read-only commands to the lowest-latency node.
+        route_randomly: false   # Route read-only commands to a random node.
+        read_only: false        # Allow read-only commands on replica nodes. Reads may be stale.
+        max_redirects: 3        # Maximum redirects to follow on MOVED/ASK responses.
+        min_idle_conns: 0       # Minimum idle connections to maintain in the pool.
+```
+
+### Memcached cache connection defaults
+
+Tempo changes the default connection behavior of the memcached cache client to keep connection pools warm across request bursts. If you do not use the memcached cache, no action is needed. [[PR 7671](https://github.com/grafana/tempo/pull/7671)]
+
+- The default `max_idle_conns` increases from `16` to `100`. Size it above your peak number of parallel requests so connections stay warm between bursts.
+- Idle connections are no longer closed by default. The new `min_idle_conns_headroom_percentage` defaults to `-1`, which keeps idle connections open. Set it to `0` to restore the previous behavior of closing connections idle for longer than two minutes.
+- A new `connect_timeout` bounds connection establishment separately from `timeout`. When unset (`0s`), it falls back to the value of `timeout`.
+
+These defaults raise the steady-state number of open connections per memcached server. To keep the previous behavior, set `max_idle_conns: 16` and `min_idle_conns_headroom_percentage: 0` in your cache configuration.
+
+### Trace by ID query sharding now scales with block count
+
+Trace by ID lookups are split into jobs across a block range. Tempo adds a new `query_frontend.trace_by_id.blocks_per_shard` setting that targets a number of blocks per job instead of a fixed job count, and it defaults to `30`, taking precedence over the older `query_shards` setting whenever it's non-zero. [[PR 7105](https://github.com/grafana/tempo/pull/7105)]
+
+Previously, `query_shards` (default `50`) split every trace by ID query into the same fixed number of jobs, regardless of how many blocks a tenant had. That value had to be tuned for the largest tenant in a cell, which left smaller tenants with too few blocks per job, and it had to be revisited as ingest volume changed. With `blocks_per_shard` set, Tempo instead computes the shard count dynamically from the tenant's current block count, so the number of jobs scales automatically as a tenant grows or shrinks, and different tenant sizes in the same cell are each sharded appropriately. The computed shard count never exceeds `query_frontend.max_outstanding_per_tenant`, so this change doesn't overload the query queue.
+
+This affects anyone who tuned `query_shards` for their workload, or who relies on trace by ID lookups producing a fixed, predictable number of sub-queries, for example in dashboards, alerting, or capacity planning.
+
+To keep the previous fixed-shard-count behavior, set `blocks_per_shard: 0` to fall back to `query_shards`:
+
+```yaml
+query_frontend:
+  trace_by_id:
+    blocks_per_shard: 0
+    query_shards: 50
+```
+
+## Upgrade to Tempo 3.0
+
+Tempo 3.0 is a major release that replaces the ingester-based architecture with a new design that separates the read and write paths.
+Block-builders, live-stores, and a backend scheduler replace ingesters and the compactor. For a detailed description of the new architecture, refer to the [Tempo architecture reference](/docs/tempo/<TEMPO_VERSION>/reference-tempo-architecture/).
+
+{{< admonition type="caution" >}}
+`vParquet3` is deprecated.
+Tempo 3.x still reads existing vParquet3 blocks, so you don't need to convert them.
+If your storage configuration specifies `vParquet3`, change the write format to `vParquet4` or later.
+Refer to [Change the block format version](/docs/tempo/<TEMPO_VERSION>/configuration/parquet/#change-the-block-format-version).
+{{< /admonition >}}
+
+The migration path depends on your deployment mode:
+
+- Monolithic mode: Update your configuration (remove `ingester`, `ingester_client`, `compactor`, and `metrics_generator_client` blocks), then upgrade the binary. No Kafka is required. For step-by-step instructions, refer to [Migrate a monolithic deployment](/docs/tempo/<TEMPO_VERSION>/set-up-for-tracing/setup-tempo/migrate-to-3/#migrate-a-monolithic-deployment). For a reference monolithic configuration, refer to [Deploy Tempo locally](/docs/tempo/<TEMPO_VERSION>/set-up-for-tracing/setup-tempo/deploy/locally/).
+- Microservices mode: Requires a Kafka-compatible system. Deploy Tempo 3.0 alongside your existing 2.x deployment, switch traffic, then decommission 2.x. Refer to the full [Migrate from Tempo 2.x to 3.0](/docs/tempo/<TEMPO_VERSION>/set-up-for-tracing/setup-tempo/migrate-to-3/) guide.
+
+You can automate configuration migration using the [`tempo-cli migrate config`](/docs/tempo/<TEMPO_VERSION>/operations/tempo_cli/#migrate-config-command) command, which removes obsolete blocks and adds the required `ingest` configuration for microservices mode.
+
+When upgrading to Tempo 3.0, also be aware of these breaking changes:
+
+- No downgrade path: There is no supported downgrade path from 3.0 to 2.x.
+- Scalable monolithic mode (SSB) removed: The `scalable-single-binary` target is no longer available. Use either microservices or monolithic (`target: all`) instead. Refer to [Deployment modes](/docs/tempo/<TEMPO_VERSION>/reference-tempo-architecture/deployment-modes/).
+- Deployment manifests: Update Helm, Tanka, and other deployment manifests to include the new components and Kafka infrastructure.
+
+### Legacy overrides disabled by default
+
+Tempo now refuses to start if it detects legacy (flat, `unscoped`) overrides in the main configuration or the per-tenant overrides file. [[PR 6741](https://github.com/grafana/tempo/pull/6741)]
+
+To resolve this, either migrate to the scoped `defaults` format (recommended) or temporarily opt back in.
+
+#### Option 1: Migrate to the scoped format
+
+Convert your overrides from the legacy flat format to the scoped `defaults` format. For example:
+
+Before (legacy):
+
+```yaml
+overrides:
+  ingestion_rate_limit_bytes: 20000000
+  ingestion_burst_size_bytes: 20000000
+  max_bytes_per_trace: 30000000
+  max_traces_per_user: 100000
+```
+
+After (scoped):
+
+```yaml
+overrides:
+  defaults:
+    ingestion:
+      rate_limit_bytes: 20000000
+      burst_size_bytes: 20000000
+      max_traces_per_user: 100000
+    global:
+      max_bytes_per_trace: 30000000
+```
+
+You can automate the migration using the Tempo CLI. Refer to the [`tempo-cli migrate overrides-config` command](https://grafana.com/docs/tempo/<TEMPO_VERSION>/operations/tempo_cli/#migrate-overrides-config-command).
+
+For the full field mapping between legacy and scoped formats, refer to [Changes to the Overrides module configuration](https://grafana.com/docs/tempo/<TEMPO_VERSION>/release-notes/version-2/v2-3/#changes-to-the-overrides-module-configuration) in the Tempo 2.3 release notes.
+
+#### Option 2: Temporarily opt back in
+
+Set `enable_legacy_overrides: true` in the overrides configuration block or pass `-config.enable-legacy-overrides=true` on the CLI. A deprecation warning is logged on startup and each time per-tenant overrides are loaded. This is a temporary escape hatch. Legacy overrides are removed in a future release.
+
+```yaml
+overrides:
+  enable_legacy_overrides: true
+```
+
+### `mem-ballast-size-mbs` flag removed
+
+The `-mem-ballast-size-mbs` command-line flag has been removed. This flag is no longer needed in Go 1.19 and later, which use `GOMEMLIMIT` instead. [[PR 6403](https://github.com/grafana/tempo/pull/6403)]
+
+If your deployment scripts, Helm values, or Tanka/Jsonnet configurations pass `-mem-ballast-size-mbs`, remove it. Tempo fails to start with an unrecognized flag error.
+
+### Metrics-generator configuration changes
+
+The metrics-generator gRPC endpoint and push path have been removed. In Tempo 3.0, the [metrics-generator](/docs/tempo/<TEMPO_VERSION>/reference-tempo-architecture/components/metrics-generator/) consumes directly from Kafka rather than receiving spans through gRPC from the distributor. [[PR 6618](https://github.com/grafana/tempo/pull/6618)]
+
+If your configuration includes a top-level `metrics_generator_client` block, you can safely remove it. Tempo 3.0 ignores this block, and it is deprecated. It is removed in a future release.
+
+### Block configuration centralized to `storage.trace.block`
+
+Block and WAL configuration for the [block-builder](/docs/tempo/<TEMPO_VERSION>/reference-tempo-architecture/components/block-builder/) and [live-store](/docs/tempo/<TEMPO_VERSION>/reference-tempo-architecture/components/live-store/) is now always sourced from `storage.trace.block`. Per-module block configuration fields have been removed. [[PR 6647](https://github.com/grafana/tempo/pull/6647)]
+
+If your configuration sets block-level options such as `version`, `parquet_dedicated_columns`, or `parquet_row_group_size_bytes` under `block_builder.block` or `live_store.block_config`, move them to `storage.trace.block`.
+
+Before:
+
+```yaml
+block_builder:
+  block:
+    version: "vParquet5"
+    parquet_dedicated_columns:
+      - { scope: resource, name: service.name, type: string }
+
+live_store:
+  block_config:
+    version: "vParquet5"
+    parquet_dedicated_columns:
+      - { scope: resource, name: service.name, type: string }
+```
+
+After:
+
+```yaml
+storage:
+  trace:
+    block:
+      version: "vParquet5"
+      parquet_dedicated_columns:
+        - { scope: resource, name: service.name, type: string }
+```
+
+### `partition_ring_live_store` removed
+
+Tempo 3.0 removes the top-level `partition_ring_live_store` setting. Tempo now uses a single [partition ring](/docs/tempo/<TEMPO_VERSION>/reference-tempo-architecture/partition-ring/), so this configuration toggle is no longer needed. [[PR 6981](https://github.com/grafana/tempo/pull/6981)]
+
+If your 2.x configuration still includes this field, remove it before or during your 3.0 upgrade.
+
+Before:
+
+```yaml
+partition_ring_live_store: true
+```
+
+After:
+
+```yaml
+# Remove partition_ring_live_store
+```
+
+### Live-store and query defaults reduced
+
+The default values for several [live-store](/docs/tempo/<TEMPO_VERSION>/reference-tempo-architecture/components/live-store/) and query-frontend settings have been reduced to produce smaller WAL blocks, release completed blocks sooner, and align the metrics query backend boundary with search.
+
+| Setting                                          | Previous default | New default |
+| ------------------------------------------------ | ---------------- | ----------- |
+| `live_store.flush_check_period`                  | `10s`            | `5s`        |
+| `live_store.max_block_duration`                  | `30m`            | `30s`       |
+| `live_store.max_block_bytes`                     | `100 MiB`        | `50 MiB`    |
+| `live_store.complete_block_timeout`              | `1h`             | `20m`       |
+| `query_frontend.metrics.query_backend_after`     | `30m`            | `15m`       |
+
+If you explicitly set these values in your configuration, no action is needed.
+
+### Fail-on-high-lag enabled by default
+
+Tempo now fails search and metrics requests when a [live-store](/docs/tempo/<TEMPO_VERSION>/reference-tempo-architecture/components/live-store/) can't guarantee complete results, rather than returning a partial response.
+The `live_store.fail_on_high_lag` setting defaults to `true` (previously `false`). When a live-store's Kafka lag overlaps a query's time range, the request returns an error instead of silently incomplete results, trading availability for correctness. [[PR 7210](https://github.com/grafana/tempo/pull/7210)]
+
+This change also sets `query_frontend.query_end_cutoff` to `30s` (previously `0`), which excludes the most recent 30 seconds from queries to avoid incomplete results.
+The cutoff must be less than `query_frontend.search.query_backend_after`.
+
+To restore the previous behavior and continue returning partial results, set `fail_on_high_lag: false`:
+
+```yaml
+live_store:
+  fail_on_high_lag: false
+```
+
+To detect lagged requests, monitor the `tempo_live_store_lagged_requests_total` metric.
+Refer to [Manage trace ingestion](/docs/tempo/<TEMPO_VERSION>/operations/manage-trace-ingestion/) for details.
+
+### Ingester removal
+
+The ingester module is removed entirely. All ingester-related configuration fields, CLI flags, alerts, and dashboard panels must be removed from your deployment. The write path is now handled by the [block-builder](/docs/tempo/<TEMPO_VERSION>/reference-tempo-architecture/components/block-builder/) and [live-store](/docs/tempo/<TEMPO_VERSION>/reference-tempo-architecture/components/live-store/).
+
+Removed configuration sections: `ingester`, `ingester_client`, `compactor`, `metrics_generator_client`.
+The `ingest.enabled` field is also removed, but the `ingest` block itself is still required for microservices mode (for example, `ingest.kafka`).
+
+For step-by-step migration instructions, refer to [Migrate from Tempo 2.x to 3.0](/docs/tempo/<TEMPO_VERSION>/set-up-for-tracing/setup-tempo/migrate-to-3/).
+
+(PRs [#6959](https://github.com/grafana/tempo/pull/6959), [#6504](https://github.com/grafana/tempo/pull/6504), [#6667](https://github.com/grafana/tempo/pull/6667), [#6873](https://github.com/grafana/tempo/pull/6873))
+
+### Compactor removal and CLI flag changes
+
+The compactor component and the `v2` block encoding are removed. Compaction is now handled by the [backend scheduler and worker](/docs/tempo/<TEMPO_VERSION>/reference-tempo-architecture/components/compaction/), which track job progress centrally and automatically reschedule failed jobs.
+
+Remove all compactor-related configuration, alerts, and dashboard panels from your deployment. The following `tempo-cli` commands are also removed because they were specific to the `v2` format: `list block`, `list index`, `view index`, `gen index`, and `gen bloom`.
+
+The compaction CLI flags drop their duplicate `compaction.` prefix. Update these flags in your configuration:
+
+- `compaction.compaction.block-retention` → `compaction.block-retention`
+- `compaction.compaction.max-objects-per-block` → `compaction.max-objects-per-block`
+- `compaction.compaction.max-block-bytes` → `compaction.max-block-bytes`
+- `compaction.compaction.compaction-window` → `compaction.compaction-window`
+
+(PRs [#6273](https://github.com/grafana/tempo/pull/6273), [#6369](https://github.com/grafana/tempo/pull/6369), [#6909](https://github.com/grafana/tempo/pull/6909))
+
+### `RetryInfo` enabled by default
+
+The `distributor.retry_after_on_resource_exhausted` setting now defaults to `5s` (previously `0`). OTLP clients receive a retry hint on `ResourceExhausted` errors from the [distributor](/docs/tempo/<TEMPO_VERSION>/reference-tempo-architecture/components/distributor/). [[PR 7088](https://github.com/grafana/tempo/pull/7088)]
+
+To disable cluster-wide, set the value to `0`. To disable for a single tenant, set the per-tenant override `ingestion.retry_info_enabled: false`.
+
+### TraceQL array matching changes
+
+The TraceQL AST optimization changes the semantics of `!=` and `!~` operators when used with array attributes. `!=` now means `NOT IN` (previously `CONTAINS NOT EQUAL`) and `!~` now means `MATCH NONE` (previously `CONTAINS NON-MATCH`). Regex operands must be of type string or string array. [[PR 6353](https://github.com/grafana/tempo/pull/6353)]
+
+If you have queries that depend on the previous behavior, disable the optimization with the query hint `skip_optimization=true`.
+
+### Other breaking changes
+
+- The `all` target is now 3.0-compatible and the `scalable-single-binary` target is removed. Refer to [Deployment modes](/docs/tempo/<TEMPO_VERSION>/reference-tempo-architecture/deployment-modes/). [[PR 6283](https://github.com/grafana/tempo/pull/6283)]
+- The OpenCensus receiver is removed. Migrate to OTLP. [[PR 6523](https://github.com/grafana/tempo/pull/6523)]
+- `SpanMetricsSummary` is removed and querier code simplified. (PRs [#6496](https://github.com/grafana/tempo/pull/6496), [#6510](https://github.com/grafana/tempo/pull/6510))
+- The `querier.query_live_store` configuration is removed. [[PR 7048](https://github.com/grafana/tempo/pull/7048)]
+- `query_frontend.search.query_ingesters_until` is removed in favor of `query_frontend.search.query_backend_after`. Refer to the [query-frontend](/docs/tempo/<TEMPO_VERSION>/reference-tempo-architecture/components/query-frontend/) component reference. [[PR 6507](https://github.com/grafana/tempo/pull/6507)]
+- The `tempo-cli query search` command no longer accepts timestamps without a timezone (for example, `2024-01-01T00:00:00`). Use RFC3339 format (for example, `2024-01-01T00:00:00Z`) or relative time (for example, `now-1h`). Refer to the [Tempo CLI documentation](/docs/tempo/<TEMPO_VERSION>/operations/tempo_cli/). [[PR 6458](https://github.com/grafana/tempo/pull/6458)]
+- Tempo 3.0 upgrades to Go 1.26.2. [[PR 6443](https://github.com/grafana/tempo/pull/6443)]
+
+
+<!-- vale Grafana.We = YES -->
+<!-- vale Grafana.Will = YES -->
+<!-- vale Grafana.Timeless = YES -->

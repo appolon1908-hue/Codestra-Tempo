@@ -1,0 +1,316 @@
+name: CI
+on:
+  pull_request:
+# Requiring certain checks for PRs to be merge-able in Github, forces for those checks to be *always* run.
+# Even if the changes do not require them (i.e. the paths indicated below). That's why `paths-ignore` is commented out.
+#
+#    paths-ignore:
+#      - 'docs/**'
+#      - 'example/**'
+#      - 'tools/**'
+
+concurrency:
+  # Cancel any running workflow for the same branch when new commits are pushed.
+  # We group both by ref_name (available when CI is triggered by a push to a branch/tag)
+  # and head_ref (available when CI is triggered by a PR).
+  group: "${{ github.ref_name }}-${{ github.head_ref }}"
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-24.04
+    steps:
+
+      - name: Check out code
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: "0"
+          persist-credentials: false
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: 'go.mod'
+
+      - name: check-fmt
+        run: make check-fmt
+
+      - name: check-jsonnetfmt
+        run: make check-jsonnetfmt
+
+      - name: Get year and week number
+        id: get-year-week-number
+        run: echo "date=$(date +"%Yweek%U")" >> "$GITHUB_OUTPUT"
+
+      - name: cache golangci
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: .cache/golangci-lint
+          key: golangci-lint-${{ runner.os }}-${{ steps.get-year-week-number.outputs.date }}-${{ hashFiles('go.mod', '.golangci.yml') }}
+
+      - name: lint
+        # using env instead of template expansions to avoid template injection
+        # https://woodruffw.github.io/zizmor/audits/#template-injection
+        run: |
+          make lint "base=origin/${BASE_REF}"
+          sudo chown -R "$(id -u):$(id -g)" .cache/golangci-lint  # needed to archive cache
+        env:
+          BASE_REF: ${{ github.base_ref }}
+
+  unit-tests:
+    name: Run Unit Tests
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        test-target:
+          [
+            test-with-cover-pkg,
+            test-with-cover-tempodb,
+            test-with-cover-tempodb-wal,
+            test-with-cover-others,
+          ]
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: 'go.mod'
+
+      - name: Run Tests
+        run: make ${{ matrix.test-target }}
+
+      - name: List coverage artifacts
+        run: ls .coverage
+
+      - name: Upload coverage artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: coverage-${{ matrix.test-target }}
+          path: .coverage/*.out
+          retention-days: 1
+          include-hidden-files: true
+          if-no-files-found: error
+
+  integration-tests-validation:
+    name: Validate integration test coverage
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out code
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - name: Validate all integration folders are covered by CI
+        run: |
+          # Define expected folders that have corresponding test-e2e-* targets
+          EXPECTED_FOLDERS=("api" "limits" "metrics-generator" "operations" "storage" "util")
+
+          # Get actual folders in integration/ (excluding hidden files)
+          mapfile -d '' _raw < <(find integration/ -mindepth 1 -maxdepth 1 -type d -not -name '.*' -print0 2>/dev/null)
+          ACTUAL_FOLDERS=()
+          for _d in "${_raw[@]}"; do ACTUAL_FOLDERS+=("$(basename "$_d")"); done
+
+          # Convert arrays to strings for comparison
+          EXPECTED_SORTED=$(printf '%s\n' "${EXPECTED_FOLDERS[@]}" | sort | tr '\n' ' ')
+          ACTUAL_SORTED=$(printf '%s\n' "${ACTUAL_FOLDERS[@]}" | sort | tr '\n' ' ')
+
+          if [ "$EXPECTED_SORTED" != "$ACTUAL_SORTED" ]; then
+            echo "❌ ERROR: Integration folder mismatch detected!"
+            echo ""
+            echo "Expected folders (covered by CI):"
+            printf '  - %s\n' "${EXPECTED_FOLDERS[@]}" | sort
+            echo ""
+            echo "Actual folders in ./integration:"
+            printf '  - %s\n' "${ACTUAL_FOLDERS[@]}" | sort
+            echo ""
+            echo "If you added a new integration test folder, you must:"
+            echo "  1. Add a corresponding 'test-e2e-<folder-name>' target to the Makefile"
+            echo "  2. Add the target to the matrix in .github/workflows/ci.yml (integration-tests job)"
+            echo "  3. Update the EXPECTED_FOLDERS list in this validation step"
+            exit 1
+          fi
+
+          echo "✅ All integration folders are covered by CI"
+
+  integration-tests:
+    name: Run integration tests
+    runs-on: ubuntu-24.04
+    needs: integration-tests-validation
+    strategy:
+      fail-fast: false
+      matrix:
+        test-target:
+          [
+            test-e2e-operations,
+            test-e2e-api,
+            test-e2e-limits,
+            test-e2e-metrics-generator,
+            test-e2e-storage,
+            test-e2e-util,
+          ]
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - name: Fetch tags
+        run: git fetch --prune --unshallow --tags
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: 'go.mod'
+      - name: Run Tests
+        run: make ${{ matrix.test-target }}
+
+  build:
+    name: Build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out code
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: 'go.mod'
+
+      - name: Build Tempo
+        run: make tempo
+
+      - name: generate-manifest
+        run: make generate-manifest
+
+      - name: Build tempo-query
+        run: make tempo-query
+
+      - name: Build vulture
+        run: make tempo-vulture
+
+      - name: Build tempo-cli
+        run: make tempo-cli
+
+      - name: Verify packaged and example configs
+        run: make check-configs
+
+  build-riscv64:
+    name: Build (riscv64 cross-compilation)
+    runs-on: ubuntu-24.04
+    env:
+      GOARCH: riscv64
+      GOOS: linux
+      CGO_ENABLED: "0"
+    steps:
+      - name: Check out code
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: 'go.mod'
+
+      - name: Build Tempo
+        run: make tempo
+
+      - name: Build tempo-query
+        run: make tempo-query
+
+      - name: Build vulture
+        run: make tempo-vulture
+
+      - name: Build tempo-cli
+        run: make tempo-cli
+
+  vendor-check:
+    name: Vendor check
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out code
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: 'go.mod'
+
+      - name: Check vendor
+        run: make vendor-check
+
+  tempo-jsonnet:
+    name: Check jsonnet & tempo-mixin
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out code
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: 'go.mod'
+
+      - name: Check jsonnet
+        run: make jsonnet-check
+
+      - name: Check tempo-mixin
+        run: make tempo-mixin-check
+
+      - name: Test jsonnet
+        run: make jsonnet-test
+
+  build-technical-documentation:
+    name: Build technical documentation
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out code
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Build Website
+        run: docker run -v "${PWD}/docs/sources:/hugo/content/docs/tempo/latest" --rm grafana/docs-base:latest make prod
+
+  coverage-annotations:
+    name: Coverage Annotations
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    needs: [unit-tests]
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Check out code
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+          fetch-depth: 0  # Fetch full history for proper diff computation
+
+      - name: Download all coverage artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: coverage-*
+          path: .coverage/
+          merge-multiple: true
+
+      - name: Annotate uncovered lines in PR diff
+        uses: grafana/shared-workflows/actions/annotate-coverage@ccd82960521026200c6b51f6c61100732a1a62f3 # annotate-coverage/v0.2.0
+        with:
+          coverage-path: .coverage
+          format: GitHubAnnotations
+          base-ref: ${{ github.event.pull_request.base.sha }}
+          commit-sha: ${{ github.event.pull_request.head.sha }}

@@ -1,0 +1,126 @@
+version: 2
+
+archives:
+  - id: default
+    ids:
+      - tempo
+      - tempo-query
+      - tempo-cli
+builds:
+  - id: "tempo"
+    main: ./cmd/tempo
+    binary: tempo
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+      - linux
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ignore:
+      - goarch: arm64
+        goos: windows
+    flags:
+      - -v
+      - -trimpath
+    ldflags:
+      - -s
+      - -w
+      - -X main.Branch={{ .Branch }}
+      - -X main.Revision={{ .ShortCommit }}
+      - -X main.Version={{ .Version }}
+    mod_timestamp: '{{ .CommitTimestamp }}'
+  - id: "tempo-query"
+    main: ./cmd/tempo-query
+    binary: tempo-query
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+      - linux
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ignore:
+      - goarch: arm64
+        goos: windows
+    flags:
+      - -v
+      - -trimpath
+    ldflags:
+      - -s
+      - -w
+      - -X main.Branch={{ .Branch }}
+      - -X main.Revision={{ .ShortCommit }}
+      - -X main.Version={{ .Version }}
+    mod_timestamp: '{{ .CommitTimestamp }}'
+  - id: "tempo-cli"
+    main: ./cmd/tempo-cli
+    binary: tempo-cli
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+      - linux
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ignore:
+      - goarch: arm64
+        goos: windows
+    flags:
+      - -v
+      - -trimpath
+    ldflags:
+      - -s
+      - -w
+      - -X main.Branch={{ .Branch }}
+      - -X main.Revision={{ .ShortCommit }}
+      - -X main.Version={{ .Version }}
+    mod_timestamp: '{{ .CommitTimestamp }}'
+changelog:
+  disable: true
+  sort: asc
+  filters:
+    exclude:
+      - '^.github:'
+      - '^example:'
+      - '^integration:'
+      - '^vendor:'
+checksum:
+  name_template: SHA256SUMS
+release:
+  draft: true
+  prerelease: auto
+snapshot:
+  version_template: "{{ .Version }}-SNAPSHOT-{{ .ShortCommit }}"
+# RPM (yum) and deb (apt) packages
+nfpms:
+  - ids:
+      - tempo
+      - tempo-cli
+      - tempo-query
+    vendor: Grafana Labs Inc
+    homepage: https://grafana.com/oss/tempo/
+    maintainer: Grafana Labs <support@grafana.com>
+    description: |-
+      Grafana Tempo is an open source, easy-to-use, and high-scale distributed tracing backend.
+      Tempo is cost-efficient, requiring only object storage to operate, and is deeply integrated with Grafana, Prometheus, and Loki.
+    license: AGPL-3.0
+    formats:
+      - deb
+      - rpm
+    contents:
+      - src: ./tools/packaging/tempo.yaml
+        dst: /etc/tempo/config.yml
+        type: "config|noreplace"
+      - src: ./tools/packaging/tempo.service
+        dst: /etc/systemd/system/tempo.service
+    scripts:
+      postinstall: ./tools/packaging/tempo-postinstall.sh
+    rpm: {}
+    deb: {}

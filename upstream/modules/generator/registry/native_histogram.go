@@ -1,0 +1,569 @@
+package registry
+
+import (
+	"encoding/binary"
+	"fmt"
+	"hash/fnv"
+	"math"
+	"sort"
+	"sync"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
+	"github.com/prometheus/prometheus/model/exemplar"
+	promhistogram "github.com/prometheus/prometheus/model/histogram"
+	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/storage"
+
+	tempo_util "github.com/grafana/tempo/pkg/util"
+)
+
+type nativeHistogram struct {
+	metricName string
+
+	// TODO: we can also switch to a HistrogramVec and let prometheus handle the labels. This would remove the series map
+	//  and all locking around it.
+	//  Downside: you need to list labels at creation time while our interfaces only pass labels at observe time, this
+	//  will requires a bigger refactor, maybe something for a second pass?
+	//  Might break processors that have variable amount of labels...
+	//  promHistogram prometheus.HistogramVec
+
+	seriesMtx    sync.Mutex
+	series       map[uint64]*nativeHistogramSeries
+	seriesDemand *Cardinality
+
+	lifecycler Limiter
+
+	buckets []float64
+
+	traceIDLabelName string
+	exemplarLabels   prometheus.Labels
+
+	// Can be "native", classic", "both" to determine which histograms to
+	// generate.  A diff in the configured value on the processors will cause a
+	// reload of the process, and a new instance of the histogram to be created.
+	histogramOverride HistogramMode
+
+	overrides Overrides
+	// The tenant for this registry instance is received at create time and does not change.
+	tenant string
+
+	externalLabels map[string]string
+
+	// classic
+	nameCount  string
+	nameSum    string
+	nameBucket string
+}
+
+type nativeHistogramSeries struct {
+	// labels should not be modified after creation
+	lb            *labels.Builder
+	labels        labels.Labels
+	promHistogram prometheus.Histogram
+	lastUpdated   int64
+	histogram     *dto.Histogram
+
+	// firstSeries is used to track if this series is new to the counter.
+	// This is used in classic histograms to ensure that new counters begin with 0.
+	// This avoids Prometheus throwing away the first value in the series,
+	// due to the transition from null -> x.
+	firstSeries bool
+
+	// classic
+	countLabels labels.Labels
+	sumLabels   labels.Labels
+	// bucketLabels []labels.Labels
+
+	// Overrides tracking to determine if we need to recreate the series
+	overridesHash uint64
+}
+
+func (hs *nativeHistogramSeries) isNew() bool {
+	return hs.firstSeries
+}
+
+func (hs *nativeHistogramSeries) registerSeenSeries() {
+	hs.firstSeries = false
+}
+
+var (
+	_ Histogram = (*nativeHistogram)(nil)
+	_ metric    = (*nativeHistogram)(nil)
+)
+
+func newNativeHistogram(name string, buckets []float64, lifecycler Limiter, traceIDLabelName string, histogramOverride HistogramMode, externalLabels map[string]string, tenant string, overrides Overrides, staleDuration time.Duration) *nativeHistogram {
+	if traceIDLabelName == "" {
+		traceIDLabelName = "traceID"
+	}
+
+	// Defensively copy and sort the classic buckets, matching newHistogram. In
+	// hybrid/both mode these reach prometheus.NewHistogram, which panics on
+	// non-monotonic buckets, and classic le buckets must be ascending anyway. A
+	// static histogram_buckets config is not validated upstream. Copying avoids
+	// mutating the caller's slice.
+	sorted := make([]float64, len(buckets))
+	copy(sorted, buckets)
+	sort.Float64s(sorted)
+	buckets = sorted
+
+	return &nativeHistogram{
+		metricName:        name,
+		series:            make(map[uint64]*nativeHistogramSeries),
+		seriesDemand:      NewCardinality(staleDuration, removeStaleSeriesInterval),
+		lifecycler:        lifecycler,
+		traceIDLabelName:  traceIDLabelName,
+		exemplarLabels:    make(prometheus.Labels, 1),
+		buckets:           buckets,
+		histogramOverride: histogramOverride,
+		externalLabels:    externalLabels,
+		overrides:         overrides,
+		tenant:            tenant,
+
+		// classic
+		nameCount:  fmt.Sprintf("%s_count", name),
+		nameSum:    fmt.Sprintf("%s_sum", name),
+		nameBucket: fmt.Sprintf("%s_bucket", name),
+	}
+}
+
+func (h *nativeHistogram) ObserveWithExemplar(lbls labels.Labels, value float64, traceID string, multiplier float64) {
+	h.observeWithExemplarWithHashAt(lbls, lbls.Hash(), value, traceID, multiplier, time.Now().UnixMilli())
+}
+
+func (h *nativeHistogram) ObserveBorrowed(lbls *BorrowedLabels, value float64, traceID []byte, multiplier float64, timeMs int64) {
+	h.observeWithExemplarWithHashAt(lbls.Labels, lbls.Hash, value, tempo_util.TraceIDToHexString(traceID), multiplier, timeMs)
+}
+
+func (h *nativeHistogram) ObserveBorrowedWithEncodedTraceID(lbls *BorrowedLabels, value float64, traceID string, multiplier float64, timeMs int64) {
+	h.observeWithExemplarWithHashAt(lbls.Labels, lbls.Hash, value, traceID, multiplier, timeMs)
+}
+
+func (h *nativeHistogram) observeWithExemplarWithHashAt(lbls labels.Labels, hash uint64, value float64, traceID string, multiplier float64, timeMs int64) {
+	h.seriesDemand.Insert(hash)
+
+	h.seriesMtx.Lock()
+	defer h.seriesMtx.Unlock()
+
+	s, lbls, hash := resolveSeries(h.series, hash, lbls, h.lifecycler, h.activeSeriesPerHistogramSerie())
+	if s != nil {
+		h.updateSeries(hash, s, value, traceID, multiplier, timeMs)
+		return
+	}
+	h.series[hash] = h.newSeries(lbls, hash, value, traceID, multiplier, timeMs)
+}
+
+func (h *nativeHistogram) newSeries(lbls labels.Labels, hash uint64, value float64, traceID string, multiplier float64, timeMs int64) *nativeHistogramSeries {
+	// Configure histogram based on mode
+	//
+	// Native-only mode sets buckets to nil, and uses the histogram.Exemplars slice as the native exemplar format.
+	// Hybrid mode uses classic buckets and bucket.Exemplar format for compatibility.
+
+	var buckets []float64
+
+	// The native histogram only uses the static buckets when the classic histograms are enabled.
+	hasClassic := hasClassicHistograms(h.histogramOverride)
+	if hasClassic {
+		// Hybrid "both" mode: include classic buckets for compatibility
+		buckets = h.buckets
+	}
+
+	hsh, bucketFactor, maxBucketNum, minResetDur := h.hashOverrides()
+
+	// Configure native histogram options based on mode
+	nativeOpts := prometheus.HistogramOpts{
+		Name:    h.name(),
+		Help:    "Native histogram for metric " + h.name(),
+		Buckets: buckets, // nil for pure native, h.buckets for hybrid
+		// Native histogram parameters
+		NativeHistogramBucketFactor:     bucketFactor,
+		NativeHistogramMaxBucketNumber:  maxBucketNum,
+		NativeHistogramMinResetDuration: minResetDur,
+	}
+
+	if hasClassic {
+		// Hybrid mode: let Prometheus decide defaults for compatibility
+		nativeOpts.NativeHistogramMaxExemplars = -1 // Use default
+	}
+
+	newSeries := &nativeHistogramSeries{
+		promHistogram: prometheus.NewHistogram(nativeOpts),
+		lastUpdated:   0,
+		firstSeries:   true,
+		overridesHash: hsh,
+	}
+
+	h.updateSeries(hash, newSeries, value, traceID, multiplier, timeMs)
+
+	lb := newSeriesLabelsBuilder(lbls, h.externalLabels)
+
+	lb.Set(labels.MetricName, h.metricName)
+
+	newSeries.labels = lb.Labels()
+	newSeries.lb = lb
+
+	// _count
+	lb.Set(labels.MetricName, h.nameCount)
+	newSeries.countLabels = lb.Labels()
+
+	// _sum
+	lb.Set(labels.MetricName, h.nameSum)
+	newSeries.sumLabels = lb.Labels()
+
+	// Keep the reusable bucket-label builder based on owned labels. The input
+	// labels may be borrowed by the caller and released after this update.
+	lb.Reset(newSeries.labels)
+	return newSeries
+}
+
+func (h *nativeHistogram) updateSeries(hash uint64, s *nativeHistogramSeries, value float64, traceID string, multiplier float64, timeMs int64) {
+	// multiplier is 1 on the common path, so these loops run exactly once.
+	if traceID == "" {
+		// Interface contract: empty trace ID (including all-zero IDs, which
+		// hex-encode to "") means no exemplar. Observing with an empty label
+		// value would attach a junk traceID="" exemplar; the classic histogram
+		// instead drops empty exemplars at collect time.
+		for i := 0.0; i < multiplier; i++ {
+			s.promHistogram.Observe(value)
+		}
+	} else {
+		// Use Prometheus native exemplar handling.
+		exemplarObserver := s.promHistogram.(prometheus.ExemplarObserver)
+		// ObserveWithExemplar copies the labels synchronously; seriesMtx serializes reuse.
+		h.exemplarLabels[h.traceIDLabelName] = traceID
+		for i := 0.0; i < multiplier; i++ {
+			exemplarObserver.ObserveWithExemplar(value, h.exemplarLabels)
+		}
+	}
+
+	// lastUpdated rides the observation call (timeMs is supplied by the
+	// caller: the batch timestamp on the borrowed path, time.Now() on the
+	// owned path) instead of a per-observation time.Now(); removeStaleSeries
+	// compares against it under the same seriesMtx.
+	s.lastUpdated = timeMs
+	h.lifecycler.OnUpdate(hash, h.activeSeriesPerHistogramSerie())
+}
+
+func (h *nativeHistogram) name() string {
+	return h.metricName
+}
+
+func (h *nativeHistogram) collectMetrics(appender storage.Appender, timeMs int64) error {
+	h.seriesMtx.Lock()
+	defer h.seriesMtx.Unlock()
+
+	for _, s := range h.series {
+		// Extract histogram
+		encodedMetric := &dto.Metric{}
+
+		// Encode to protobuf representation
+		err := s.promHistogram.Write(encodedMetric)
+		if err != nil {
+			return err
+		}
+
+		// NOTE: Store the encoded histogram here so we can keep track of the
+		// exemplars that have been sent.  The value is updated here, but the
+		// pointers remain the same, and so Reset() call below can be used to clear
+		// the exemplars.
+		s.histogram = encodedMetric.GetHistogram()
+
+		// If we are in "both" or "classic" mode, also emit classic histograms.
+		if hasClassicHistograms(h.histogramOverride) {
+			classicErr := h.classicHistograms(appender, timeMs, s)
+			if classicErr != nil {
+				return classicErr
+			}
+		}
+
+		// If we are in "both" or "native" mode, also emit native histograms.
+		if hasNativeHistograms(h.histogramOverride) {
+			nativeErr := h.nativeHistograms(appender, s.labels, timeMs, s)
+			if nativeErr != nil {
+				return nativeErr
+			}
+		}
+
+		// Mark the series as seen after all histogram types have been emitted.
+		if s.isNew() {
+			s.registerSeenSeries()
+		}
+	}
+
+	return nil
+}
+
+func (h *nativeHistogram) countActiveSeries() int {
+	h.seriesMtx.Lock()
+	defer h.seriesMtx.Unlock()
+
+	return len(h.series) * int(h.activeSeriesPerHistogramSerie())
+}
+
+func (h *nativeHistogram) countSeriesDemand() int {
+	est := h.seriesDemand.Estimate()
+	return int(est) * int(h.activeSeriesPerHistogramSerie())
+}
+
+func (h *nativeHistogram) removeStaleSeries(staleTimeMs int64) {
+	overridesHash, _, _, _ := h.hashOverrides()
+
+	h.seriesMtx.Lock()
+	defer h.seriesMtx.Unlock()
+
+	for hash, s := range h.series {
+		if s.overridesHash != overridesHash {
+			// The overrides have changed, so we need to recreate the series.
+			delete(h.series, hash)
+			h.lifecycler.OnDelete(hash, h.activeSeriesPerHistogramSerie())
+			continue
+		}
+
+		if s.lastUpdated < staleTimeMs {
+			delete(h.series, hash)
+			h.lifecycler.OnDelete(hash, h.activeSeriesPerHistogramSerie())
+		}
+	}
+	h.seriesDemand.Advance()
+}
+
+func (h *nativeHistogram) hashOverrides() (uint64, float64, uint32, time.Duration) {
+	var (
+		bucketFactor = h.overrides.MetricsGeneratorNativeHistogramBucketFactor(h.tenant)
+		maxBucketNum = h.overrides.MetricsGeneratorNativeHistogramMaxBucketNumber(h.tenant)
+		minResetDur  = h.overrides.MetricsGeneratorNativeHistogramMinResetDuration(h.tenant)
+	)
+
+	hsh := fnv.New64a()
+
+	_ = binary.Write(hsh, binary.LittleEndian, bucketFactor)
+	_ = binary.Write(hsh, binary.LittleEndian, maxBucketNum)
+	_ = binary.Write(hsh, binary.LittleEndian, minResetDur)
+
+	return hsh.Sum64(), bucketFactor, maxBucketNum, minResetDur
+}
+
+func (h *nativeHistogram) activeSeriesPerHistogramSerie() uint32 {
+	total := uint32(0)
+	if hasClassicHistograms(h.histogramOverride) {
+		// sum + count + #buckets
+		total += 2 + uint32(len(h.buckets))
+		// check for +Inf bucket
+		if len(h.buckets) > 0 && !math.IsInf(h.buckets[len(h.buckets)-1], 1) {
+			total++ // +Inf bucket
+		}
+	}
+	if hasNativeHistograms(h.histogramOverride) {
+		total++
+	}
+	return total
+}
+
+func (h *nativeHistogram) nativeHistograms(appender storage.Appender, lbls labels.Labels, timeMs int64, s *nativeHistogramSeries) (err error) {
+	// If this is a new series, append a zero histogram at the end of the last minute.
+	// This avoids Prometheus throwing away the first value when a metric is aged out
+	// and recreated (the transition from null -> x).
+	if s.isNew() {
+		endOfLastMinuteMs := getEndOfLastMinuteMs(timeMs)
+		zeroHist := &promhistogram.Histogram{
+			Schema: s.histogram.GetSchema(),
+		}
+		_, err := appender.AppendHistogram(0, lbls, endOfLastMinuteMs, zeroHist, nil)
+		if err != nil && !isOutOfOrderError(err) {
+			return err
+		}
+	}
+
+	// Decode to Prometheus representation
+	hist := promhistogram.Histogram{
+		Schema:        s.histogram.GetSchema(),
+		Count:         s.histogram.GetSampleCount(),
+		Sum:           s.histogram.GetSampleSum(),
+		ZeroThreshold: s.histogram.GetZeroThreshold(),
+		ZeroCount:     s.histogram.GetZeroCount(),
+	}
+	if len(s.histogram.PositiveSpan) > 0 {
+		hist.PositiveSpans = make([]promhistogram.Span, len(s.histogram.PositiveSpan))
+		for i, span := range s.histogram.PositiveSpan {
+			hist.PositiveSpans[i] = promhistogram.Span{
+				Offset: span.GetOffset(),
+				Length: span.GetLength(),
+			}
+		}
+	}
+	hist.PositiveBuckets = s.histogram.PositiveDelta
+	if len(s.histogram.NegativeSpan) > 0 {
+		hist.NegativeSpans = make([]promhistogram.Span, len(s.histogram.NegativeSpan))
+		for i, span := range s.histogram.NegativeSpan {
+			hist.NegativeSpans[i] = promhistogram.Span{
+				Offset: span.GetOffset(),
+				Length: span.GetLength(),
+			}
+		}
+	}
+	hist.NegativeBuckets = s.histogram.NegativeDelta
+
+	// Append the native histogram
+	ref, err := appender.AppendHistogram(0, lbls, timeMs, &hist, nil)
+	if err != nil {
+		return err
+	}
+
+	// NOTE: two exemplar formats are used:
+	// Native exemplars use the histogram.Exemplars slice, which is the native format.
+	// Bucket exemplars use the bucket.Exemplar field, which is the classic format.
+	//
+	// Use native exemplars when available, falling back to bucket exemplars
+
+	for _, ex := range s.histogram.Exemplars {
+		if ex != nil && len(ex.Label) > 0 {
+			_, err = appender.AppendExemplar(ref, lbls, exemplar.Exemplar{
+				Labels: convertLabelPairToLabels(ex.GetLabel()),
+				Value:  ex.GetValue(),
+				Ts:     timeMs,
+			})
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	// NOTE: We clear the native exemplar slice to prevent accumulation, but the
+	// client_golang package handles the expiration of exemplars internally, and
+	// we don't have control over clearing the native histogram exemplars in the
+	// same way we do for the class histogram exemplars.
+	if len(s.histogram.Exemplars) > 0 {
+		clear(s.histogram.Exemplars)
+		s.histogram.Exemplars = s.histogram.Exemplars[:0]
+	}
+
+	// For pure native mode, never emit bucket exemplars - only native ones
+	// For hybrid mode, fallback to bucket exemplars if no native exemplars available
+	isHybridMode := hasClassicHistograms(h.histogramOverride)
+	if isHybridMode && len(s.histogram.Exemplars) == 0 {
+		// Hybrid mode fallback: use bucket exemplars if no native exemplars
+		for _, bucket := range s.histogram.Bucket {
+			if bucket.Exemplar != nil && len(bucket.Exemplar.Label) > 0 {
+				_, err = appender.AppendExemplar(ref, lbls, exemplar.Exemplar{
+					Labels: convertLabelPairToLabels(bucket.Exemplar.GetLabel()),
+					Value:  bucket.Exemplar.GetValue(),
+					Ts:     timeMs,
+				})
+				if err != nil {
+					return err
+				}
+				// Don't clear bucket exemplars here as they might be needed for classic emission
+			}
+		}
+	}
+
+	return err
+}
+
+func (h *nativeHistogram) classicHistograms(appender storage.Appender, timeMs int64, s *nativeHistogramSeries) error {
+	if s.isNew() {
+		endOfLastMinuteMs := getEndOfLastMinuteMs(timeMs)
+		_, err := appender.Append(0, s.sumLabels, endOfLastMinuteMs, 0)
+		if err != nil {
+			return err
+		}
+		_, err = appender.Append(0, s.countLabels, endOfLastMinuteMs, 0)
+		if err != nil {
+			return err
+		}
+	}
+
+	// sum
+	_, err := appender.Append(0, s.sumLabels, timeMs, s.histogram.GetSampleSum())
+	if err != nil {
+		return err
+	}
+
+	// count
+	_, err = appender.Append(0, s.countLabels, timeMs, getIfGreaterThenZeroOr(s.histogram.GetSampleCountFloat(), s.histogram.GetSampleCount()))
+	if err != nil {
+		return err
+	}
+
+	// bucket
+	s.lb.Set(labels.MetricName, h.metricName+"_bucket")
+
+	// the Prometheus histogram will sometimes add the +Inf bucket, it depends on whether there is an exemplar
+	// for that bucket or not. To avoid adding it twice, keep track of it with this boolean.
+	infBucketWasAdded := false
+
+	for _, bucket := range s.histogram.Bucket {
+		// add "le" label
+		s.lb.Set(labels.BucketLabel, formatFloat(bucket.GetUpperBound()))
+
+		if bucket.GetUpperBound() == math.Inf(1) {
+			infBucketWasAdded = true
+		}
+		if s.isNew() {
+			endOfLastMinuteMs := getEndOfLastMinuteMs(timeMs)
+			_, appendErr := appender.Append(0, s.lb.Labels(), endOfLastMinuteMs, 0)
+			if err != nil && !isOutOfOrderError(err) {
+				return appendErr
+			}
+		}
+
+		ref, appendErr := appender.Append(0, s.lb.Labels(), timeMs, getIfGreaterThenZeroOr(bucket.GetCumulativeCountFloat(), bucket.GetCumulativeCount()))
+		if appendErr != nil {
+			return appendErr
+		}
+
+		// Check for exemplars from prometheus histogram
+		if bucket.Exemplar != nil && len(bucket.Exemplar.Label) > 0 {
+			_, err = appender.AppendExemplar(ref, s.lb.Labels(), exemplar.Exemplar{
+				Labels: convertLabelPairToLabels(bucket.Exemplar.GetLabel()),
+				Value:  bucket.Exemplar.GetValue(),
+				Ts:     timeMs,
+			})
+			if err != nil {
+				return err
+			}
+			bucket.Exemplar.Reset()
+		}
+	}
+
+	if !infBucketWasAdded {
+		// Add +Inf bucket
+		s.lb.Set(labels.BucketLabel, "+Inf")
+		if s.isNew() {
+			endOfLastMinuteMs := getEndOfLastMinuteMs(timeMs)
+			_, err = appender.Append(0, s.lb.Labels(), endOfLastMinuteMs, 0)
+			if err != nil && !isOutOfOrderError(err) {
+				return err
+			}
+		}
+		_, err := appender.Append(0, s.lb.Labels(), timeMs, getIfGreaterThenZeroOr(s.histogram.GetSampleCountFloat(), s.histogram.GetSampleCount()))
+		if err != nil {
+			return err
+		}
+	}
+
+	// drop "le" label again
+	s.lb.Del(labels.BucketLabel)
+
+	return nil
+}
+
+func convertLabelPairToLabels(lbps []*dto.LabelPair) labels.Labels {
+	lbs := make([]labels.Label, len(lbps))
+	for i, lbp := range lbps {
+		lbs[i] = labels.Label{
+			Name:  lbp.GetName(),
+			Value: lbp.GetValue(),
+		}
+	}
+	return labels.New(lbs...)
+}
+
+// getIfGreaterThenZeroOr returns v1 is if it's greater than zero, otherwise it returns v2.
+func getIfGreaterThenZeroOr(v1 float64, v2 uint64) float64 {
+	if v1 > 0 {
+		return v1
+	}
+	return float64(v2)
+}

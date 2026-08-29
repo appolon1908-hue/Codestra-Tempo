@@ -1,0 +1,683 @@
+package traceql
+
+import (
+	"fmt"
+	"math"
+	"strings"
+	"time"
+
+	"github.com/grafana/tempo/pkg/tempopb"
+)
+
+// metricsElement is the shared base for span and series processing pipelines.
+type metricsElement interface {
+	init(req *tempopb.QueryRangeRequest, mode AggregateMode)
+	result(multiplier float64) SeriesSet
+	length() int
+}
+
+// spanProcessor handles individual span observation.
+type spanProcessor interface {
+	metricsElement
+	extractConditions(request *FetchSpansRequest)
+	observe(Span)
+	observeExemplar(Span)
+}
+
+// seriesProcessor handles pre-aggregated time series.
+type seriesProcessor interface {
+	metricsElement
+	observeSeries([]*tempopb.TimeSeries)
+}
+
+type firstStageElement interface {
+	Element
+	spanProcessor
+	seriesProcessor
+}
+
+// batchSeriesProcessor routes incoming time series to sub-processors by
+// the __query_fragment label. It implements seriesProcessor so the frontend
+// evaluator can treat math and non-math queries uniformly.
+type batchSeriesProcessor map[string]seriesProcessor
+
+var _ seriesProcessor = batchSeriesProcessor(nil)
+
+func (b batchSeriesProcessor) init(req *tempopb.QueryRangeRequest, mode AggregateMode) {
+	for _, p := range b {
+		p.init(req, mode)
+	}
+}
+
+func (b batchSeriesProcessor) observeSeries(in []*tempopb.TimeSeries) {
+	if len(in) == 0 {
+		return
+	}
+	if len(b) == 1 { // no-batch query, no need for fragments filtration
+		for _, p := range b {
+			p.observeSeries(in)
+		}
+		return
+	}
+	fragments := make(map[string][]*tempopb.TimeSeries, len(b))
+	for _, ts := range in {
+		for _, label := range ts.Labels {
+			if label.GetKey() == internalLabelQueryFragment {
+				fragmentKey := label.GetValue().GetStringValue()
+				fragments[fragmentKey] = append(fragments[fragmentKey], ts)
+				break
+			}
+		}
+	}
+
+	for k, v := range fragments {
+		if p, ok := b[k]; ok {
+			p.observeSeries(v)
+		}
+	}
+}
+
+func (b batchSeriesProcessor) result(multiplier float64) SeriesSet {
+	combined := make(SeriesSet)
+	for _, p := range b {
+		for k, v := range p.result(multiplier) {
+			combined[k] = v
+		}
+	}
+	return combined
+}
+
+func (b batchSeriesProcessor) length() int {
+	var total int
+	for _, p := range b {
+		total += p.length()
+	}
+	return total
+}
+
+type getExemplar func(Span) (float64, uint64)
+
+// MetricsAggregate is a placeholder in the AST for a metrics aggregation
+// pipeline element. It has a superset of the properties of them all, and
+// builds them later via init() so that appropriate buffers can be allocated
+// for the query time range and step, and different implementations for
+// shardable and unshardable pipelines.
+type MetricsAggregate struct {
+	op         MetricsAggregateOp
+	by         []Attribute
+	attr       Attribute
+	floats     []float64
+	agg        SpanAggregator
+	seriesAgg  SeriesAggregator
+	exemplarFn getExemplar
+	// Type of operation for simple aggregatation in layers 2 and 3
+	simpleAggregationOp SimpleAggregationOp
+	// When true, each observed span contributes its IntrinsicSpanMultiplier
+	// (= 1 / sampling probability) to count/sum aggregates instead of 1. Must
+	// be set before init() so the constructed inner aggregators see it.
+	extrapolate bool
+}
+
+// SetExtrapolate enables per-span sampling extrapolation. Must be called
+// before init().
+func (a *MetricsAggregate) SetExtrapolate(extrapolate bool) {
+	a.extrapolate = extrapolate
+}
+
+func newMetricsAggregate(agg MetricsAggregateOp, by []Attribute) *MetricsAggregate {
+	return &MetricsAggregate{
+		op: agg,
+		by: by,
+	}
+}
+
+func newMetricsAggregateWithAttr(agg MetricsAggregateOp, attr Attribute, by []Attribute) *MetricsAggregate {
+	return &MetricsAggregate{
+		op:   agg,
+		attr: attr,
+		by:   by,
+	}
+}
+
+func newMetricsAggregateQuantileOverTime(attr Attribute, qs []float64, by []Attribute) *MetricsAggregate {
+	return &MetricsAggregate{
+		op:     metricsAggregateQuantileOverTime,
+		floats: qs,
+		attr:   attr,
+		by:     by,
+	}
+}
+
+func (a *MetricsAggregate) extractConditions(request *FetchSpansRequest) {
+	// For metrics aggregators based on a span attribute we have to include it
+	includeAttribute := a.attr != (Attribute{}) && !request.HasAttribute(a.attr)
+	if includeAttribute {
+		request.SecondPassConditions = append(request.SecondPassConditions, Condition{
+			Attribute: a.attr,
+		})
+	}
+
+	for _, b := range a.by {
+		// In the case of the AllConditions, it is enough to check that the
+		// attribute is present in any of the passes.
+		if request.AllConditions {
+			if !request.HasAttribute(b) {
+				request.SecondPassConditions = append(request.SecondPassConditions, Condition{
+					Attribute: b,
+				})
+			}
+		} else {
+			// In the case of AllConditions set to false, as is the case with a
+			// structural query, we need to ensure that the `by` attribute is present
+			// in the second pass conditions as well, so that we load the column and
+			// can return the appropriate values.
+			if !request.SecondPassHasAttribute(b) {
+				request.SecondPassConditions = append(request.SecondPassConditions, Condition{
+					Attribute: b,
+				})
+			}
+		}
+	}
+}
+
+func (a *MetricsAggregate) init(q *tempopb.QueryRangeRequest, mode AggregateMode) {
+	// Raw mode:
+
+	var innerAgg func() VectorAggregator
+	var byFunc func(Span) (Static, bool)
+	var byFuncLabel string
+
+	extrapolate := a.extrapolate
+	newCount := func() VectorAggregator {
+		agg := NewCountOverTimeAggregator()
+		agg.SetExtrapolate(extrapolate)
+		return agg
+	}
+
+	switch a.op {
+	case metricsAggregateCountOverTime:
+		innerAgg = newCount
+		a.simpleAggregationOp = sumAggregation
+		a.exemplarFn = exemplarNaN
+
+	case metricsAggregateMinOverTime:
+		innerAgg = func() VectorAggregator { return NewOverTimeAggregator(a.attr, minOverTimeAggregation) }
+		a.simpleAggregationOp = minOverTimeAggregation
+		a.exemplarFn = exemplarFnFor(a.attr)
+
+	case metricsAggregateMaxOverTime:
+		innerAgg = func() VectorAggregator { return NewOverTimeAggregator(a.attr, maxOverTimeAggregation) }
+		a.simpleAggregationOp = maxOverTimeAggregation
+		a.exemplarFn = exemplarFnFor(a.attr)
+
+	case metricsAggregateSumOverTime:
+		innerAgg = func() VectorAggregator {
+			agg := NewOverTimeAggregator(a.attr, sumOverTimeAggregation)
+			agg.SetExtrapolate(extrapolate)
+			return agg
+		}
+		a.simpleAggregationOp = sumOverTimeAggregation
+		a.exemplarFn = exemplarFnFor(a.attr)
+
+	case metricsAggregateRate:
+		rateMult := 1.0 / time.Duration(q.Step).Seconds()
+		innerAgg = func() VectorAggregator {
+			agg := NewRateAggregator(rateMult)
+			agg.SetExtrapolate(extrapolate)
+			return agg
+		}
+		a.simpleAggregationOp = sumAggregation
+		a.exemplarFn = exemplarNaN
+
+	case metricsAggregateHistogramOverTime:
+		innerAgg = newCount
+		byFunc = bucketizeFnFor(a.attr)
+		byFuncLabel = internalLabelBucket
+		a.simpleAggregationOp = sumAggregation
+		a.exemplarFn = exemplarNaN // Histogram final series are counts so exemplars are placeholders
+
+	case metricsAggregateQuantileOverTime:
+		innerAgg = newCount
+		byFunc = bucketizeFnFor(a.attr)
+		byFuncLabel = internalLabelBucket
+		a.simpleAggregationOp = sumAggregation
+		a.exemplarFn = exemplarFnFor(a.attr)
+	}
+
+	switch mode {
+	case AggregateModeSum:
+		a.initSum(q)
+		return
+
+	case AggregateModeFinal:
+		a.initFinal(q)
+		return
+	}
+
+	var innerAggFunc func() RangeAggregator
+	if IsInstant(q) {
+		innerAggFunc = func() RangeAggregator {
+			return NewInstantAggregator(q.Start, q.End, innerAgg)
+		}
+	} else {
+		innerAggFunc = func() RangeAggregator {
+			return NewStepAggregator(q, innerAgg)
+		}
+	}
+
+	a.agg = NewGroupingAggregator(a.op.String(), innerAggFunc, a.by, byFunc, byFuncLabel)
+}
+
+func bucketizeFnFor(attr Attribute) func(Span) (Static, bool) {
+	switch attr {
+	case IntrinsicDurationAttribute:
+		// Optimal implementation for duration attribute
+		return bucketizeDuration
+	default:
+		// Basic implementation for all other attributes
+		return bucketizeAttribute(attr)
+	}
+}
+
+func bucketizeDuration(s Span) (Static, bool) {
+	d := s.DurationNanos()
+	if d < 2 {
+		return NewStaticNil(), false
+	}
+	// Bucket is in seconds
+	return NewStaticFloat(Log2Bucketize(d) / float64(time.Second)), true
+}
+
+// exemplarAttribute captures a closure around the attribute so it doesn't have to be passed along with every span.
+// should be more efficient.
+func bucketizeAttribute(a Attribute) func(Span) (Static, bool) {
+	return func(s Span) (Static, bool) {
+		f, t := FloatizeAttribute(s, a)
+
+		switch t {
+		case TypeInt:
+			if f < 2 {
+				return NewStaticNil(), false
+			}
+			// Bucket is the value rounded up to the nearest power of 2
+			return NewStaticFloat(Log2Bucketize(uint64(f))), true
+		case TypeDuration:
+			if f < 2 {
+				return NewStaticNil(), false
+			}
+			// Bucket is log2(nanos) converted to float seconds
+			return NewStaticFloat(Log2Bucketize(uint64(f)) / float64(time.Second)), true
+		default:
+			// TODO(mdisibio) - Add support for floats, we need to map them into buckets.
+			// Because of the range of floats, we need a native histogram approach.
+			return NewStaticNil(), false
+		}
+	}
+}
+
+func exemplarFnFor(a Attribute) func(Span) (float64, uint64) {
+	switch a {
+	case IntrinsicDurationAttribute:
+		return exemplarDuration
+	case Attribute{}:
+		// This records exemplars without a value, and they
+		// are attached to the series at the end.
+		return exemplarNaN
+	default:
+		return exemplarAttribute(a)
+	}
+}
+
+func exemplarNaN(s Span) (float64, uint64) {
+	return math.NaN(), s.StartTimeUnixNanos() / uint64(time.Millisecond)
+}
+
+func exemplarDuration(s Span) (float64, uint64) {
+	v := float64(s.DurationNanos()) / float64(time.Second)
+	t := s.StartTimeUnixNanos() / uint64(time.Millisecond)
+	return v, t
+}
+
+// exemplarAttribute captures a closure around the attribute so it doesn't have to be passed along with every span.
+// should be more efficient.
+func exemplarAttribute(a Attribute) func(Span) (float64, uint64) {
+	return func(s Span) (float64, uint64) {
+		v, _ := FloatizeAttribute(s, a)
+		t := s.StartTimeUnixNanos() / uint64(time.Millisecond)
+		return v, t
+	}
+}
+
+func (a *MetricsAggregate) initSum(q *tempopb.QueryRangeRequest) {
+	// Currently all metrics are summed by job to produce
+	// intermediate results. This will change when adding min/max/topk/etc
+	a.seriesAgg = NewSimpleCombiner(q, a.simpleAggregationOp)
+}
+
+func (a *MetricsAggregate) initFinal(q *tempopb.QueryRangeRequest) {
+	switch a.op {
+	case metricsAggregateQuantileOverTime:
+		a.seriesAgg = NewHistogramAggregator(q, a.floats, q.Exemplars)
+	default:
+		// These are simple additions by series
+		a.seriesAgg = NewSimpleCombiner(q, a.simpleAggregationOp)
+	}
+}
+
+func (a *MetricsAggregate) observe(span Span) {
+	a.agg.Observe(span)
+}
+
+func (a *MetricsAggregate) observeExemplar(span Span) {
+	v, ts := a.exemplarFn(span)
+	a.agg.ObserveExemplar(span, v, ts)
+}
+
+func (a *MetricsAggregate) observeSeries(ss []*tempopb.TimeSeries) {
+	a.seriesAgg.Combine(ss)
+}
+
+func (a *MetricsAggregate) result(multiplier float64) SeriesSet {
+	if a.agg != nil {
+		ss := a.agg.Series()
+
+		// These operations don't get scaled by the multiplier.
+		switch a.op {
+		case metricsAggregateMinOverTime, metricsAggregateMaxOverTime:
+			return ss
+		}
+
+		if multiplier > 1.0 {
+			for _, s := range ss {
+				for i := range s.Values {
+					s.Values[i] *= multiplier
+				}
+			}
+		}
+		return ss
+	}
+
+	// In the frontend-version the results come from
+	// the job-level aggregator
+	return a.seriesAgg.Results()
+}
+
+func (a *MetricsAggregate) length() int {
+	if a.agg != nil {
+		return a.agg.Length()
+	}
+
+	return a.seriesAgg.Length()
+}
+
+func (a *MetricsAggregate) validate() error {
+	switch a.op {
+	case metricsAggregateCountOverTime:
+	case metricsAggregateMinOverTime:
+	case metricsAggregateMaxOverTime:
+	case metricsAggregateSumOverTime:
+	case metricsAggregateRate:
+	case metricsAggregateHistogramOverTime:
+		if len(a.by) >= maxGroupBys {
+			// We reserve a spot for the bucket so quantile has 1 less group by
+			return newUnsupportedError(fmt.Sprintf("metrics group by %v values", len(a.by)))
+		}
+	case metricsAggregateQuantileOverTime:
+		if len(a.by) >= maxGroupBys {
+			// We reserve a spot for the bucket so quantile has 1 less group by
+			return newUnsupportedError(fmt.Sprintf("metrics group by %v values", len(a.by)))
+		}
+		for _, q := range a.floats {
+			if q < 0 || q > 1 {
+				return fmt.Errorf("quantile must be between 0 and 1: %v", q)
+			}
+		}
+	default:
+		return newUnsupportedError(fmt.Sprintf("metrics aggregate operation (%v)", a.op))
+	}
+
+	if len(a.by) > maxGroupBys {
+		return newUnsupportedError(fmt.Sprintf("metrics group by %v values", len(a.by)))
+	}
+
+	return nil
+}
+
+var (
+	_ firstStageElement = (*MetricsAggregate)(nil)
+	_ spanProcessor     = (*MetricsAggregate)(nil)
+	_ seriesProcessor   = (*MetricsAggregate)(nil)
+)
+
+// secondStageElement represents operations that are performed
+// in the second stage metrics pipeline, such as topK/bottomK, etc.
+// these operations are performed on the metrics generated by the first stage.
+//
+// NOTE: find a batter name for this, maybe something like AggregateStage.
+// This stage operates on metrics generated by the first stage and performs aggregation on traceql metrics.
+// for now, calling it second stage is fine because it is the second stage in the pipeline.
+// and we already have MetricsAggregate which is the in the first stage that operates on spans
+// and produces metrics so we need to rename that to make things clear and avoid confusion.
+type secondStageElement interface {
+	Element
+	init(req *tempopb.QueryRangeRequest)
+	process(input SeriesSet) SeriesSet
+	separator() string
+}
+
+type SecondStageOp int
+
+const (
+	OpTopK SecondStageOp = iota
+	OpBottomK
+)
+
+var errInvalidLimit = fmt.Errorf("limit must be greater than 0")
+
+func (op SecondStageOp) String() string {
+	switch op {
+	case OpTopK:
+		return "topk"
+	case OpBottomK:
+		return "bottomk"
+	}
+	return "unknown"
+}
+
+// TopKBottomK handles second stage topK/bottomK operations
+type TopKBottomK struct {
+	op     SecondStageOp
+	limit  int
+	length int
+	sep    string
+}
+
+func newTopKBottomK(op SecondStageOp, limit int, separator string) *TopKBottomK { //nolint:unparam
+	return &TopKBottomK{op: op, limit: limit, sep: separator}
+}
+
+func (m *TopKBottomK) String() string {
+	return fmt.Sprintf("%s(%d)", m.op.String(), m.limit)
+}
+
+func (m *TopKBottomK) validate() error {
+	if m.limit <= 0 {
+		return errInvalidLimit
+	}
+	return nil
+}
+
+func (m *TopKBottomK) init(req *tempopb.QueryRangeRequest) {
+	m.length = NewIntervalMapperFromReq(req).IntervalCount()
+}
+
+func (m *TopKBottomK) process(input SeriesSet) SeriesSet {
+	// if input size is less or equal to limit, return input as is
+	if len(input) <= m.limit {
+		return input
+	}
+
+	switch m.op {
+	case OpTopK:
+		return processTopK(input, m.length, m.limit)
+	case OpBottomK:
+		return processBottomK(input, m.length, m.limit)
+	default:
+		// unknown operation, return input SeriesSet, we shouldn't reach here
+		return input
+	}
+}
+
+func (m *TopKBottomK) separator() string {
+	return m.sep
+}
+
+var _ secondStageElement = (*TopKBottomK)(nil)
+
+// MetricsFilter implements second stage comparison filtering on metrics results.
+// It filters data points that don't match the comparison condition, setting them to NaN.
+// Series with all NaN values after filtering are removed.
+// Example: {status=error} | rate() by (svc) > 10
+type MetricsFilter struct {
+	op    Operator
+	value float64
+	sep   string
+}
+
+func newMetricsFilterFromStatic(op Operator, s Static, separator string) *MetricsFilter {
+	v := s.Float()
+	if s.Type == TypeDuration {
+		v /= float64(time.Second)
+	}
+	return &MetricsFilter{op: op, value: v, sep: separator}
+}
+
+func (m *MetricsFilter) String() string {
+	return m.op.String() + " " + formatFloat(m.value)
+}
+
+func (m *MetricsFilter) validate() error {
+	switch m.op {
+	case OpGreater, OpGreaterEqual, OpLess, OpLessEqual, OpEqual, OpNotEqual:
+		return nil
+	default:
+		return fmt.Errorf("unsupported metrics filter operation: %s", m.op.String())
+	}
+}
+
+func (m *MetricsFilter) init(_ *tempopb.QueryRangeRequest) {}
+
+func (m *MetricsFilter) process(input SeriesSet) SeriesSet {
+	result := make(SeriesSet, len(input))
+
+	for key, series := range input {
+		hasValue := false
+
+		for i, v := range series.Values {
+			if math.IsNaN(v) || !m.compare(v) {
+				series.Values[i] = math.NaN()
+				continue
+			}
+
+			hasValue = true
+		}
+
+		if !hasValue {
+			continue
+		}
+
+		exemplars := make([]Exemplar, 0, len(series.Exemplars))
+		for i, e := range series.Exemplars {
+			if !math.IsNaN(e.Value) && m.compare(e.Value) {
+				exemplars = append(exemplars, series.Exemplars[i])
+			}
+		}
+		result[key] = TimeSeries{
+			Labels:    series.Labels,
+			Values:    series.Values,
+			Exemplars: exemplars,
+		}
+	}
+
+	return result
+}
+
+// compare performs the comparison.
+// the function is inlined and more efficient than a pre-calculate function
+func (m *MetricsFilter) compare(v float64) bool {
+	switch m.op {
+	case OpGreater:
+		return v > m.value
+	case OpGreaterEqual:
+		return v >= m.value
+	case OpLess:
+		return v < m.value
+	case OpLessEqual:
+		return v <= m.value
+	case OpEqual:
+		return v == m.value
+	case OpNotEqual:
+		return v != m.value
+	default:
+		return false
+	}
+}
+
+func (m *MetricsFilter) separator() string {
+	return m.sep
+}
+
+var _ secondStageElement = (*MetricsFilter)(nil)
+
+// formatFloat formats a float64 for round-trip fidelity: integers without decimal, floats with %g.
+func formatFloat(v float64) string {
+	if v == float64(int(v)) && !math.IsInf(v, 0) && !math.IsNaN(v) {
+		return fmt.Sprintf("%d", int(v))
+	}
+	return fmt.Sprintf("%g", v)
+}
+
+// ChainedSecondStage chains multiple second stage elements together.
+// Elements are processed in order, each receiving the output of the previous.
+// Example: {status=error} | rate() | topk(5) > 10
+type ChainedSecondStage []secondStageElement
+
+func (c ChainedSecondStage) String() string {
+	b := strings.Builder{}
+	for i := range c {
+		b.WriteString(c[i].separator())
+		b.WriteString(c[i].String())
+	}
+	return b.String()
+}
+
+func (c ChainedSecondStage) validate() error {
+	for _, e := range c {
+		if err := e.validate(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c ChainedSecondStage) init(req *tempopb.QueryRangeRequest) {
+	for _, e := range c {
+		e.init(req)
+	}
+}
+
+func (c ChainedSecondStage) process(input SeriesSet) SeriesSet {
+	for _, e := range c {
+		input = e.process(input)
+	}
+	return input
+}
+
+func (c ChainedSecondStage) separator() string {
+	if len(c) == 0 {
+		return ""
+	}
+	return c[0].separator()
+}
+
+var _ secondStageElement = ChainedSecondStage{}

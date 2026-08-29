@@ -1,0 +1,1099 @@
+package api
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"math"
+	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/go-logfmt/logfmt"
+	"github.com/google/uuid"
+	"github.com/gorilla/mux"
+	"github.com/grafana/dskit/httpgrpc"
+	spanpruningprocessor "github.com/open-telemetry/opentelemetry-collector-contrib/processor/spanpruningprocessor"
+	"github.com/prometheus/common/model"
+
+	"github.com/grafana/tempo/pkg/model/tracediff"
+	"github.com/grafana/tempo/pkg/tempopb"
+	"github.com/grafana/tempo/pkg/traceql"
+	"github.com/grafana/tempo/pkg/util"
+	"github.com/grafana/tempo/tempodb"
+)
+
+const (
+	urlParamTraceID = "traceID"
+	// search
+	urlParamQuery           = "q"
+	urlParamTags            = "tags"
+	urlParamMinDuration     = "minDuration"
+	urlParamMaxDuration     = "maxDuration"
+	urlParamLimit           = "limit"
+	urlParamMaxStaleValues  = "maxStaleValues"
+	urlParamStart           = "start"
+	urlParamEnd             = "end"
+	urlParamSpansPerSpanSet = "spss"
+	urlParamStep            = "step"
+	urlParamSince           = "since"
+	urlParamExemplars       = "exemplars"
+	urlMaxSeries            = "maxSeries"
+	urlInstant              = "instant"
+
+	// backend search querier
+	urlParamStartPage        = "startPage"
+	urlParamPagesToSearch    = "pagesToSearch"
+	urlParamBlockID          = "blockID"
+	urlParamIndexPageSize    = "indexPageSize"
+	urlParamTotalRecords     = "totalRecords"
+	urlParamVersion          = "version"
+	urlParamSize             = "size"
+	urlParamFooterSize       = "footerSize"
+	urlParamDedicatedColumns = "dc"
+
+	urlParamSkipASTTransformations = "skip_ast_transformations"
+
+	// span pruning
+	urlParamSpanPruning               = "span_pruning"
+	urlParamSpanPruningGroupBy        = "span_pruning_group_by"
+	urlParamSpanPruningMinSpans       = "span_pruning_min_spans"
+	urlParamSpanPruningMaxParentDepth = "span_pruning_max_parent_depth"
+
+	// trace by id v2 filtering (q reuses urlParamQuery)
+	urlParamKeepHierarchy = "keep_hierarchy"
+	urlParamMatchDepth    = "match_depth"
+	urlParamAncestorDepth = "ancestor_depth"
+
+	// search tags
+	urlParamScope = "scope"
+
+	HeaderAccept           = "Accept"
+	HeaderContentType      = "Content-Type"
+	HeaderAcceptProtobuf   = "application/protobuf"
+	HeaderAcceptJSON       = "application/json"
+	HeaderAcceptLLM        = "application/vnd.grafana.llm"
+	HeaderRecentDataTarget = "Recent-Data-Target"
+
+	PathPrefixQuerier = "/querier"
+
+	PathTraces              = "/api/traces/{traceID}"
+	PathSearch              = "/api/search"
+	PathSearchTags          = "/api/search/tags"
+	PathSearchTagValues     = "/api/search/tag/" + MuxVarTagInPath + "/values"
+	PathEcho                = "/api/echo"
+	PathBuildInfo           = "/api/status/buildinfo"
+	PathUsageStats          = "/status/usage-stats"
+	PathMetricsQueryInstant = "/api/metrics/query"
+	PathMetricsQueryRange   = "/api/metrics/query_range"
+	PathMCP                 = "/api/mcp"
+
+	// PathOverrides user configurable overrides
+	PathOverrides = "/api/overrides"
+
+	PathSearchTagValuesV2 = "/api/v2/search/tag/" + MuxVarTagInPath + "/values"
+	PathSearchTagsV2      = "/api/v2/search/tags"
+	PathTraceDiffV2       = "/api/v2/traces/diff"
+	PathTracesV2          = "/api/v2/traces/{traceID}"
+
+	QueryModeKey       = "mode"
+	QueryModeIngesters = "ingesters"
+	QueryModeBlocks    = "blocks"
+	QueryModeExternal  = "external"
+	QueryModeAll       = "all"
+	BlockStartKey      = "blockStart"
+	BlockEndKey        = "blockEnd"
+
+	defaultLimit           = 20
+	defaultSpansPerSpanSet = 3
+	defaultSince           = 1 * time.Hour
+)
+
+// MarshallingFormat represents the format used for marshalling HTTP responses
+type MarshallingFormat string
+
+const (
+	MarshallingFormatProtobuf MarshallingFormat = HeaderAcceptProtobuf
+	MarshallingFormatJSON     MarshallingFormat = HeaderAcceptJSON
+	MarshallingFormatLLM      MarshallingFormat = HeaderAcceptLLM
+)
+
+// TraceDiffRequest is the request body for the trace diff API.
+type TraceDiffRequest struct {
+	Base    TraceDiffTraceRequest `json:"base"`
+	Compare TraceDiffTraceRequest `json:"compare"`
+	Format  string                `json:"format,omitempty"`
+}
+
+// TraceDiffTraceRequest identifies one side of a trace diff request.
+type TraceDiffTraceRequest struct {
+	TraceID string `json:"traceId"`
+	Start   *int64 `json:"start,omitempty"`
+	End     *int64 `json:"end,omitempty"`
+
+	TraceIDBytes []byte    `json:"-"`
+	StartTime    time.Time `json:"-"`
+	EndTime      time.Time `json:"-"`
+}
+
+// MarshalingFormatFromAcceptHeader extracts the marshaling format from the Accept header
+// It properly handles multiple media types and quality values
+func MarshalingFormatFromAcceptHeader(header http.Header) MarshallingFormat {
+	allMarshallingFormats := []MarshallingFormat{MarshallingFormatProtobuf, MarshallingFormatJSON, MarshallingFormatLLM}
+	acceptHeader := header.Get(HeaderAccept)
+	if acceptHeader == "" {
+		return MarshallingFormatJSON
+	}
+
+	// Check if a specific/supported marshalling format is requested
+	for _, format := range allMarshallingFormats {
+		if strings.Contains(acceptHeader, string(format)) {
+			return format
+		}
+	}
+
+	// Default to JSON
+	return MarshallingFormatJSON
+}
+
+func ParseRecentDataTargetHeader(req *http.Request) string {
+	v := req.Header.Get(HeaderRecentDataTarget)
+	return v
+}
+
+func ParseTraceID(r *http.Request) ([]byte, error) {
+	vars := mux.Vars(r)
+	traceID, ok := vars[urlParamTraceID]
+	if !ok {
+		return nil, fmt.Errorf("please provide a traceID")
+	}
+
+	byteID, err := util.HexStringToTraceID(traceID)
+	if err != nil {
+		return nil, err
+	}
+
+	return byteID, nil
+}
+
+// ParseSearchRequest takes an http.Request and decodes query params to create a tempopb.SearchRequest
+func ParseSearchRequest(r *http.Request) (*tempopb.SearchRequest, error) {
+	return ParseSearchRequestWithDefault(r, defaultSpansPerSpanSet)
+}
+
+// ParseSearchRequestWithDefault takes an http.Request and decodes query params to create a tempopb.SearchRequest
+// using the provided default value for SpansPerSpanSet when not specified in the request
+func ParseSearchRequestWithDefault(r *http.Request, defaultSpansPerSpanSet uint32) (*tempopb.SearchRequest, error) {
+	req := &tempopb.SearchRequest{
+		Tags:            map[string]string{},
+		SpansPerSpanSet: defaultSpansPerSpanSet,
+	}
+
+	vals := r.URL.Query()
+
+	if s, ok := extractQueryParam(vals, urlParamStart); ok {
+		start, err := strconv.ParseUint(s, 10, 32)
+		if err != nil {
+			return nil, fmt.Errorf("invalid start: %w", err)
+		}
+		req.Start = uint32(start)
+	}
+
+	if s, ok := extractQueryParam(vals, urlParamEnd); ok {
+		end, err := strconv.ParseUint(s, 10, 32)
+		if err != nil {
+			return nil, fmt.Errorf("invalid end: %w", err)
+		}
+		req.End = uint32(end)
+	}
+
+	query, queryFound := extractQueryParam(vals, urlParamQuery)
+	if queryFound {
+		req.Query = query
+	}
+
+	encodedTags, tagsFound := extractQueryParam(vals, urlParamTags)
+	if tagsFound {
+		// tags and traceQL API are mutually exclusive
+		if queryFound {
+			return nil, fmt.Errorf("invalid request: can't specify tags and q in the same query")
+		}
+
+		decoder := logfmt.NewDecoder(strings.NewReader(encodedTags))
+
+		for decoder.ScanRecord() {
+			for decoder.ScanKeyval() {
+				key := string(decoder.Key())
+				if _, ok := req.Tags[key]; ok {
+					return nil, fmt.Errorf("invalid tags: tag %s has been set twice", key)
+				}
+				req.Tags[key] = string(decoder.Value())
+			}
+		}
+
+		if err := decoder.Err(); err != nil {
+			var syntaxErr *logfmt.SyntaxError
+			if ok := errors.As(err, &syntaxErr); ok {
+				return nil, fmt.Errorf("invalid tags: %s at pos %d", syntaxErr.Msg, syntaxErr.Pos)
+			}
+			return nil, fmt.Errorf("invalid tags: %w", err)
+		}
+	}
+
+	// if we don't have a query or tags, and we don't see start or end treat this like an old style search
+	// if we have no tags but we DO have start/end we have to treat this like a range search with no
+	// tags specified.
+	if !queryFound && !tagsFound && req.Start == 0 && req.End == 0 {
+		// Passing tags as individual query parameters is not supported anymore, clients should use the tags
+		// query parameter instead. We still parse these tags since the initial Grafana implementation uses this.
+		// As Grafana gets updated and/or versions using this get old we can remove this section.
+		for k, v := range vals {
+			// Skip reserved keywords
+			if k == urlParamQuery || k == urlParamTags || k == urlParamMinDuration || k == urlParamMaxDuration || k == urlParamLimit || k == urlParamSpansPerSpanSet || k == urlParamStart || k == urlParamEnd {
+				continue
+			}
+
+			if len(v) > 0 && v[0] != "" {
+				req.Tags[k] = v[0]
+			}
+		}
+	}
+
+	if s, ok := extractQueryParam(vals, urlParamMinDuration); ok {
+		dur, err := time.ParseDuration(s)
+		if err != nil {
+			return nil, fmt.Errorf("invalid minDuration: %w", err)
+		}
+		req.MinDurationMs = uint32(dur.Milliseconds())
+	}
+
+	if s, ok := extractQueryParam(vals, urlParamMaxDuration); ok {
+		dur, err := time.ParseDuration(s)
+		if err != nil {
+			return nil, fmt.Errorf("invalid maxDuration: %w", err)
+		}
+		req.MaxDurationMs = uint32(dur.Milliseconds())
+
+		if req.MinDurationMs != 0 && req.MinDurationMs > req.MaxDurationMs {
+			return nil, errors.New("invalid maxDuration: must be greater than minDuration")
+		}
+	}
+
+	if s, ok := extractQueryParam(vals, urlParamLimit); ok {
+		limit, err := strconv.ParseUint(s, 10, 32)
+		if err != nil {
+			return nil, fmt.Errorf("invalid limit: %w", err)
+		}
+		if limit == 0 {
+			return nil, errors.New("invalid limit: must be a positive number")
+		}
+		req.Limit = uint32(limit)
+	}
+
+	if s, ok := extractQueryParam(vals, urlParamSpansPerSpanSet); ok {
+		spansPerSpanSet, err := strconv.ParseUint(s, 10, 32)
+		if err != nil {
+			return nil, fmt.Errorf("invalid spss: %w", err)
+		}
+		req.SpansPerSpanSet = uint32(spansPerSpanSet)
+	}
+
+	if s, ok := extractQueryParam(vals, urlParamSkipASTTransformations); ok {
+		for _, name := range strings.Split(s, ",") {
+			if name = strings.TrimSpace(name); name != "" {
+				req.SkipASTTransformations = append(req.SkipASTTransformations, name)
+			}
+		}
+	}
+
+	// start and end == 0 is fine
+	if req.End == 0 && req.Start == 0 {
+		return req, nil
+	}
+
+	// if start or end are non-zero do some checks
+	if req.End <= req.Start {
+		return nil, fmt.Errorf("http parameter start must be before end. received start=%d end=%d", req.Start, req.End)
+	}
+	return req, nil
+}
+
+func ParseQueryInstantRequest(r *http.Request) (*tempopb.QueryInstantRequest, error) {
+	req := &tempopb.QueryInstantRequest{}
+	vals := r.URL.Query()
+
+	// check "query" first. this was originally added for prom compatibility and Grafana still uses it.
+	if s, ok := extractQueryParam(vals, "query"); ok {
+		req.Query = s
+	}
+
+	// also check the `q` parameter. this is what all other Tempo endpoints take for a TraceQL query.
+	if s, ok := extractQueryParam(vals, urlParamQuery); ok {
+		req.Query = s
+	}
+
+	start, end, err := bounds(vals)
+	if err != nil {
+		return nil, httpgrpc.Error(http.StatusBadRequest, err.Error())
+	}
+	req.Start = uint64(start.UnixNano())
+	req.End = uint64(end.UnixNano())
+
+	return req, nil
+}
+
+func ParseQueryRangeRequest(r *http.Request) (*tempopb.QueryRangeRequest, error) {
+	req := &tempopb.QueryRangeRequest{}
+	vals := r.URL.Query()
+
+	// check "query" first. this was originally added for prom compatibility and Grafana still uses it.
+	if s, ok := extractQueryParam(vals, "query"); ok {
+		req.Query = s
+	}
+
+	// also check the `q` parameter. this is what all other Tempo endpoints take for a TraceQL query.
+	if s, ok := extractQueryParam(vals, urlParamQuery); ok {
+		req.Query = s
+	}
+
+	if s, ok := extractQueryParam(vals, QueryModeKey); ok {
+		req.QueryMode = s
+	}
+
+	start, end, err := bounds(vals)
+	if err != nil {
+		return nil, httpgrpc.Error(http.StatusBadRequest, err.Error())
+	}
+	req.Start = uint64(start.UnixNano())
+	req.End = uint64(end.UnixNano())
+
+	step, err := step(vals, start, end)
+	if err != nil {
+		return nil, httpgrpc.Error(http.StatusBadRequest, err.Error())
+	}
+	req.Step = uint64(step.Nanoseconds())
+
+	// New RF1 params
+	blockID, _ := extractQueryParam(vals, urlParamBlockID)
+	if blockID, err := uuid.Parse(blockID); err == nil {
+		req.BlockID = blockID.String()
+	}
+
+	startPage, _ := extractQueryParam(vals, urlParamStartPage)
+	if startPage, err := strconv.ParseUint(startPage, 10, 32); err == nil {
+		req.StartPage = uint32(startPage)
+	}
+
+	pagesToSearch, _ := extractQueryParam(vals, urlParamPagesToSearch)
+	if of, err := strconv.ParseUint(pagesToSearch, 10, 32); err == nil {
+		req.PagesToSearch = uint32(of)
+	}
+
+	version, _ := extractQueryParam(vals, urlParamVersion)
+	req.Version = version
+
+	size, _ := extractQueryParam(vals, urlParamSize)
+	if size, err := strconv.ParseUint(size, 10, 64); err == nil {
+		req.Size_ = uint64(size)
+	}
+
+	footerSize, _ := extractQueryParam(vals, urlParamFooterSize)
+	if footerSize, err := strconv.ParseUint(footerSize, 10, 32); err == nil {
+		req.FooterSize = uint32(footerSize)
+	}
+
+	dedicatedColumns, _ := extractQueryParam(vals, urlParamDedicatedColumns)
+	if len(dedicatedColumns) > 0 {
+		err := json.Unmarshal([]byte(dedicatedColumns), &req.DedicatedColumns)
+		if err != nil {
+			return nil, httpgrpc.Errorf(http.StatusBadRequest, "failed to parse dedicated columns: %s", err)
+		}
+	}
+
+	exemplars, _ := extractQueryParam(vals, urlParamExemplars)
+	if exemplars, err := strconv.ParseUint(exemplars, 10, 32); err == nil {
+		req.Exemplars = uint32(exemplars)
+	}
+
+	maxSeries, _ := extractQueryParam(vals, urlMaxSeries)
+	if maxSeries, err := strconv.ParseUint(maxSeries, 10, 32); err == nil {
+		req.MaxSeries = uint32(maxSeries)
+	}
+
+	if isInstant, found := extractQueryParam(vals, urlInstant); found {
+		val, err := strconv.ParseBool(isInstant)
+		if err == nil {
+			req.SetInstant(val)
+		}
+	}
+
+	if s, ok := extractQueryParam(vals, urlParamSkipASTTransformations); ok {
+		for _, name := range strings.Split(s, ",") {
+			if name = strings.TrimSpace(name); name != "" {
+				req.SkipASTTransformations = append(req.SkipASTTransformations, name)
+			}
+		}
+	}
+
+	return req, nil
+}
+
+func BuildQueryInstantRequest(req *http.Request, searchReq *tempopb.QueryInstantRequest) *http.Request {
+	if req == nil {
+		req = &http.Request{
+			URL: &url.URL{},
+		}
+	}
+
+	if searchReq == nil {
+		return req
+	}
+
+	qb := newQueryBuilder("")
+	qb.addParam(urlParamStart, strconv.FormatUint(searchReq.Start, 10))
+	qb.addParam(urlParamEnd, strconv.FormatUint(searchReq.End, 10))
+	qb.addParam(urlParamQuery, searchReq.Query)
+
+	req.URL.RawQuery = qb.query()
+
+	return req
+}
+
+// BuildQueryRangeRequest takes a tempopb.QueryRangeRequest and populates the passed http.Request
+// dedicatedColumnsJSON should be generated using the DedicatedColumnsToJSON struct which produces the expected string
+// value and memoizes results to prevent redundant marshaling.
+func BuildQueryRangeRequest(req *http.Request, searchReq *tempopb.QueryRangeRequest, dedicatedColumnsJSON string) *http.Request {
+	if req == nil {
+		req = &http.Request{
+			URL: &url.URL{},
+		}
+	}
+
+	if searchReq == nil {
+		return req
+	}
+
+	qb := newQueryBuilder("")
+	if searchReq.Start != 0 {
+		qb.addParam(urlParamStart, strconv.FormatUint(searchReq.Start, 10))
+	}
+	if searchReq.End != 0 {
+		qb.addParam(urlParamEnd, strconv.FormatUint(searchReq.End, 10))
+	}
+	if searchReq.Step != 0 { // if step != 0 leave the param out and Tempo will calculate it
+		qb.addParam(urlParamStep, time.Duration(searchReq.Step).String())
+	}
+	qb.addParam(QueryModeKey, searchReq.QueryMode)
+	// New RF1 params
+	qb.addParam(urlParamBlockID, searchReq.BlockID)
+	qb.addParam(urlParamStartPage, strconv.Itoa(int(searchReq.StartPage)))
+	qb.addParam(urlParamPagesToSearch, strconv.Itoa(int(searchReq.PagesToSearch)))
+	qb.addParam(urlParamVersion, searchReq.Version)
+	qb.addParam("encoding", "none")
+	qb.addParam(urlParamSize, strconv.Itoa(int(searchReq.Size_)))
+	qb.addParam(urlParamFooterSize, strconv.Itoa(int(searchReq.FooterSize)))
+
+	if len(dedicatedColumnsJSON) > 0 && dedicatedColumnsJSON != "null" { // if a caller marshals a nil dedicated cols we will receive the string "null"
+		qb.addParam(urlParamDedicatedColumns, dedicatedColumnsJSON)
+	}
+
+	if len(searchReq.Query) > 0 {
+		qb.addParam(urlParamQuery, searchReq.Query)
+	}
+
+	qb.addParam(urlParamExemplars, strconv.FormatUint(uint64(searchReq.Exemplars), 10))
+	qb.addParam(urlMaxSeries, strconv.Itoa(int(searchReq.MaxSeries)))
+	if searchReq.HasInstant() {
+		qb.addParam(urlInstant, strconv.FormatBool(searchReq.GetInstant()))
+	}
+
+	if len(searchReq.SkipASTTransformations) > 0 {
+		qb.addParam(urlParamSkipASTTransformations, strings.Join(searchReq.SkipASTTransformations, ","))
+	}
+
+	req.URL.RawQuery = qb.query()
+
+	return req
+}
+
+// Generic helper to append query parameters to an http request with less allocations
+func BuildQueryRequest(req *http.Request, queryParams map[string]string) *http.Request {
+	if req == nil {
+		req = &http.Request{
+			URL: &url.URL{},
+		}
+	}
+	qb := newQueryBuilder(req.URL.RawQuery)
+	for k, v := range queryParams {
+		if v == "" {
+			continue
+		}
+		qb.addParam(k, v)
+	}
+	req.URL.RawQuery = qb.query()
+	return req
+}
+
+func bounds(vals url.Values) (time.Time, time.Time, error) {
+	var (
+		now               = time.Now()
+		start, end, since = extractDateRangeParams(vals)
+	)
+
+	return determineBounds(now, start, end, since)
+}
+
+func determineBounds(now time.Time, startString, endString, sinceString string) (time.Time, time.Time, error) {
+	since := defaultSince
+	if sinceString != "" {
+		d, err := model.ParseDuration(sinceString)
+		if err != nil {
+			return time.Time{}, time.Time{}, fmt.Errorf("could not parse 'since' parameter: %w", err)
+		}
+		since = time.Duration(d)
+	}
+
+	end, err := parseTimestamp(endString, now)
+	if err != nil {
+		return time.Time{}, time.Time{}, fmt.Errorf("could not parse 'end' parameter: %w", err)
+	}
+
+	// endOrNow is used to apply a default for the start time or an offset if 'since' is provided.
+	// we want to use the 'end' time so long as it's not in the future as this should provide
+	// a more intuitive experience when end time is in the future.ß
+	endOrNow := end
+	if end.After(now) {
+		endOrNow = now
+	}
+
+	start, err := parseTimestamp(startString, endOrNow.Add(-since))
+	if err != nil {
+		return time.Time{}, time.Time{}, fmt.Errorf("could not parse 'start' parameter: %w", err)
+	}
+
+	return start, end, nil
+}
+
+// ClampDateRangeReq parses and validates date range parameters from an HTTP request,
+// applying clamping logic to ensure the end time doesn't exceed current time minus endBuffer.
+//
+// Parameters:
+//   - req: HTTP request containing query parameters for start, end, and since
+//   - defStart: default duration to subtract from current time for start when no parameters provided
+//   - endBuffer: duration to subtract from current time to clamp the maximum end time
+//
+// Returns:
+//   - start: parsed or calculated start time
+//   - end: parsed or calculated end time, clamped to not exceed (now - endBuffer)
+//   - p: timestamp precision detected from the parsed values
+//   - err: error if parsing fails or validation errors occur
+//
+// Parameter precedence and behavior:
+//  1. If 'since' is provided: end = now - endBuffer, start = end - since
+//  2. If neither start nor end provided: end = now - endBuffer, start = now - defStart
+//  3. If both start and end provided: parse both and clamp end to not exceed (now - endBuffer)
+//  4. If only one of start/end provided: returns validation error
+//
+// Validation rules when both start and end are provided:
+//   - Both must have the same string length (seconds vs nanoseconds format)
+//   - Both must be either fractional or integer (consistent decimal point usage)
+func ClampDateRangeReq(req *http.Request, defStart, endBuffer time.Duration) (start, end time.Time, err error) {
+	vals := req.URL.Query()
+	var (
+		now                        = time.Now()
+		startVal, endVal, sinceVal = extractDateRangeParams(vals)
+	)
+
+	// Since provided, it takes precedence
+	if sinceVal != "" {
+		d, err := model.ParseDuration(sinceVal)
+		if err != nil {
+			return time.Time{}, time.Time{}, fmt.Errorf("could not parse 'since' parameter: %w", err)
+		}
+		end = now.Add(-endBuffer)
+		start = end.Add(-time.Duration(d))
+		return start, end, nil
+	}
+
+	// No start or end, sets defaults values
+	if startVal == "" && endVal == "" {
+		end = now.Add(-endBuffer)
+		start = now.Add(-defStart)
+		return start, end, nil
+	}
+
+	// Validating inputs
+	if startVal == "" || endVal == "" {
+		return time.Time{}, time.Time{}, fmt.Errorf("only one of start and end provided: must provide both or neither")
+	}
+
+	// Both provided, parse and clamp
+	start, err = parseTimestamp(startVal, time.Time{})
+	if err != nil {
+		return time.Time{}, time.Time{}, fmt.Errorf("could not parse 'start' parameter: %w", err)
+	}
+
+	end, err = parseTimestamp(endVal, time.Time{})
+	if err != nil {
+		return time.Time{}, time.Time{}, fmt.Errorf("could not parse 'end' parameter: %w", err)
+	}
+	maxEnd := now.Add(-endBuffer)
+	if maxEnd.Before(end) {
+		end = maxEnd
+		if start.After(end) {
+			start = now.Add(-defStart) // It can be possible that after clamping the end the start time would be greater.
+		}
+	}
+
+	return start, end, nil
+}
+
+// parseTimestamp parses an unix timestamp from a string
+// allowed values: unix epoch seconds (int), unix epoch nanoseconds (int),
+// unix epoch fractional seconds (float), or RFC3339 string
+// any other string will result on a parsing error
+// if the value is empty it returns a default value passed as second parameter
+func parseTimestamp(value string, def time.Time) (time.Time, error) {
+	if value == "" {
+		return def, nil
+	}
+
+	if strings.Contains(value, ".") {
+		if t, err := strconv.ParseFloat(value, 64); err == nil {
+			s, ns := math.Modf(t)
+			ns = math.Round(ns*1000) / 1000
+			return time.Unix(int64(s), int64(ns*float64(time.Second))), nil
+		}
+	}
+	nanos, err := strconv.ParseInt(value, 10, 64)
+	if err != nil {
+		if ts, err := time.Parse(time.RFC3339Nano, value); err == nil {
+			return ts, nil
+		}
+		return time.Time{}, err
+	}
+
+	if len(value) <= 10 {
+		return time.Unix(nanos, 0), nil
+	}
+	return time.Unix(0, nanos), nil
+}
+
+func step(vals url.Values, start, end time.Time) (time.Duration, error) {
+	value, _ := extractQueryParam(vals, urlParamStep)
+	if value == "" {
+		return time.Duration(traceql.DefaultQueryRangeStep(uint64(start.UnixNano()), uint64(end.UnixNano()))), nil
+	}
+	dur, err := parseSecondsOrDuration(value)
+	if err != nil {
+		return dur, err
+	}
+	if dur < 0 {
+		return 0, fmt.Errorf("cannot parse %q: step must be positive", value)
+	}
+	return dur, nil
+}
+
+func parseSecondsOrDuration(value string) (time.Duration, error) {
+	if d, err := strconv.ParseFloat(value, 64); err == nil {
+		ts := d * float64(time.Second)
+		if ts > float64(math.MaxInt64) || ts < float64(math.MinInt64) {
+			return 0, fmt.Errorf("cannot parse %q to a valid duration. It overflows int64", value)
+		}
+		return time.Duration(ts), nil
+	}
+	if d, err := time.ParseDuration(value); err == nil {
+		return d, nil
+	}
+	return 0, fmt.Errorf("cannot parse %q to a valid duration", value)
+}
+
+// BuildSearchRequest takes a tempopb.SearchRequest and populates the passed http.Request
+// with the appropriate params. If no http.Request is provided a new one is created.
+func BuildSearchRequest(req *http.Request, searchReq *tempopb.SearchRequest) (*http.Request, error) {
+	if req == nil {
+		req = &http.Request{
+			URL: &url.URL{},
+		}
+	}
+
+	if searchReq == nil {
+		return req, nil
+	}
+
+	qb := newQueryBuilder("")
+	if searchReq.Start != 0 {
+		qb.addParam(urlParamStart, strconv.FormatUint(uint64(searchReq.Start), 10))
+	}
+	if searchReq.End != 0 {
+		qb.addParam(urlParamEnd, strconv.FormatUint(uint64(searchReq.End), 10))
+	}
+	if searchReq.Limit != 0 {
+		qb.addParam(urlParamLimit, strconv.FormatUint(uint64(searchReq.Limit), 10))
+	}
+	if searchReq.MaxDurationMs != 0 {
+		qb.addParam(urlParamMaxDuration, strconv.FormatUint(uint64(searchReq.MaxDurationMs), 10)+"ms")
+	}
+	if searchReq.MinDurationMs != 0 {
+		qb.addParam(urlParamMinDuration, strconv.FormatUint(uint64(searchReq.MinDurationMs), 10)+"ms")
+	}
+	// Always add spans_per_span_set parameter even if 0 (which means unlimited)
+	qb.addParam(urlParamSpansPerSpanSet, strconv.FormatUint(uint64(searchReq.SpansPerSpanSet), 10))
+
+	if len(searchReq.Query) > 0 {
+		qb.addParam(urlParamQuery, searchReq.Query)
+	}
+
+	if len(searchReq.Tags) > 0 {
+		builder := &strings.Builder{}
+		encoder := logfmt.NewEncoder(builder)
+
+		for k, v := range searchReq.Tags {
+			err := encoder.EncodeKeyval(k, v)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		qb.addParam(urlParamTags, builder.String())
+	}
+
+	if len(searchReq.SkipASTTransformations) > 0 {
+		qb.addParam(urlParamSkipASTTransformations, strings.Join(searchReq.SkipASTTransformations, ","))
+	}
+
+	req.URL.RawQuery = qb.query()
+
+	return req, nil
+}
+
+// BuildSearchBlockRequest takes a tempopb.SearchBlockRequest and populates the passed http.Request
+// with the appropriate params. If no http.Request is provided a new one is created.
+// dedicatedColumnsJSON should be generated using the DedicatedColumnsToJSON struct which produces the expected string
+// value and memoizes results to prevent redundant marshaling.
+func BuildSearchBlockRequest(req *http.Request, searchReq *tempopb.SearchBlockRequest, dedicatedColumnsJSON string) (*http.Request, error) {
+	if req == nil {
+		req = &http.Request{
+			URL: &url.URL{},
+		}
+	}
+
+	req, err := BuildSearchRequest(req, searchReq.SearchReq)
+	if err != nil {
+		return nil, err
+	}
+
+	qb := newQueryBuilder(req.URL.RawQuery)
+	qb.addParam(urlParamBlockID, searchReq.BlockID)
+	qb.addParam(urlParamPagesToSearch, strconv.FormatUint(uint64(searchReq.PagesToSearch), 10))
+	qb.addParam(urlParamSize, strconv.FormatUint(searchReq.Size_, 10))
+	qb.addParam(urlParamStartPage, strconv.FormatUint(uint64(searchReq.StartPage), 10))
+	qb.addParam("encoding", "none") // todo: remove. encoding was removed b/c its unused but we still add it here to make rollouts seamless
+	qb.addParam(urlParamIndexPageSize, strconv.FormatUint(uint64(searchReq.IndexPageSize), 10))
+	qb.addParam(urlParamTotalRecords, strconv.FormatUint(uint64(searchReq.TotalRecords), 10))
+	qb.addParam(urlParamVersion, searchReq.Version)
+	qb.addParam(urlParamFooterSize, strconv.FormatUint(uint64(searchReq.FooterSize), 10))
+	if len(dedicatedColumnsJSON) > 0 && dedicatedColumnsJSON != "null" { // if a caller marshals a nil dedicated cols we will receive the string "null"
+		qb.addParam(urlParamDedicatedColumns, dedicatedColumnsJSON)
+	}
+
+	req.URL.RawQuery = qb.query()
+
+	return req, nil
+}
+
+func extractQueryParam(v url.Values, param string) (string, bool) {
+	value := v.Get(param)
+	return value, value != ""
+}
+
+func extractDateRangeParams(vals url.Values) (start, end, since string) {
+	start, _ = extractQueryParam(vals, urlParamStart)
+	end, _ = extractQueryParam(vals, urlParamEnd)
+	since, _ = extractQueryParam(vals, urlParamSince)
+	return
+}
+
+// ParseTraceDiffRequest parses and validates the trace diff API request body.
+func ParseTraceDiffRequest(r *http.Request) (*TraceDiffRequest, error) {
+	var req TraceDiffRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		return nil, fmt.Errorf("invalid trace diff request body: %w", err)
+	}
+
+	if req.Format == "" {
+		req.Format = tracediff.VersionTracePatchV0
+	}
+	switch req.Format {
+	case tracediff.VersionTraceSummaryV0Composed, tracediff.VersionTracePatchV0, tracediff.VersionTraceSummaryV0Native:
+	default:
+		return nil, fmt.Errorf("invalid format %q: must be one of %q, %q, %q",
+			req.Format, tracediff.VersionTraceSummaryV0Composed, tracediff.VersionTracePatchV0, tracediff.VersionTraceSummaryV0Native)
+	}
+
+	if err := parseTraceDiffTraceRequest("base", &req.Base); err != nil {
+		return nil, err
+	}
+	if err := parseTraceDiffTraceRequest("compare", &req.Compare); err != nil {
+		return nil, err
+	}
+
+	return &req, nil
+}
+
+func parseTraceDiffTraceRequest(name string, traceReq *TraceDiffTraceRequest) error {
+	if traceReq.TraceID == "" {
+		return fmt.Errorf("%s.traceId is required", name)
+	}
+
+	traceID, err := util.HexStringToTraceID(traceReq.TraceID)
+	if err != nil {
+		return fmt.Errorf("invalid %s.traceId: %w", name, err)
+	}
+	traceReq.TraceIDBytes = traceID
+
+	if traceReq.Start != nil {
+		traceReq.StartTime = time.Unix(*traceReq.Start, 0)
+	}
+	if traceReq.End != nil {
+		traceReq.EndTime = time.Unix(*traceReq.End, 0)
+	}
+	if traceReq.Start != nil && traceReq.End != nil && *traceReq.End <= *traceReq.Start {
+		return fmt.Errorf("%s.start must be before %s.end. received start=%d end=%d", name, name, *traceReq.Start, *traceReq.End)
+	}
+
+	return nil
+}
+
+// ParseTraceByIDRequest parses and validates params for the trace by id API.
+// return values are (blockStart, blockEnd, queryMode, start, end, error)
+// start and end are zero time.Time values when not provided by the caller.
+func ParseTraceByIDRequest(r *http.Request) (string, string, string, time.Time, time.Time, error) {
+	vals := r.URL.Query()
+
+	q, _ := extractQueryParam(vals, QueryModeKey)
+
+	// validate queryMode. it should either be empty or one of (QueryModeIngesters|QueryModeBlocks|QueryModeAll)
+	var queryMode string
+	var startTime time.Time
+	var endTime time.Time
+	var blockStart string
+	var blockEnd string
+
+	switch {
+	case len(q) == 0 || q == QueryModeAll:
+		queryMode = QueryModeAll
+	case q == QueryModeIngesters:
+		queryMode = QueryModeIngesters
+	case q == QueryModeBlocks:
+		queryMode = QueryModeBlocks
+	case q == QueryModeExternal:
+		queryMode = QueryModeExternal
+	default:
+		return "", "", "", time.Time{}, time.Time{}, fmt.Errorf("invalid value for mode %s", q)
+	}
+
+	// no need to validate/sanitize other parameters if queryMode == QueryModeIngesters
+	if queryMode == QueryModeIngesters {
+		return "", "", queryMode, time.Time{}, time.Time{}, nil
+	}
+
+	if start, ok := extractQueryParam(vals, BlockStartKey); ok {
+		_, err := uuid.Parse(start)
+		if err != nil {
+			return "", "", "", time.Time{}, time.Time{}, fmt.Errorf("invalid value for blockstart: %w", err)
+		}
+		blockStart = start
+	} else {
+		blockStart = tempodb.BlockIDMin
+	}
+
+	if end, ok := extractQueryParam(vals, BlockEndKey); ok {
+		_, err := uuid.Parse(end)
+		if err != nil {
+			return "", "", "", time.Time{}, time.Time{}, fmt.Errorf("invalid value for blockEnd: %w", err)
+		}
+		blockEnd = end
+	} else {
+		blockEnd = tempodb.BlockIDMax
+	}
+
+	if s, ok := extractQueryParam(vals, urlParamStart); ok {
+		startUnix, err := strconv.ParseInt(s, 10, 64)
+		if err != nil {
+			return "", "", "", time.Time{}, time.Time{}, fmt.Errorf("invalid start: %w", err)
+		}
+		startTime = time.Unix(startUnix, 0)
+	}
+
+	if s, ok := extractQueryParam(vals, urlParamEnd); ok {
+		endUnix, err := strconv.ParseInt(s, 10, 64)
+		if err != nil {
+			return "", "", "", time.Time{}, time.Time{}, fmt.Errorf("invalid end: %w", err)
+		}
+		endTime = time.Unix(endUnix, 0)
+	}
+
+	if !startTime.IsZero() && !endTime.IsZero() && !endTime.After(startTime) {
+		return "", "", "", time.Time{}, time.Time{}, fmt.Errorf("http parameter start must be before end. received start=%d end=%d", startTime.Unix(), endTime.Unix())
+	}
+
+	return blockStart, blockEnd, queryMode, startTime, endTime, nil
+}
+
+// TraceByIDFilterParams holds the parsed q spanset filter params for the trace by id v2 API.
+type TraceByIDFilterParams struct {
+	Query         string
+	KeepHierarchy bool
+	MatchDepth    int
+	AncestorDepth int
+}
+
+// ParseTraceByIDFilterParams parses the q spanset filter params for the trace by id v2 API.
+// keep_hierarchy, match_depth, and ancestor_depth are only parsed and validated when q is set:
+// they are documented as ignored without a query, so malformed values must not fail an
+// unfiltered request. When q is empty, the zero-value TraceByIDFilterParams is returned.
+//
+// ancestor_depth is narrower still: it is only read when keep_hierarchy is true, since that is the
+// only case where it changes the response. Otherwise it is left at its default and never validated,
+// so an out-of-range ancestor_depth cannot fail a request it would not have affected.
+//
+// match_depth and ancestor_depth have different defaults when absent from the request, both
+// chosen to preserve pre-existing behavior: an absent match_depth defaults to 0 (matched spans
+// only, no descendants), while an absent ancestor_depth defaults to -1 (unbounded ancestor walk).
+// When read, both accept -1 (unbounded) or any non-negative depth.
+func ParseTraceByIDFilterParams(r *http.Request) (TraceByIDFilterParams, error) {
+	vals := r.URL.Query()
+
+	// trim so a blank or whitespace-only q means no filter (full trace), matching the docs.
+	query := strings.TrimSpace(vals.Get(urlParamQuery))
+	if query == "" {
+		return TraceByIDFilterParams{}, nil
+	}
+
+	params := TraceByIDFilterParams{
+		Query:         query,
+		MatchDepth:    0,
+		AncestorDepth: -1,
+	}
+
+	if raw := vals.Get(urlParamKeepHierarchy); raw != "" {
+		keep, err := strconv.ParseBool(raw)
+		if err != nil {
+			return TraceByIDFilterParams{}, fmt.Errorf("invalid value for %s: %w", urlParamKeepHierarchy, err)
+		}
+		params.KeepHierarchy = keep
+	}
+
+	if raw := vals.Get(urlParamMatchDepth); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil {
+			return TraceByIDFilterParams{}, fmt.Errorf("invalid value for %s: %w", urlParamMatchDepth, err)
+		}
+		if n < -1 {
+			return TraceByIDFilterParams{}, fmt.Errorf("invalid value for %s: must be >= -1", urlParamMatchDepth)
+		}
+		params.MatchDepth = n
+	}
+
+	// ancestor_depth only bounds the keep_hierarchy ancestor walk, so without keep_hierarchy it is not
+	// read at all: a param with nothing to act on should not be able to fail a request that would
+	// otherwise succeed. Someone iterating on a trace can flip keep_hierarchy off without also having
+	// to strip the depth that goes with it.
+	if params.KeepHierarchy {
+		if raw := vals.Get(urlParamAncestorDepth); raw != "" {
+			n, err := strconv.Atoi(raw)
+			if err != nil {
+				return TraceByIDFilterParams{}, fmt.Errorf("invalid value for %s: %w", urlParamAncestorDepth, err)
+			}
+			if n < -1 {
+				return TraceByIDFilterParams{}, fmt.Errorf("invalid value for %s: must be >= -1", urlParamAncestorDepth)
+			}
+			params.AncestorDepth = n
+		}
+	}
+
+	return params, nil
+}
+
+func ReadBodyToBuffer(resp *http.Response) (*bytes.Buffer, error) {
+	length := resp.ContentLength
+	// if ContentLength is -1 if the length is unknown. default to bytes.MinRead (its what buffer.ReadFrom does)
+	if length < 0 {
+		length = bytes.MinRead
+	}
+	// buffer.ReadFrom always allocs at least bytes.MinRead past the end of the actual required length b/c of how io.EOF is handled. this prevents extending the internal
+	// slice unnecessarily.  https://github.com/golang/go/issues/21852
+	length += bytes.MinRead
+
+	// alloc a buffer to store the response body
+	buffer := bytes.NewBuffer(make([]byte, 0, length))
+	_, err := buffer.ReadFrom(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	return buffer, nil
+}
+
+// DefaultSpanPruningConfig returns the span pruning processor's default configuration.
+func DefaultSpanPruningConfig() *spanpruningprocessor.Config {
+	return spanpruningprocessor.NewFactory().CreateDefaultConfig().(*spanpruningprocessor.Config)
+}
+
+// ParseSpanPruningRequest parses span_pruning* query parameters into a *spanpruningprocessor.Config
+// and reports whether span pruning should be applied to the response.
+//
+// If enabledByDefault is true, span pruning is enabled when the request's own span_pruning param
+// is absent. An explicit span_pruning value in the request, true or false, always takes precedence.
+func ParseSpanPruningRequest(r *http.Request, enabledByDefault bool) (bool, *spanpruningprocessor.Config, error) {
+	raw := r.URL.Query().Get(urlParamSpanPruning)
+
+	spanPruningEnabled := enabledByDefault
+	if raw != "" {
+		var err error
+		spanPruningEnabled, err = strconv.ParseBool(raw)
+		if err != nil {
+			return false, nil, fmt.Errorf("invalid %s value %q: must be a boolean", urlParamSpanPruning, raw)
+		}
+	}
+
+	if !spanPruningEnabled {
+		return false, nil, nil
+	}
+
+	cfg := DefaultSpanPruningConfig()
+
+	if v := r.URL.Query().Get(urlParamSpanPruningGroupBy); v != "" {
+		var patterns []string
+		for _, p := range strings.Split(v, ",") {
+			if p = strings.TrimSpace(p); p != "" {
+				patterns = append(patterns, p)
+			}
+		}
+		cfg.GroupByAttributes = patterns
+	}
+	if v := r.URL.Query().Get(urlParamSpanPruningMinSpans); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return false, nil, fmt.Errorf("invalid %s value %q: %w", urlParamSpanPruningMinSpans, v, err)
+		}
+		cfg.MinSpansToAggregate = n
+	}
+	if v := r.URL.Query().Get(urlParamSpanPruningMaxParentDepth); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return false, nil, fmt.Errorf("invalid %s value %q: %w", urlParamSpanPruningMaxParentDepth, v, err)
+		}
+		cfg.MaxParentDepth = n
+	}
+
+	if err := cfg.Validate(); err != nil {
+		return false, nil, fmt.Errorf("invalid span pruning config: %w", err)
+	}
+
+	return true, cfg, nil
+}

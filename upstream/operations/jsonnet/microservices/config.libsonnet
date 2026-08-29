@@ -1,0 +1,203 @@
+{
+  _images+:: {
+    tempo: 'grafana/tempo:3.0.0',
+    tempo_query: 'grafana/tempo-query:3.0.0',
+    tempo_vulture: 'grafana/tempo-vulture:3.0.0',
+    memcached: 'memcached:1.6.45-alpine@sha256:c29847751abb41f4c268c84fb3087fee05d4edcbda44409ccb5086e26148e8a7',
+    memcachedExporter: 'prom/memcached-exporter:v0.16.0@sha256:fa03aba2f2aa6f572bf56ba07dd2960c62433805427be0fddc8b21b8074c1728',
+
+    tempo_distributor: self.tempo,
+    tempo_querier: self.tempo,
+    tempo_query_frontend: self.tempo,
+    tempo_metrics_generator: self.tempo,
+    tempo_block_builder: self.tempo,
+    tempo_live_store: self.tempo,
+    tempo_backend_scheduler: self.tempo,
+    tempo_backend_worker: self.tempo,
+  },
+
+  _config+:: {
+    gossip_member_label: 'tempo-gossip-member',
+    // Labels that service selectors should not use
+    service_ignored_labels:: [self.gossip_member_label],
+
+    variables_expansion: false,
+    variables_expansion_env_mixin: null,
+    node_selector: null,
+
+    // Enable concurrent rollout of block-builder through the usage of the rollout operator.
+    // This feature modifies the block-builder StatefulSet which cannot be altered, so if it already exists it has to be deleted and re-applied again in order to be enabled.
+    block_builder_concurrent_rollout_enabled: false,
+    // Maximum number of unavailable replicas during a block-builder rollout when using block_builder_concurrent_rollout_enabled feature.
+    // Defaults to 100% since block-builder pods are independent (each owns distinct Kafka partitions).
+    block_builder_max_unavailable: '100%',
+
+    // disable tempo-query by default
+    tempo_query: {
+      enabled: false,
+    },
+    query_frontend: {
+      replicas: 1,
+      resources: {
+        requests: {
+          cpu: '500m',
+          memory: '1Gi',
+        },
+        limits: {
+          cpu: '1',
+          memory: '2Gi',
+        },
+      },
+    },
+    querier: {
+      replicas: 2,
+      resources: {
+        requests: {
+          cpu: '500m',
+          memory: '1Gi',
+        },
+        limits: {
+          cpu: '1',
+          memory: '2Gi',
+        },
+      },
+    },
+    distributor: {
+      receivers: error 'Must specify receivers',
+      replicas: 1,
+      resources: {
+        requests: {
+          cpu: '3',
+          memory: '3Gi',
+        },
+        limits: {
+          cpu: '5',
+          memory: '5Gi',
+        },
+      },
+    },
+    metrics_generator: {
+      pvc_size: error 'Must specify a metrics-generator pvc size',
+      pvc_storage_class: error 'Must specify a metrics-generator pvc storage class',
+      ephemeral_storage_request_size: error 'Must specify a generator ephemeral_storage_request size',
+      ephemeral_storage_limit_size: error 'Must specify a metrics generator ephemeral_storage_limit size',
+      replicas: 0,
+      // deployment_max_unavailable: max unavailable during rolling update (default 1).
+      // Accepts an integer or a percentage string, e.g. deployment_max_unavailable: '25%'.
+      // Rolling (1): 2 rebalances per pod. All-at-once (replicas): fewer total rebalances;
+      // first new pod briefly holds all partitions until others rejoin.
+      deployment_max_unavailable: 1,
+      resources: {
+        requests: {
+          cpu: '500m',
+          memory: '1Gi',
+        },
+        limits: {
+          cpu: '1',
+          memory: '2Gi',
+        },
+      },
+    },
+    block_builder: {
+      replicas: 0,
+      data_volume_size: '5Gi',
+      resources: {
+        requests: {
+          cpu: '500m',
+          memory: '1Gi',
+        },
+        limits: {
+          cpu: '1',
+          memory: '2Gi',
+        },
+      },
+    },
+    live_store: {
+      pvc_size: error 'Must specify a live-store pvc size',
+      pvc_storage_class: error 'Must specify a live-store pvc storage class',
+      replicas: 0,
+      max_unavailable: 25,
+      downscale_delay: '35m',
+      allow_multiple_replicas_on_same_node: false,
+      resources: {
+        requests: {
+          cpu: '500m',
+          memory: '1Gi',
+        },
+        limits: {
+          cpu: '1',
+          memory: '2Gi',
+        },
+      },
+    },
+    backend_scheduler: {
+      replicas: 1,  // Only ever 1 backend-scheduler
+      pvc_size: error 'Must specify a backend_scheduler pvc size',
+      pvc_storage_class: error 'Must specify a backend_scheduler pvc storage class',
+      resources: {
+        requests: {
+          cpu: '500m',
+          memory: '1Gi',
+        },
+        limits: {
+          cpu: '1',
+          memory: '2Gi',
+        },
+      },
+    },
+    backend_worker: {
+      replicas: 1,
+      resources: {
+        requests: {
+          cpu: '500m',
+          memory: '1Gi',
+        },
+        limits: {
+          cpu: '1',
+          memory: '2Gi',
+        },
+      },
+    },
+    memcached: {
+      replicas: 3,
+      connection_limit: 4096,
+      memory_limit_mb: 1024,
+    },
+    jaeger_ui: {
+      base_path: '/',
+    },
+    vulture: {
+      replicas: 0,
+      tempoPushUrl: 'http://distributor',
+      tempoQueryUrl: 'http://query-frontend:%s' % $._config.port,
+      tempoOrgId: '',
+      tempoRetentionDuration: '336h',
+      tempoSearchBackoffDuration: '5s',
+      tempoReadBackoffDuration: '10s',
+      tempoWriteBackoffDuration: '10s',
+      tempoMetricsBackoffDuration: '0s',  // TraceQL Metrics checks disabled
+      tempoLongWriteBackoffDuration: '50s',
+    },
+    port: 3200,
+    http_api_prefix: '',
+    gossip_ring_port: 7946,
+    backend: error 'Must specify a backend',  // gcs|s3
+    bucket: error 'Must specify a bucket',
+    kafka_address: error 'Must specify a kafka address',
+    kafka_topic: error 'Must specify a kafka topic',
+
+    overrides_configmap_name: 'tempo-overrides',
+    overrides+:: {
+      super_user: {
+        ingestion: {
+          max_traces_per_user: 100000,
+          rate_limit_bytes: 200e5,  // ~20MB per sec
+          burst_size_bytes: 200e5,  // ~20MB
+        },
+        global: {
+          max_bytes_per_trace: 300e5,  // ~30MB
+        },
+      },
+    },
+  },
+}

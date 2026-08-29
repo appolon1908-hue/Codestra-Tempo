@@ -1,0 +1,341 @@
+package combiner
+
+import (
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/gogo/protobuf/jsonpb"
+	"github.com/gogo/protobuf/proto"
+	"github.com/gogo/status"
+	"github.com/grafana/tempo/pkg/api"
+	"github.com/grafana/tempo/pkg/tempopb"
+	"github.com/grafana/tempo/pkg/util"
+	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/codes"
+)
+
+func TestErroredResponse(t *testing.T) {
+	tests := []struct {
+		name       string
+		statusCode int
+		respBody   string
+
+		expectedResp *http.Response
+		expectedErr  error
+	}{
+		{
+			name:       "no error",
+			statusCode: http.StatusOK,
+			respBody:   "woooo!",
+		},
+		{
+			name:       "5xx",
+			statusCode: http.StatusInternalServerError,
+			respBody:   "foo",
+
+			expectedResp: &http.Response{
+				StatusCode: http.StatusInternalServerError,
+				Status:     "Internal Server Error",
+				Body:       io.NopCloser(strings.NewReader("foo")),
+			},
+			expectedErr: status.Error(codes.Internal, "foo"),
+		},
+		{
+			name:       "4xx",
+			statusCode: http.StatusBadRequest,
+			respBody:   "foo",
+
+			expectedResp: &http.Response{
+				StatusCode: http.StatusBadRequest,
+				Status:     "Bad Request",
+				Body:       io.NopCloser(strings.NewReader("foo")),
+			},
+			expectedErr: status.Error(codes.InvalidArgument, "foo"),
+		},
+		{
+			name:       "499",
+			statusCode: util.StatusClientClosedRequest,
+			respBody:   "foo",
+			expectedResp: &http.Response{
+				StatusCode: util.StatusClientClosedRequest,
+				Status:     util.StatusTextClientClosedRequest,
+				Body:       io.NopCloser(strings.NewReader("foo")),
+			},
+			expectedErr: status.Error(codes.Canceled, "foo"),
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			combiner := &genericCombiner[*tempopb.SearchResponse]{
+				httpStatusCode: tc.statusCode,
+				httpRespBody:   tc.respBody,
+			}
+
+			resp, err := combiner.erroredResponse()
+			require.Equal(t, tc.expectedErr, err)
+
+			if tc.expectedResp == nil {
+				require.Nil(t, resp)
+				return
+			}
+
+			// validate the body
+			require.Equal(t, tc.expectedResp.Status, resp.Status)
+			require.Equal(t, tc.expectedResp.StatusCode, resp.StatusCode)
+
+			expectedBody, err := io.ReadAll(tc.expectedResp.Body)
+			require.NoError(t, err)
+			actualBody, err := io.ReadAll(resp.Body)
+			require.NoError(t, err)
+			require.Equal(t, expectedBody, actualBody)
+		})
+	}
+}
+
+func TestInitHttpCombiner(t *testing.T) {
+	combiner := newTestCombiner()
+
+	require.Equal(t, 200, combiner.httpStatusCode)
+	require.Equal(t, api.MarshallingFormatJSON, combiner.httpMarshalingFormat)
+}
+
+func TestGenericCombiner(t *testing.T) {
+	combiner := newTestCombiner()
+
+	wg := sync.WaitGroup{}
+
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 10000; j++ {
+
+				err := combiner.AddResponse(newTestResponse(t))
+				require.NoError(t, err)
+			}
+		}()
+	}
+
+	wg.Wait()
+	actual, err := combiner.finalize(nil)
+	require.NoError(t, err)
+
+	expected := 10 * 10000
+	require.Equal(t, expected, int(actual.SpanCount))
+	require.Equal(t, expected, int(actual.ErrorCount))
+}
+
+func TestGenericCombinerHoldsErrors(t *testing.T) {
+	// slam a combiner with successful responses and just one error. confirm that the error is returned
+	combiner := newTestCombiner()
+	wg := sync.WaitGroup{}
+
+	for j := 0; j < 10; j++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			for i := 0; i < 10000; i++ {
+				err := combiner.AddResponse(newTestResponse(t))
+				require.NoError(t, err)
+			}
+		}()
+	}
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		time.Sleep(time.Millisecond)
+		err := combiner.AddResponse(newFailedTestResponse())
+		require.NoError(t, err)
+	}()
+
+	wg.Wait()
+	resp, err := combiner.HTTPFinal()
+	require.NoError(t, err)
+	require.Equal(t, http.StatusInternalServerError, resp.StatusCode)
+}
+
+func TestGenericCombinerDoesntRace(t *testing.T) {
+	combiner := newTestCombiner()
+	end := make(chan struct{})
+	wg := sync.WaitGroup{}
+
+	concurrent := func(f func()) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-end:
+					return
+				default:
+					f()
+				}
+			}
+		}()
+	}
+	concurrent(func() {
+		_ = combiner.AddResponse(newTestResponse(t))
+	})
+
+	concurrent(func() {
+		// this test is going to add a failed response which cuts off certain code paths. just wait a bit to test the other paths
+		time.Sleep(10 * time.Millisecond)
+		_ = combiner.AddResponse(newFailedTestResponse())
+	})
+
+	concurrent(func() {
+		combiner.ShouldQuit()
+	})
+
+	concurrent(func() {
+		combiner.StatusCode()
+	})
+
+	concurrent(func() {
+		_, _ = combiner.HTTPFinal()
+	})
+
+	concurrent(func() {
+		_, _ = combiner.GRPCFinal()
+	})
+
+	concurrent(func() {
+		_, _ = combiner.GRPCDiff()
+	})
+
+	close(end)
+	wg.Wait()
+}
+
+type testPipelineResponse struct {
+	r            *http.Response
+	responseData any
+}
+
+func newTestResponse(t *testing.T) *testPipelineResponse {
+	serviceStats := &tempopb.ServiceStats{
+		SpanCount:  1,
+		ErrorCount: 1,
+	}
+
+	rec := httptest.NewRecorder()
+	err := (&jsonpb.Marshaler{}).Marshal(rec, serviceStats)
+	require.NoError(t, err)
+
+	return &testPipelineResponse{
+		r: rec.Result(),
+	}
+}
+
+func newFailedTestResponse() *testPipelineResponse {
+	rec := httptest.NewRecorder()
+	rec.WriteHeader(http.StatusInternalServerError)
+	_, _ = rec.Write([]byte("foo"))
+	return &testPipelineResponse{
+		r: rec.Result(),
+	}
+}
+
+func (p *testPipelineResponse) HTTPResponse() *http.Response {
+	return p.r
+}
+
+func (p *testPipelineResponse) RequestData() any {
+	return p.responseData
+}
+
+func (p *testPipelineResponse) IsMetadata() bool {
+	return false
+}
+
+func newTestCombiner() *genericCombiner[*tempopb.ServiceStats] {
+	count := 0
+
+	gc := &genericCombiner[*tempopb.ServiceStats]{
+		new:     func() *tempopb.ServiceStats { return &tempopb.ServiceStats{} },
+		current: nil,
+		combine: func(_, _ *tempopb.ServiceStats, _ PipelineResponse) error {
+			count++
+			return nil
+		},
+		finalize: func(_ *tempopb.ServiceStats) (*tempopb.ServiceStats, error) {
+			return &tempopb.ServiceStats{
+				SpanCount:  uint32(count),
+				ErrorCount: uint32(count),
+			}, nil
+		},
+		quit: func(_ *tempopb.ServiceStats) bool {
+			return false
+		},
+		diff: func(_ *tempopb.ServiceStats) (*tempopb.ServiceStats, error) {
+			return &tempopb.ServiceStats{
+				SpanCount:  uint32(count),
+				ErrorCount: uint32(count),
+			}, nil
+		},
+	}
+	initHTTPCombiner(gc, api.MarshallingFormatJSON)
+	return gc
+}
+
+// Helper functions for creating test responses with different marshaling formats
+func toHTTPResponseWithFormat(t *testing.T, pb proto.Message, statusCode int, responseData any, format api.MarshallingFormat) PipelineResponse {
+	var body []byte
+	var err error
+
+	if pb != nil {
+		if format == api.MarshallingFormatProtobuf {
+			body, err = proto.Marshal(pb)
+			require.NoError(t, err)
+		} else {
+			m := jsonpb.Marshaler{}
+			bodyStr, marshalErr := m.MarshalToString(pb)
+			require.NoError(t, marshalErr)
+			body = []byte(bodyStr)
+		}
+	}
+
+	return &testPipelineResponse{
+		responseData: responseData,
+		r: &http.Response{
+			Body:       io.NopCloser(strings.NewReader(string(body))),
+			StatusCode: statusCode,
+			Header: http.Header{
+				api.HeaderContentType: {string(format)},
+			},
+		},
+	}
+}
+
+func toHTTPResponse(t *testing.T, pb proto.Message, statusCode int) PipelineResponse {
+	return toHTTPResponseWithFormat(t, pb, statusCode, nil, api.HeaderAcceptJSON)
+}
+
+func fromHTTPResponse(t *testing.T, r *http.Response, pb proto.Message) {
+	contentType := r.Header.Get(api.HeaderContentType)
+	if contentType == api.HeaderAcceptProtobuf {
+		body, err := io.ReadAll(r.Body)
+		require.NoError(t, err)
+		err = proto.Unmarshal(body, pb)
+		require.NoError(t, err)
+	} else {
+		err := jsonpb.Unmarshal(r.Body, pb)
+		require.NoError(t, err)
+	}
+}
+
+func requireProtoSegmentsFit[T proto.Message](t *testing.T, segments []T, maxSize int) {
+	t.Helper()
+
+	for i, segment := range segments {
+		require.LessOrEqualf(t, proto.Size(segment), maxSize, "segment %d exceeds max size", i)
+	}
+}

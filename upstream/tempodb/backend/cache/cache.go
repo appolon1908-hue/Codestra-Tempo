@@ -1,0 +1,309 @@
+package cache
+
+import (
+	"bytes"
+	"context"
+	"io"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
+	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+
+	"github.com/grafana/tempo/pkg/cache"
+
+	tempo_io "github.com/grafana/tempo/pkg/io"
+	"github.com/grafana/tempo/tempodb/backend"
+)
+
+// metricsNamespace is the Prometheus namespace shared by this package's metrics.
+const metricsNamespace = "tempodb"
+
+// cacheStoreSizeBytes records the byte size of every item written to a tempodb backend cache, labelled by role.
+var cacheStoreSizeBytes = promauto.NewHistogramVec(prometheus.HistogramOpts{
+	Namespace:                       metricsNamespace,
+	Name:                            "cache_store_size_bytes",
+	Help:                            "Distribution of item sizes written to tempodb backend caches, by role.",
+	Buckets:                         prometheus.ExponentialBuckets(512, 2, 15), // 512 B, 1 KiB, ..., 8 MiB
+	NativeHistogramBucketFactor:     1.1,
+	NativeHistogramMaxBucketNumber:  100,
+	NativeHistogramMinResetDuration: 1 * time.Hour,
+}, []string{"role"})
+
+// cacheRequests counts cache lookups by role and outcome (hit / miss).
+var cacheRequests = promauto.NewCounterVec(prometheus.CounterOpts{
+	Namespace: metricsNamespace,
+	Name:      "cache_requests_total",
+	Help:      "Cache lookup outcome by role.",
+}, []string{"role", "outcome"})
+
+// cacheRequestBytes counts bytes served on hit and bytes fetched from backend on miss, by role.
+var cacheRequestBytes = promauto.NewCounterVec(prometheus.CounterOpts{
+	Namespace: metricsNamespace,
+	Name:      "cache_request_bytes_total",
+	Help:      "Bytes served by cache (hit) or fetched on miss, by role.",
+}, []string{"role", "outcome"})
+
+const (
+	cacheOutcomeHit  = "hit"
+	cacheOutcomeMiss = "miss"
+)
+
+type BloomConfig struct {
+	CacheMinCompactionLevel uint8         `yaml:"cache_min_compaction_level"`
+	CacheMaxBlockAge        time.Duration `yaml:"cache_max_block_age"`
+}
+
+type readerWriter struct {
+	cfgBloom *BloomConfig
+
+	nextReader backend.RawReader
+	nextWriter backend.RawWriter
+
+	footerCache     cache.Cache
+	bloomCache      cache.Cache
+	columnIdxCache  cache.Cache
+	offsetIdxCache  cache.Cache
+	traceIDIdxCache cache.Cache
+	pageCache       cache.Cache
+}
+
+func NewCache(cfgBloom *BloomConfig, nextReader backend.RawReader, nextWriter backend.RawWriter, cacheProvider cache.Provider, logger log.Logger) (backend.RawReader, backend.RawWriter, error) {
+	rw := &readerWriter{
+		cfgBloom: cfgBloom,
+
+		footerCache:     cacheProvider.CacheFor(cache.RoleParquetFooter),
+		bloomCache:      cacheProvider.CacheFor(cache.RoleBloom),
+		offsetIdxCache:  cacheProvider.CacheFor(cache.RoleParquetOffsetIdx),
+		columnIdxCache:  cacheProvider.CacheFor(cache.RoleParquetColumnIdx),
+		traceIDIdxCache: cacheProvider.CacheFor(cache.RoleTraceIDIdx),
+		pageCache:       cacheProvider.CacheFor(cache.RoleParquetPage),
+
+		nextReader: nextReader,
+		nextWriter: nextWriter,
+	}
+
+	level.Info(logger).Log(
+		"msg", "caches available to storage backend",
+		cache.RoleParquetFooter, rw.footerCache != nil,
+		cache.RoleBloom, rw.bloomCache != nil,
+		cache.RoleParquetOffsetIdx, rw.offsetIdxCache != nil,
+		cache.RoleParquetColumnIdx, rw.columnIdxCache != nil,
+		cache.RoleTraceIDIdx, rw.traceIDIdxCache != nil,
+		cache.RoleParquetPage, rw.pageCache != nil,
+	)
+
+	return rw, rw, nil
+}
+
+// List implements backend.RawReader
+func (r *readerWriter) List(ctx context.Context, keypath backend.KeyPath) ([]string, error) {
+	return r.nextReader.List(ctx, keypath)
+}
+
+func (r *readerWriter) ListBlocks(ctx context.Context, tenant string) (blockIDs []uuid.UUID, compactedBlockIDs []uuid.UUID, err error) {
+	return r.nextReader.ListBlocks(ctx, tenant)
+}
+
+// Find implements backend.Reader
+func (r *readerWriter) Find(ctx context.Context, keypath backend.KeyPath, f backend.FindFunc) (err error) {
+	return r.nextReader.Find(ctx, keypath, f)
+}
+
+// Read implements backend.RawReader
+func (r *readerWriter) Read(ctx context.Context, name string, keypath backend.KeyPath, cacheInfo *backend.CacheInfo) (io.ReadCloser, int64, error) {
+	var k string
+	var role string
+	cache := r.cacheFor(cacheInfo)
+	if cache != nil {
+		role = string(cacheInfo.Role)
+		k = key(keypath, name)
+		b, found := cache.FetchKey(ctx, k)
+		if found {
+			cacheRequests.WithLabelValues(role, cacheOutcomeHit).Inc()
+			cacheRequestBytes.WithLabelValues(role, cacheOutcomeHit).Add(float64(len(b)))
+			return &cacheReadCloser{Reader: bytes.NewReader(b), buf: b, cache: cache}, int64(len(b)), nil
+		}
+		cacheRequests.WithLabelValues(role, cacheOutcomeMiss).Inc()
+	}
+
+	// previous implemenation always passed false forward for "shouldCache" so we are matching that behavior by passing nil for cacheInfo
+	// todo: reevaluate. should we pass the cacheInfo forward?
+	object, size, err := r.nextReader.Read(ctx, name, keypath, nil)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer object.Close()
+
+	b, err := tempo_io.ReadAllWithEstimate(object, size)
+	if err == nil && cache != nil {
+		cacheRequestBytes.WithLabelValues(role, cacheOutcomeMiss).Add(float64(len(b)))
+		store(ctx, cache, cacheInfo.Role, k, b)
+	}
+
+	return io.NopCloser(bytes.NewReader(b)), size, err
+}
+
+// ReadRange implements backend.RawReader
+func (r *readerWriter) ReadRange(ctx context.Context, name string, keypath backend.KeyPath, offset uint64, buffer []byte, cacheInfo *backend.CacheInfo) error {
+	var k string
+	var role string
+	cache := r.cacheFor(cacheInfo)
+	if cache != nil {
+		role = string(cacheInfo.Role)
+		k = strings.Join(append(keypath, name, strconv.Itoa(int(offset)), strconv.Itoa(len(buffer))), ":")
+		b, found := cache.FetchKey(ctx, k)
+		if found {
+			cacheRequests.WithLabelValues(role, cacheOutcomeHit).Inc()
+			cacheRequestBytes.WithLabelValues(role, cacheOutcomeHit).Add(float64(len(b)))
+			copy(buffer, b)
+			cache.Release(b)
+			return nil
+		}
+		cacheRequests.WithLabelValues(role, cacheOutcomeMiss).Inc()
+	}
+
+	// previous implemenation always passed false forward for "shouldCache" so we are matching that behavior by passing nil for cacheInfo
+	// todo: reevaluate. should we pass the cacheInfo forward?
+	err := r.nextReader.ReadRange(ctx, name, keypath, offset, buffer, nil)
+	if err == nil && cache != nil {
+		cacheRequestBytes.WithLabelValues(role, cacheOutcomeMiss).Add(float64(len(buffer)))
+		store(ctx, cache, cacheInfo.Role, k, buffer)
+	}
+
+	return err
+}
+
+// Shutdown implements backend.RawReader
+func (r *readerWriter) Shutdown() {
+	r.nextReader.Shutdown()
+}
+
+// Write implements backend.Writer
+func (r *readerWriter) Write(ctx context.Context, name string, keypath backend.KeyPath, data io.Reader, size int64, cacheInfo *backend.CacheInfo) error {
+	b, err := tempo_io.ReadAllWithEstimate(data, size)
+	if err != nil {
+		return err
+	}
+
+	if cache := r.cacheFor(cacheInfo); cache != nil {
+		cacheStoreSizeBytes.WithLabelValues(string(cacheInfo.Role)).Observe(float64(len(b)))
+		cache.Store(ctx, []string{key(keypath, name)}, [][]byte{b})
+	}
+
+	// previous implemenation always passed false forward for "shouldCache" so we are matching that behavior by passing nil for cacheInfo
+	// todo: reevaluate. should we pass the cacheInfo forward?
+	return r.nextWriter.Write(ctx, name, keypath, bytes.NewReader(b), int64(len(b)), nil)
+}
+
+// Append implements backend.Writer
+func (r *readerWriter) Append(ctx context.Context, name string, keypath backend.KeyPath, tracker backend.AppendTracker, buffer []byte) (backend.AppendTracker, error) {
+	return r.nextWriter.Append(ctx, name, keypath, tracker, buffer)
+}
+
+// CloseAppend implements backend.Writer
+func (r *readerWriter) CloseAppend(ctx context.Context, tracker backend.AppendTracker) error {
+	return r.nextWriter.CloseAppend(ctx, tracker)
+}
+
+func (r *readerWriter) Delete(ctx context.Context, name string, keypath backend.KeyPath, cacheInfo *backend.CacheInfo) error {
+	if c := r.cacheFor(cacheInfo); c != nil {
+		c.Remove(ctx, []string{key(keypath, name)})
+	}
+	return r.nextWriter.Delete(ctx, name, keypath, nil)
+}
+
+func key(keypath backend.KeyPath, name string) string {
+	return strings.Join(keypath, ":") + ":" + name
+}
+
+// BlockKeyPrefix returns the cache key prefix shared by bloom-filter shards and the
+// trace-id-index for a block. Whole-object cache keys are BlockKeyPrefix + name.
+// Note: ReadRange keys also embed ":offset:length" suffixes and cannot be derived from this prefix.
+func BlockKeyPrefix(blockID uuid.UUID, tenantID string) string {
+	return key(backend.KeyPathForBlock(blockID, tenantID), "")
+}
+
+// cacheFor evaluates the cacheInfo and returns the appropriate cache.
+func (r *readerWriter) cacheFor(cacheInfo *backend.CacheInfo) cache.Cache {
+	if cacheInfo == nil {
+		return nil
+	}
+
+	switch cacheInfo.Role {
+	case cache.RoleParquetFooter:
+		return r.footerCache
+	case cache.RoleParquetColumnIdx:
+		return r.columnIdxCache
+	case cache.RoleParquetOffsetIdx:
+		return r.offsetIdxCache
+	case cache.RoleParquetPage:
+		return r.pageCache
+	case cache.RoleTraceIDIdx:
+		return r.traceIDIdxCache
+	case cache.RoleBloom:
+		// if there is no bloom cfg then there are no restrictions on bloom filter caching
+		if r.cfgBloom == nil {
+			return r.bloomCache
+		}
+
+		if cacheInfo.Meta == nil {
+			return nil
+		}
+
+		// compaction level is _atleast_ CacheMinCompactionLevel
+		if r.cfgBloom.CacheMinCompactionLevel > 0 && cacheInfo.Meta.CompactionLevel > uint32(r.cfgBloom.CacheMinCompactionLevel) {
+			return nil
+		}
+
+		curTime := time.Now()
+		// block is not older than CacheMaxBlockAge
+		if r.cfgBloom.CacheMaxBlockAge > 0 && curTime.Sub(cacheInfo.Meta.StartTime) > r.cfgBloom.CacheMaxBlockAge {
+			return nil
+		}
+
+		return r.bloomCache
+	}
+
+	return nil
+}
+
+func store(ctx context.Context, cache cache.Cache, role cache.Role, key string, val []byte) {
+	cacheStoreSizeBytes.WithLabelValues(string(role)).Observe(float64(len(val)))
+
+	write := val
+	if needsCopy(role) {
+		write = make([]byte, len(val))
+		copy(write, val)
+	}
+
+	cache.Store(ctx, []string{key}, [][]byte{write})
+}
+
+// needsCopy returns true if the role should be copied into a new buffer before being written to the cache
+// todo: should this be signalled through cacheinfo instead?
+func needsCopy(role cache.Role) bool {
+	return role == cache.RoleParquetPage // parquet pages are reused by the library. if we don't copy them then the buffer may be reused before written to cache
+}
+
+// cacheReadCloser releases the underlying buffer back to the cache on Close
+// so pooled allocators (e.g. memcached) can reuse it on the next cache hit.
+type cacheReadCloser struct {
+	*bytes.Reader
+	buf    []byte
+	cache  cache.Cache
+	closed bool
+}
+
+func (c *cacheReadCloser) Close() error {
+	if c.closed {
+		return nil
+	}
+	c.closed = true
+	c.cache.Release(c.buf)
+	return nil
+}

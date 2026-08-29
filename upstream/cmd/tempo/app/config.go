@@ -1,0 +1,355 @@
+package app
+
+import (
+	"flag"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/grafana/dskit/flagext"
+	"github.com/grafana/dskit/kv/memberlist"
+	"github.com/grafana/dskit/server"
+	"github.com/grafana/tempo/modules/backendscheduler"
+	backendscheduler_client "github.com/grafana/tempo/modules/backendscheduler/client"
+	"github.com/grafana/tempo/modules/backendworker"
+	"github.com/grafana/tempo/modules/blockbuilder"
+	"github.com/grafana/tempo/modules/cache"
+	"github.com/grafana/tempo/modules/distributor"
+	"github.com/grafana/tempo/modules/frontend"
+	"github.com/grafana/tempo/modules/generator"
+	"github.com/grafana/tempo/modules/livestore"
+	livestore_client "github.com/grafana/tempo/modules/livestore/client"
+	"github.com/grafana/tempo/modules/overrides"
+	"github.com/grafana/tempo/modules/querier"
+	"github.com/grafana/tempo/modules/storage"
+	"github.com/grafana/tempo/pkg/ingest"
+	internalserver "github.com/grafana/tempo/pkg/server"
+	"github.com/grafana/tempo/pkg/traceql"
+	"github.com/grafana/tempo/pkg/usagestats"
+	"github.com/grafana/tempo/pkg/util"
+	"github.com/grafana/tempo/tempodb"
+	"github.com/grafana/tempo/tempodb/backend"
+)
+
+const defaultGRPCCompression = "snappy"
+
+// MemoryConfig configures memory management settings
+type MemoryConfig struct {
+	AutoMemLimitEnabled bool    `yaml:"automemlimit_enabled"`
+	AutoMemLimitRatio   float64 `yaml:"automemlimit_ratio"`
+}
+
+// Config is the root config for App.
+type Config struct {
+	Target                 string        `yaml:"target,omitempty"`
+	AuthEnabled            bool          `yaml:"auth_enabled,omitempty"`
+	MultitenancyEnabled    bool          `yaml:"multitenancy_enabled,omitempty"`
+	ShutdownDelay          time.Duration `yaml:"shutdown_delay,omitempty"`
+	StreamOverHTTPEnabled  bool          `yaml:"stream_over_http_enabled,omitempty"`
+	HTTPAPIPrefix          string        `yaml:"http_api_prefix"`
+	EnableGoRuntimeMetrics bool          `yaml:"enable_go_runtime_metrics,omitempty"`
+	SpanProfiling          bool          `yaml:"span_profiling,omitempty"`
+
+	Memory                 MemoryConfig                   `yaml:"memory,omitempty"`
+	Server                 server.Config                  `yaml:"server,omitempty"`
+	InternalServer         internalserver.Config          `yaml:"internal_server,omitempty"`
+	Distributor            distributor.Config             `yaml:"distributor,omitempty"`
+	MetricsGeneratorClient map[string]any                 `yaml:"metrics_generator_client,omitempty"` // Deprecated: kept for one-release config compatibility.
+	LiveStoreClient        livestore_client.Config        `yaml:"live_store_client,omitempty"`
+	Querier                querier.Config                 `yaml:"querier,omitempty"`
+	Frontend               frontend.Config                `yaml:"query_frontend,omitempty"`
+	Generator              generator.Config               `yaml:"metrics_generator,omitempty"`
+	Ingest                 ingest.Config                  `yaml:"ingest,omitempty"`
+	BlockBuilder           blockbuilder.Config            `yaml:"block_builder,omitempty"`
+	StorageConfig          storage.Config                 `yaml:"storage,omitempty"`
+	Overrides              overrides.Config               `yaml:"overrides,omitempty"`
+	MemberlistKV           memberlist.KVConfig            `yaml:"memberlist,omitempty"`
+	UsageReport            usagestats.Config              `yaml:"usage_report,omitempty"`
+	CacheProvider          cache.Config                   `yaml:"cache,omitempty"`
+	BackendScheduler       backendscheduler.Config        `yaml:"backend_scheduler,omitempty"`
+	BackenSchedulerClient  backendscheduler_client.Config `yaml:"backend_scheduler_client,omitempty"`
+	BackendWorker          backendworker.Config           `yaml:"backend_worker,omitempty"`
+	LiveStore              livestore.Config               `yaml:"live_store,omitempty"`
+}
+
+func NewDefaultConfig() *Config {
+	defaultConfig := &Config{}
+	defaultFS := flag.NewFlagSet("", flag.PanicOnError)
+	defaultConfig.RegisterFlagsAndApplyDefaults("", defaultFS)
+	return defaultConfig
+}
+
+// RegisterFlagsAndApplyDefaults registers flag.
+func (c *Config) RegisterFlagsAndApplyDefaults(prefix string, f *flag.FlagSet) {
+	c.Target = SingleBinary
+	c.StreamOverHTTPEnabled = false
+
+	// Memory settings
+	c.Memory = MemoryConfig{
+		AutoMemLimitEnabled: false,
+		AutoMemLimitRatio:   0.8,
+	}
+
+	// global settings
+	f.StringVar(&c.Target, "target", SingleBinary, "target module")
+	f.BoolVar(&c.AuthEnabled, "auth.enabled", false, "Set to true to enable auth (deprecated: use multitenancy.enabled)")
+	f.BoolVar(&c.MultitenancyEnabled, "multitenancy.enabled", false, "Set to true to enable multitenancy.")
+	f.StringVar(&c.HTTPAPIPrefix, "http-api-prefix", "", "String prefix for all http api endpoints.")
+	f.BoolVar(&c.EnableGoRuntimeMetrics, "enable-go-runtime-metrics", false, "Set to true to enable all Go runtime metrics")
+	f.DurationVar(&c.ShutdownDelay, "shutdown-delay", 0, "How long to wait between SIGTERM and shutdown. After receiving SIGTERM, Tempo will report not-ready status via /ready endpoint.")
+	f.BoolVar(&c.SpanProfiling, "span-profiling", false, "Set to true to enable span profiling (pyroscope pprof labels on OTel spans).")
+
+	// Server settings
+	flagext.DefaultValues(&c.Server)
+	c.Server.LogLevel.RegisterFlags(f)
+
+	// Internal server settings
+	flagext.DefaultValues(&c.InternalServer)
+
+	// Set log level for internal server as the same as server
+	c.InternalServer.LogLevel = c.Server.LogLevel
+	c.InternalServer.LogFormat = c.Server.LogFormat
+
+	// Increase max message size to 16MB
+	c.Server.GRPCServerMaxRecvMsgSize = 16 * 1024 * 1024
+	c.Server.GRPCServerMaxSendMsgSize = 16 * 1024 * 1024
+
+	// The following GRPC server settings are added to address this issue - https://github.com/grafana/tempo/issues/493
+	// The settings prevent the grpc server from sending a GOAWAY message if a client sends heartbeat messages
+	// too frequently (due to lack of real traffic).
+	c.Server.GRPCServerMinTimeBetweenPings = 10 * time.Second
+	c.Server.GRPCServerPingWithoutStreamAllowed = true
+
+	f.IntVar(&c.Server.HTTPListenPort, "server.http-listen-port", 3200, "HTTP server listen port.")
+	f.IntVar(&c.Server.GRPCListenPort, "server.grpc-listen-port", 9095, "gRPC server listen port.")
+
+	// Memberlist settings
+	fs := flag.NewFlagSet("", flag.PanicOnError) // create a new flag set b/c we don't want all the memberlist settings in our flags. we're just doing this to get defaults
+	c.MemberlistKV.RegisterFlags(fs)
+	_ = fs.Parse([]string{})
+	// these defaults were chosen to balance resource usage vs. ring propagation speed. they are a "toned down" version of
+	// the memberlist defaults
+	c.MemberlistKV.RetransmitMult = 2
+	c.MemberlistKV.GossipInterval = time.Second
+	c.MemberlistKV.GossipNodes = 2
+	c.MemberlistKV.EnableCompression = false
+
+	f.Var(&c.MemberlistKV.JoinMembers, "memberlist.host-port", "Host port to connect to memberlist cluster.")
+	f.IntVar(&c.MemberlistKV.TCPTransport.BindPort, "memberlist.bind-port", 7946, "Port for memberlist to communicate on")
+	f.IntVar(&c.MemberlistKV.MessageHistoryBufferBytes, "memberlist.message-history-buffer-bytes", 0, "")
+
+	// Everything else
+	flagext.DefaultValues(&c.LiveStoreClient)
+	c.LiveStoreClient.GRPCClientConfig.GRPCCompression = defaultGRPCCompression
+	flagext.DefaultValues(&c.BackenSchedulerClient)
+	c.BackenSchedulerClient.GRPCClientConfig.GRPCCompression = defaultGRPCCompression
+	c.Overrides.RegisterFlagsAndApplyDefaults(f)
+
+	c.Distributor.RegisterFlagsAndApplyDefaults(util.PrefixConfig(prefix, "distributor"), f)
+	c.Generator.RegisterFlagsAndApplyDefaults(util.PrefixConfig(prefix, "generator"), f)
+	c.Ingest.RegisterFlagsAndApplyDefaults(util.PrefixConfig(prefix, "ingest"), f)
+	c.BlockBuilder.RegisterFlagsAndApplyDefaults(util.PrefixConfig(prefix, "block-builder"), f)
+	c.Querier.RegisterFlagsAndApplyDefaults(util.PrefixConfig(prefix, "querier"), f)
+	c.Frontend.RegisterFlagsAndApplyDefaults(util.PrefixConfig(prefix, "query-frontend"), f)
+	c.StorageConfig.RegisterFlagsAndApplyDefaults(util.PrefixConfig(prefix, "storage"), f)
+	c.UsageReport.RegisterFlagsAndApplyDefaults(util.PrefixConfig(prefix, "reporting"), f)
+	c.CacheProvider.RegisterFlagsAndApplyDefaults(util.PrefixConfig(prefix, "cache"), f)
+	c.BackendScheduler.RegisterFlagsAndApplyDefaults(util.PrefixConfig(prefix, "backend-scheduler"), f)
+	c.BackendWorker.RegisterFlagsAndApplyDefaults(util.PrefixConfig(prefix, "backend-worker"), f)
+	c.LiveStore.RegisterFlagsAndApplyDefaults(util.PrefixConfig(prefix, "live-store"), f)
+}
+
+// MultitenancyIsEnabled checks if multitenancy is enabled
+func (c *Config) MultitenancyIsEnabled() bool {
+	return c.MultitenancyEnabled || c.AuthEnabled
+}
+
+// CheckConfig checks if config values are suspect and returns a bundled list of warnings and explanation.
+func (c *Config) CheckConfig() []ConfigWarning {
+	var warnings []ConfigWarning
+	if c.LiveStore.CompleteBlockTimeout < c.StorageConfig.Trace.BlocklistPoll {
+		warnings = append(warnings, warnCompleteBlockTimeout)
+	}
+
+	if c.BackendWorker.Compactor.BlockRetention < c.StorageConfig.Trace.BlocklistPoll {
+		warnings = append(warnings, warnBlockRetention)
+	}
+
+	if c.BackendWorker.Compactor.RetentionConcurrency == 0 {
+		warnings = append(warnings, warnRetentionConcurrency)
+	}
+
+	if c.StorageConfig.Trace.BlocklistPollConcurrency == 0 {
+		warnings = append(warnings, warnBlocklistPollConcurrency)
+	}
+
+	if c.Distributor.LogReceivedSpans.Enabled {
+		warnings = append(warnings, warnLogReceivedTraces)
+	}
+
+	if c.Distributor.LogDiscardedSpans.Enabled {
+		warnings = append(warnings, warnLogDiscardedTraces)
+	}
+
+	if c.StorageConfig.Trace.Backend == backend.Local && !IsSingleBinary(c.Target) {
+		warnings = append(warnings, warnStorageTraceBackendLocal)
+	}
+
+	if c.Frontend.MCPServer.Enabled {
+		warnings = append(warnings, warnMCPServerEnabled)
+	}
+
+	dcWarnings, dcErr := c.StorageConfig.Trace.Block.DedicatedColumns.Validate()
+	if dcErr != nil {
+		warnings = append(warnings, ConfigWarning{
+			Message: dcErr.Error(),
+			Explain: "Tempo will not start with an invalid dedicated attribute column configuration",
+		})
+	}
+	for _, warning := range dcWarnings {
+		warnings = append(warnings, ConfigWarning{
+			Message: warning.Error(),
+			Explain: "Dedicated attribute column configuration contains an invalid configuration that will be ignored",
+		})
+	}
+
+	if c.tracesAndOverridesStorageConflict() {
+		warnings = append(warnings, warnTracesAndUserConfigurableOverridesStorageConflict)
+	}
+
+	if c.Overrides.ConfigType == overrides.ConfigTypeLegacy {
+		warnings = append(warnings, warnLegacyOverridesConfig)
+	}
+
+	if c.StorageConfig.Trace.Backend == backend.S3 && c.StorageConfig.Trace.S3.NativeAWSAuthEnabled {
+		warnings = append(warnings, warnNativeAWSAuthEnabled)
+	}
+
+	if c.StorageConfig.Trace.Cache != "" {
+		warnings = append(warnings, warnConfiguredLegacyCache)
+	}
+
+	if c.Frontend.TraceByID.ConcurrentShards > c.Frontend.TraceByID.QueryShards {
+		warnings = append(warnings, warnTraceByIDConcurrentShards)
+	}
+
+	if c.BackendScheduler.Work.PruneAge <= (c.StorageConfig.Trace.BlocklistPoll * 2) {
+		warnings = append(warnings, warnBackendSchedulerPruneAgeLessThanBlocklistPoll)
+	}
+
+	if len(c.BlockBuilder.AssignedPartitionsMap) > 0 && c.BlockBuilder.PartitionsPerInstance > 0 {
+		warnings = append(warnings, warnPartitionAssigmentCollision)
+	}
+
+	for _, name := range c.Frontend.SkipASTTransformations {
+		if !traceql.IsValidTransformationName(name) {
+			warnings = append(warnings, ConfigWarning{
+				Message: fmt.Sprintf("unknown AST transformation %q in query_frontend.skip_ast_transformations", name),
+				Explain: "valid transformation names are: " + strings.Join(traceql.KnownTransformationNames(), ", "),
+			})
+		}
+	}
+
+	if !c.Frontend.RF1After.IsZero() {
+		warnings = append(warnings, ConfigWarning{
+			Message: "query_frontend.rf1_after is deprecated and will be removed in a future release.",
+			Explain: "Non-metric query paths now query all blocks regardless of replication factor. This setting is ignored.",
+		})
+	}
+
+	return warnings
+}
+
+// ConfigWarning bundles message and explanation strings in one structure.
+type ConfigWarning struct {
+	Message string
+	Explain string
+}
+
+var (
+	warnCompleteBlockTimeout = ConfigWarning{
+		Message: "live_store.complete_block_timeout < storage.trace.blocklist_poll",
+		Explain: "You may receive 404s between the time the live-store has flushed a trace and the querier is aware of the new block",
+	}
+	warnBlockRetention = ConfigWarning{
+		Message: "backend_worker.compaction.compacted_block_timeout < storage.trace.blocklist_poll",
+		Explain: "Queriers and Backend-workers may attempt to read a block that no longer exists",
+	}
+	warnRetentionConcurrency = ConfigWarning{
+		Message: "backend_worker.Compactor.RetentionConcurrency must be greater than zero. Using default.",
+		Explain: fmt.Sprintf("default=%d", tempodb.DefaultRetentionConcurrency),
+	}
+	warnBlocklistPollConcurrency = ConfigWarning{
+		Message: "c.StorageConfig.Trace.BlocklistPollConcurrency must be greater than zero. Using default.",
+		Explain: fmt.Sprintf("default=%d", tempodb.DefaultBlocklistPollConcurrency),
+	}
+	warnLogReceivedTraces = ConfigWarning{
+		Message: "Span logging is enabled. This is for debugging only and not recommended for production deployments.",
+	}
+	warnLogDiscardedTraces = ConfigWarning{
+		Message: "Span logging for discarded traces is enabled. This is for debugging only and not recommended for production deployments.",
+	}
+	warnStorageTraceBackendLocal = ConfigWarning{
+		Message: "Local backend will not correctly retrieve traces with a distributed deployment unless all components have access to the same disk. You should probably be using object storage as a backend.",
+	}
+	warnLegacyOverridesConfig = ConfigWarning{
+		Message: "DEPRECATED: Legacy (flat, unscoped) overrides format is in use and will be removed in a future release.",
+		Explain: "Migrate your overrides config to the new scoped format, or set -config.enable-legacy-overrides=true (or enable_legacy_overrides: true in YAML) to continue using legacy overrides temporarily.",
+	}
+
+	warnTracesAndUserConfigurableOverridesStorageConflict = ConfigWarning{
+		Message: "Trace storage conflicts with user-configurable overrides storage",
+	}
+
+	warnNativeAWSAuthEnabled = ConfigWarning{
+		Message: "c.StorageConfig.Trace.S3.NativeAWSAuthEnabled is deprecated and will be removed in a future release.",
+		Explain: "This setting is no longer necessary and will be ignored.",
+	}
+
+	warnConfiguredLegacyCache = ConfigWarning{
+		Message: "c.StorageConfig.Trace.Cache is deprecated and will be removed in a future release.",
+		Explain: "Please migrate to the top level cache settings config.",
+	}
+
+	warnTraceByIDConcurrentShards = ConfigWarning{
+		Message: "c.Frontend.TraceByID.ConcurrentShards greater than query_shards is invalid. concurrent_shards will be set to query_shards",
+		Explain: "Please remove ConcurrentShards or set it to a value less than or equal to QueryShards",
+	}
+
+	warnMCPServerEnabled = ConfigWarning{
+		Message: "c.Frontend.MCPServer.Enabled is enabled.",
+		Explain: "Querying Tempo with an LLM will result in tracing data being sent to the LLM. Review your LLM provider's documentation and confirm you are comfortable with this.",
+	}
+
+	warnBackendSchedulerPruneAgeLessThanBlocklistPoll = ConfigWarning{
+		Message: "c.BackendScheduler.Work.PruneAge must be greater than 2x the storage.trace.blocklist_poll duration",
+		Explain: "The backend scheduler needs not to prune work faster than the block list poll duration to avoid losing track of blocks which may have been have been compacted, but whose status has not been rediscovered during polling.",
+	}
+
+	warnPartitionAssigmentCollision = ConfigWarning{
+		Message: "Block-builder partition assigment is configured by c.BlockBuilder.PartitionAssigment and c.BlockBuilder.PartitionsPerInstance",
+		Explain: "When both parameters are used c.BlockBuilder.PartitionAssigment takes precedence over c.BlockBuilder.PartitionsPerInstance",
+	}
+)
+
+func (c *Config) tracesAndOverridesStorageConflict() bool {
+	traceStorage := c.StorageConfig.Trace
+	overridesStorage := c.Overrides.UserConfigurableOverridesConfig.Client
+
+	if traceStorage.Backend != overridesStorage.Backend {
+		return false
+	}
+
+	switch traceStorage.Backend {
+	case backend.Local:
+		return traceStorage.Local.PathMatches(overridesStorage.Local)
+	case backend.GCS:
+		return traceStorage.GCS.PathMatches(overridesStorage.GCS)
+	case backend.S3:
+		return traceStorage.S3.PathMatches(overridesStorage.S3)
+	case backend.Azure:
+		return traceStorage.Azure.PathMatches(overridesStorage.Azure)
+	}
+
+	return false
+}

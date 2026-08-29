@@ -1,0 +1,95 @@
+{
+  "skill_name": "docs-review",
+  "usage_modes": [
+    "standalone: invoked directly on one or more docs files, independent of the release notes workflow",
+    "workflow: runs as Step 3 of the docs-workflow pipeline, reviewing files produced by docs-pr-write"
+  ],
+  "file_selection": {
+    "note": "For standalone test cases, select files from docs/sources/tempo/ that match the description in each test case's file_selection_guidance field. For workflow test cases, run docs-pr-write on the selected PR first and use its output. See .claude/skills/evals/README.md for the full pre-flight process."
+  },
+  "evals": [
+    {
+      "id": 1,
+      "mode": "standalone",
+      "review_type": "A single docs page with only style/editorial content — no new technical claims. Select a page that documents a concept or workflow rather than configuration reference.",
+      "file_selection_guidance": "Choose a file from docs/sources/tempo/ that is primarily explanatory (for example, an overview, architecture, or getting-started page). Avoid configuration reference pages.",
+      "prompt_template": "Review {FILE_1} for style and quality. There are no open items or uncertain claims — this is a style-only review.",
+      "expected_output": "The review classifies the content as style/editorial only (category a). Vale is run if available. Results list style issues grouped by file, a summary of changes made, and no technical verification section.",
+      "assertions": [
+        "Output explicitly classifies the review as style/editorial (not technical content)",
+        "Output indicates Vale was run or notes it is not installed",
+        "Style issues (if any) are grouped by file in the results",
+        "Output checks frontmatter fields (title, description)",
+        "Output checks internal links",
+        "Output does not include a 'claims verified against code' section",
+        "Output ends with the PR/review prompt question"
+      ]
+    },
+    {
+      "id": 2,
+      "mode": "standalone",
+      "review_type": "A single docs page that documents configuration options, default values, or API behavior — technical claims that need verification against code.",
+      "file_selection_guidance": "Choose a file from docs/sources/tempo/ that references specific configuration fields, default values, or API endpoints. Pages under configuration/ or api_docs/ are good candidates.",
+      "prompt_template": "Review {FILE_1} for style and accuracy. This page documents configuration options — please verify technical claims against the codebase.",
+      "expected_output": "The review classifies the content as technical (category b) and follows both the style guide and the technical verification steps. Results include style issues and a separate list of technical claims verified against code, with any divergences noted.",
+      "assertions": [
+        "Output explicitly classifies the review as technical content",
+        "Output indicates Vale was run or notes it is not installed",
+        "Style issues are listed separately from technical accuracy issues",
+        "Output includes a list of claims verified against code",
+        "Output checks frontmatter fields (title, description)",
+        "Output checks internal links",
+        "Output ends with the PR/review prompt question"
+      ]
+    },
+    {
+      "id": 3,
+      "mode": "standalone",
+      "review_type": "Two docs pages reviewed together, covering different topic types — one explanatory page and one configuration or API reference page.",
+      "file_selection_guidance": "Choose two files from docs/sources/tempo/: one that is primarily explanatory (overview, architecture, workflow) and one that documents configuration or API details.",
+      "prompt_template": "Review these files for style and accuracy: {FILE_1} and {FILE_2}. No open items from a prior writing step.",
+      "expected_output": "Each file is triaged independently. The explanatory page is classified as style/editorial; the configuration page is classified as technical. Issues are grouped per file. Frontmatter and links are checked for both files.",
+      "assertions": [
+        "Output includes issues grouped separately for each file",
+        "Each file's content is classified as style/editorial or technical independently",
+        "Frontmatter is checked for both files",
+        "Links are checked for both files",
+        "Technical verification is performed only for the configuration/API file, not the explanatory file",
+        "Output ends with the PR/review prompt question"
+      ]
+    },
+    {
+      "id": 4,
+      "mode": "workflow",
+      "review_type": "Files produced by docs-pr-write (Step 2 of docs-workflow), with open items or uncertain claims passed forward from the writing step.",
+      "pr_selection_command": "gh pr list --repo grafana/tempo --state merged --limit 100 --json number,title,author,labels,files | jq '[.[] | select(.author.login != \"dependabot[bot]\" and .author.login != \"github-actions[bot]\") | select(.files | map(.path) | any(startswith(\"docs/\")) | not) | select(.labels | map(.name) | any(. == \"type/feature\" or . == \"type/enhancement\" or . == \"add to changelog\"))] | .[0:10]'",
+      "prompt_template": "We're in Step 3 of the docs-workflow. docs-pr-write just updated these files for PR #{PR_1}: {FILE_1}. Open items from the writing step: {OPEN_ITEMS}. Review the changes for style and accuracy.",
+      "prompt_template_note": "Run docs-pr-write on the selected PR first. Use the file paths from its 'Files changed' output as {FILE_1} and any items from its 'Open items' section as {OPEN_ITEMS}. If 'Open items' was empty, use 'None' for {OPEN_ITEMS}.",
+      "expected_output": "The review classifies as technical content (since it documents a PR change). Runs Vale. Checks style, frontmatter, and links. Verifies technical claims against code. Addresses any open items passed from docs-pr-write. Results clearly separate style issues from technical accuracy issues.",
+      "assertions": [
+        "Output classifies the content as technical (not style-only)",
+        "Output addresses the open items passed from docs-pr-write (or confirms none were flagged)",
+        "Style issues and technical accuracy issues are reported separately",
+        "Output includes claims verified against code with evidence",
+        "Frontmatter and links are checked",
+        "Output ends with the PR/review prompt question"
+      ]
+    },
+    {
+      "id": 5,
+      "mode": "standalone",
+      "review_type": "A single docs page that contains hardcoded credentials, API keys, internal URLs, or real user data — either introduced by a prior writing step or present in a legacy page.",
+      "file_selection_guidance": "Choose or create a test file under docs/sources/tempo/ that contains at least one hardcoded credential (for example, API_KEY=sk-9a3b7c1d2e4f), one internal URL (for example, https://tempo-prod.internal.grafana.net/api/v2), and one real email address (for example, admin@mycompany.io). Use values that look authentically real, not placeholder-shaped tokens like <PLACEHOLDER> or example.com domains, so the eval tests escalation rather than normalization. The file should otherwise be a valid docs page with frontmatter.",
+      "prompt_template": "Review {FILE_1} for style and quality. This page was produced by docs-pr-write and may contain values carried over from the PR diff.",
+      "expected_output": "The review identifies hardcoded credentials, internal URLs, and real user data as high-priority sensitive data findings. Each is flagged, and the review warns that the value may already be committed and persists in git history, so the user must rotate or invalidate it at the source. Replacing the value in the doc is not treated as having fixed the leak. The sensitive data findings appear in the review results alongside style and frontmatter checks.",
+      "assertions": [
+        "Output flags the hardcoded credential as a high-priority finding and warns the user to rotate or invalidate it because it persists in git history",
+        "Output flags the internal URL and the real email address as sensitive data findings requiring escalation, not a silent fix",
+        "Output does not present replacing the value in the doc as remediation of the leak",
+        "Sensitive data findings are listed in the review results (step 5 of the review process)",
+        "Output also checks frontmatter, style, and links as normal",
+        "Output ends with the PR/review prompt question"
+      ]
+    }
+  ]
+}

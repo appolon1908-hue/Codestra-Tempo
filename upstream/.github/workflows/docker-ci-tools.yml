@@ -1,0 +1,95 @@
+name: docker-ci-tools
+on:
+  push:
+    # If you define both branches/branches-ignore and paths/paths-ignore, the workflow will only run when both filters are satisfied.
+    branches:
+      - 'main'
+    paths:
+      - 'tools/**'
+
+env:
+  IMAGE_NAME: us-docker.pkg.dev/grafanalabs-global/dockerhub-tempo-prod-mirror/tempo-ci-tools
+
+# Needed to authenticate to GAR with OIDC.
+permissions:
+  contents: read
+
+jobs:
+
+  get-image-tag:
+    if: github.repository == 'grafana/tempo'  # skip in forks
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.get-tag.outputs.tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - id: get-tag
+        run: |
+          echo "tag=$(./tools/image-tag)-$(date +%Y%m%d-%H%M%S)" >> "$GITHUB_OUTPUT"
+
+  docker-ci-tools:
+    if: github.repository == 'grafana/tempo'
+    needs: get-image-tag
+    strategy:
+      matrix:
+        runner_arch: [ { runner: ubuntu-24.04, arch: amd64 }, { runner: github-hosted-ubuntu-arm64, arch: arm64 } ]
+    runs-on: ${{ matrix.runner_arch.runner }}
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      TAG: ${{ needs.get-image-tag.outputs.tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Login to GAR
+        uses: grafana/shared-workflows/actions/login-to-gar@1f541877ceb22c7be7667d8a8df04984aeac9f9d # login-to-gar/v1.0.3
+        with:
+          registry: us-docker.pkg.dev
+
+      - name: docker-build-and-push
+        run: |
+          TAG_ARCH="$TAG-${{ matrix.runner_arch.arch }}"
+          docker build -f tools/Dockerfile -t "$IMAGE_NAME:$TAG_ARCH" .
+          docker push "$IMAGE_NAME:$TAG_ARCH"
+
+  manifest:
+    if: github.repository == 'grafana/tempo'
+    needs: ['get-image-tag', 'docker-ci-tools']
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      TAG: ${{ needs.get-image-tag.outputs.tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Login to GAR
+        uses: grafana/shared-workflows/actions/login-to-gar@1f541877ceb22c7be7667d8a8df04984aeac9f9d # login-to-gar/v1.0.3
+        with:
+          registry: us-docker.pkg.dev
+
+      - name: docker-manifest-create-and-push
+        run: |
+          docker manifest create \
+          	"$IMAGE_NAME:$TAG"               \
+          	--amend "$IMAGE_NAME:$TAG-amd64"  \
+          	--amend "$IMAGE_NAME:$TAG-arm64"
+          docker manifest push "$IMAGE_NAME:$TAG"
+
+          docker manifest create \
+          	"$IMAGE_NAME:latest"              \
+          	--amend "$IMAGE_NAME:$TAG-amd64"   \
+          	--amend "$IMAGE_NAME:$TAG-arm64"
+          docker manifest push "$IMAGE_NAME:latest"

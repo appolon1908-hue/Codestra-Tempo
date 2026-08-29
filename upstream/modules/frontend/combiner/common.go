@@ -1,0 +1,377 @@
+package combiner
+
+import (
+	"bytes"
+	"errors"
+	"fmt"
+	"io"
+	"math/bits"
+	"net/http"
+	"strings"
+	"sync"
+	"unsafe"
+
+	tempo_io "github.com/grafana/tempo/pkg/io"
+	"github.com/grafana/tempo/pkg/tempopb"
+	"github.com/grafana/tempo/pkg/util"
+
+	"github.com/gogo/protobuf/jsonpb"
+	"github.com/gogo/protobuf/proto"
+	"github.com/gogo/status"
+	"github.com/grafana/tempo/pkg/api"
+	"google.golang.org/grpc/codes"
+)
+
+type TResponse interface {
+	proto.Message
+}
+
+type PipelineResponse interface {
+	HTTPResponse() *http.Response
+	RequestData() any
+
+	IsMetadata() bool // todo: search and query range pass back metadata responses through a normal http response. update to use this instead.
+}
+
+type genericCombiner[T TResponse] struct {
+	mu sync.Mutex
+
+	current T // todo: state mgmt is mixed between the combiner and the various implementations. put it in one spot.
+
+	new      func() T
+	combine  func(partial T, final T, resp PipelineResponse) error
+	metadata func(resp PipelineResponse, final T) error
+	finalize func(T) (T, error)
+	diff     func(T) (T, error)
+	quit     func(T) bool
+
+	// Segment one response into smaller ones, that fit within the given max size.
+	segment func(T, int) []T
+
+	// Used to determine the response code and when to stop
+	httpStatusCode int
+	httpRespBody   string
+	// Used to marshal the response when using an HTTP Combiner, it doesn't affect for a GRPC combiner.
+	httpMarshalingFormat api.MarshallingFormat
+}
+
+// Init an HTTP combiner with default values. The marshaling format dictates how the response will be marshaled, including the Content-type header.
+func initHTTPCombiner[T TResponse](c *genericCombiner[T], marshalingFormat api.MarshallingFormat) {
+	c.httpStatusCode = 200
+	c.httpMarshalingFormat = marshalingFormat
+}
+
+// AddResponse is used to add a http response to the combiner.
+func (c *genericCombiner[T]) AddResponse(r PipelineResponse) error {
+	if r.IsMetadata() && c.metadata != nil {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+
+		if err := c.metadata(r, c.current); err != nil {
+			return fmt.Errorf("error processing metadata: %w", err)
+		}
+		return nil
+	}
+
+	res := r.HTTPResponse()
+	if res == nil {
+		return nil
+	}
+
+	// todo: reevaluate this. should the caller owner the lifecycle of the http.response body?
+	defer func() { _ = res.Body.Close() }()
+
+	// test shouldQuit and set response all under the same lock. this prevents race conditions where
+	// two responses can make it pass shouldQuit() with different results.
+	shouldQuitAndSetResponse := func() (bool, error) {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+
+		if c.shouldQuit() {
+			return true, nil
+		}
+
+		if res.StatusCode != http.StatusOK {
+			bytesMsg, err := io.ReadAll(res.Body)
+			if err != nil {
+				return true, fmt.Errorf("error reading response body: %w", err)
+			}
+			c.httpRespBody = string(bytesMsg)
+			c.httpStatusCode = res.StatusCode
+			// don't return error. the error path is reserved for unexpected errors.
+			// http pipeline errors should be returned through the final response. (Complete/TypedComplete/TypedDiff)
+			return true, nil
+		}
+
+		return false, nil
+	}
+
+	if quit, err := shouldQuitAndSetResponse(); quit {
+		return err
+	}
+
+	partial := c.new() // instantiating directly requires additional type constraints. this seemed cleaner: https://stackoverflow.com/questions/69573113/how-can-i-instantiate-a-non-nil-pointer-of-type-argument-with-generic-go
+
+	switch res.Header.Get(api.HeaderContentType) {
+	case api.HeaderAcceptProtobuf:
+		b, err := tempo_io.ReadAllWithEstimate(res.Body, res.ContentLength)
+		if err != nil {
+			return fmt.Errorf("error reading response body")
+		}
+		if err := proto.Unmarshal(b, partial); err != nil {
+			return fmt.Errorf("error unmarshalling proto response body: %w", err)
+		}
+	default:
+		// Assume json
+		if err := jsonpb.Unmarshal(res.Body, partial); err != nil {
+			return fmt.Errorf("error unmarshalling response body: %w", err)
+		}
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// test again for should quit. it's possible that another response came in while we were unmarshalling that would make us quit.
+	if c.shouldQuit() {
+		return nil
+	}
+
+	c.httpStatusCode = res.StatusCode
+	if err := c.combine(partial, c.current, r); err != nil {
+		c.httpRespBody = internalErrorMsg
+		return fmt.Errorf("error combining in combiner: %w", err)
+	}
+
+	return nil
+}
+
+func (c *genericCombiner[T]) AddTypedResponse(r T) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return c.combine(r, c.current, nil)
+}
+
+// HTTPFinal, GRPCComplete, and GRPCDiff are all responsible for returning something
+// usable in grpc streaming/http response.
+// NOTE: returning error is reserved for unexpected errors, HTTP errors will be returned
+// in the response body. callers should check the http status code.
+func (c *genericCombiner[T]) HTTPFinal() (*http.Response, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	httpErr, _ := c.erroredResponse()
+	if httpErr != nil {
+		return httpErr, nil
+	}
+
+	final, err := c.finalize(c.current)
+	if err != nil {
+		if errors.Is(err, ErrTraceHidden) {
+			c.httpStatusCode = http.StatusNotFound
+			return &http.Response{
+				StatusCode: http.StatusNotFound,
+				Body:       http.NoBody,
+				Header:     http.Header{},
+			}, nil
+		}
+		return nil, err
+	}
+
+	bodyBytes, contentType, err := c.internalMarshalAs(final)
+	if err != nil {
+		return nil, fmt.Errorf("error marshalling response body as %s: %w", c.httpMarshalingFormat, err)
+	}
+
+	return &http.Response{
+		StatusCode: 200,
+		Header: http.Header{
+			api.HeaderContentType: {contentType},
+		},
+		Body:          io.NopCloser(bytes.NewReader(bodyBytes)),
+		ContentLength: int64(len(bodyBytes)),
+	}, nil
+}
+
+func (c *genericCombiner[T]) GRPCFinal() (T, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	var empty T
+	_, grpcErr := c.erroredResponse()
+	if grpcErr != nil {
+		return empty, grpcErr
+	}
+
+	final, err := c.finalize(c.current)
+	if err != nil {
+		if errors.Is(err, ErrTraceHidden) {
+			return empty, status.Error(codes.NotFound, ErrTraceHidden.Error())
+		}
+		return empty, err
+	}
+
+	// clone the final response to prevent race conditions with marshalling this data
+	finalClone := proto.Clone(final).(T)
+	return finalClone, nil
+}
+
+func (c *genericCombiner[T]) GRPCDiff() (T, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	var empty T
+	_, grpcErr := c.erroredResponse()
+	if grpcErr != nil {
+		return empty, grpcErr
+	}
+
+	diff, err := c.diff(c.current)
+	if err != nil {
+		return empty, err
+	}
+
+	// clone the diff to prevent race conditions with marshalling this data
+	diffClone := proto.Clone(diff)
+	return diffClone.(T), nil
+}
+
+func (c *genericCombiner[T]) GRPCSegment(response T, maxSize int) ([]T, error) {
+	c.mu.Lock()
+	segment := c.segment
+	c.mu.Unlock()
+
+	if segment == nil {
+		return nil, fmt.Errorf("grpc response segmentation not supported for response type:  %T", response)
+	}
+
+	return segment(response, maxSize), nil
+}
+
+func (c *genericCombiner[T]) erroredResponse() (*http.Response, error) {
+	if c.httpStatusCode == http.StatusOK {
+		return nil, nil
+	}
+
+	// build grpc error and http response
+	var grpcErr error
+	switch c.httpStatusCode {
+	case http.StatusNotFound:
+		grpcErr = status.Error(codes.NotFound, c.httpRespBody)
+	case http.StatusTooManyRequests:
+		grpcErr = status.Error(codes.ResourceExhausted, c.httpRespBody)
+	case http.StatusBadRequest:
+		grpcErr = status.Error(codes.InvalidArgument, c.httpRespBody)
+	case util.StatusClientClosedRequest:
+		// HTTP 499 is mapped to codes.Canceled grpc error
+		grpcErr = status.Error(codes.Canceled, c.httpRespBody)
+	default:
+		if c.httpStatusCode/100 == 5 {
+			grpcErr = status.Error(codes.Internal, c.httpRespBody)
+		} else {
+			grpcErr = status.Error(codes.Unknown, c.httpRespBody)
+		}
+	}
+	httpResp := &http.Response{
+		StatusCode: c.httpStatusCode,
+		Status:     util.StatusText(c.httpStatusCode),
+		Body:       io.NopCloser(strings.NewReader(c.httpRespBody)),
+	}
+
+	return httpResp, grpcErr
+}
+
+func (c *genericCombiner[R]) StatusCode() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return c.httpStatusCode
+}
+
+func (c *genericCombiner[R]) ShouldQuit() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return c.shouldQuit()
+}
+
+func (c *genericCombiner[R]) shouldQuit() bool {
+	if c.httpStatusCode/100 == 5 { // Bail on 5xx
+		return true
+	}
+
+	if c.httpStatusCode/100 == 4 { // Bail on 4xx
+		return true
+	}
+
+	if c.quit != nil && c.quit(c.current) {
+		return true
+	}
+
+	// 2xx
+	return false
+}
+
+func (c *genericCombiner[T]) internalMarshalAs(final T) ([]byte, string, error) {
+	var bodyBytes []byte
+	var contentType string
+	var err error
+
+	switch c.httpMarshalingFormat {
+	case api.MarshallingFormatProtobuf:
+		bodyBytes, err = proto.Marshal(final)
+		contentType = string(api.MarshallingFormatProtobuf)
+	case api.MarshallingFormatLLM:
+		var bodyString string
+		bodyString, err = new(llmMarshaler).marshalToString(final)
+		contentType = string(api.MarshallingFormatLLM) + "+json" // postfix the content subtype to indicate its parseable as json
+		// if its unsupported, just fallthrough to marshal as normal json
+		if errors.Is(err, util.ErrUnsupported) {
+			bodyString, err = new(jsonpb.Marshaler).MarshalToString(final)
+			contentType = string(api.MarshallingFormatJSON)
+		}
+		bodyBytes = unsafeStringToBytes(bodyString)
+	case api.MarshallingFormatJSON:
+		fallthrough
+	default:
+		var bodyString string
+		bodyString, err = new(jsonpb.Marshaler).MarshalToString(final)
+		contentType = string(api.MarshallingFormatJSON)
+		bodyBytes = unsafeStringToBytes(bodyString)
+	}
+
+	return bodyBytes, contentType, err
+}
+
+// ErrTraceHidden is returned by TraceRedactor.RedactTraceAttributes when a trace is hidden
+// by access policy
+var ErrTraceHidden = errors.New("trace hidden by access policy")
+
+// TraceRedactor is applied to a fully assembled trace before it is returned to
+// the caller. When ErrTraceHidden is returned, the caller should receive a 404 response.
+type TraceRedactor interface {
+	RedactTraceAttributes(t *tempopb.Trace) error
+}
+
+// unsafeStringToBytes converts a string to []byte without allocation.
+// The returned byte slice must not be modified.
+func unsafeStringToBytes(s string) []byte {
+	return unsafe.Slice(unsafe.StringData(s), len(s))
+}
+
+// protoStringSize returns the size in bytes of a string in a repeated string field.
+// Size is 1 byte for the field number, the string content itself, and then the string length encoded as varint.
+func protoStringSize(s string) int {
+	l := len(s)
+	// Calculation copied from sovTempo in tempopb.
+	varIntSize := (bits.Len64(uint64(l)|1) + 6) / 7
+	return 1 + l + varIntSize
+}
+
+// protoSizeMath returns the full size in bytes including overhead to store an entry in a proto slice.
+// It accounts for the field number, the length of the item itself, and then the length encoded as a varint.
+func protoSizeMath(item proto.Message) (n int) {
+	sz := proto.Size(item)
+	varIntSize := (bits.Len64(uint64(sz)|1) + 6) / 7
+	return 1 + sz + varIntSize
+}

@@ -1,0 +1,1000 @@
+package blockselector
+
+import (
+	"fmt"
+	"testing"
+	"time"
+
+	"github.com/grafana/tempo/tempodb/backend"
+	"github.com/grafana/tempo/tempodb/encoding"
+	"github.com/stretchr/testify/assert"
+)
+
+func TestTimeWindowBlockSelectorBlocksToCompact(t *testing.T) {
+	now := time.Now()
+	// The cases below build block end times and expected hashes from now, and run
+	// with a one second compaction range, so a window is one Unix second wide.
+	// Pin the selector to the same reference time: otherwise any case that
+	// depends on a block landing exactly on the active window boundary fails
+	// whenever a second elapses between here and the selector reading the clock,
+	// which happens routinely under a slow or instrumented test run.
+	timeNow = func() time.Time { return now }
+	t.Cleanup(func() { timeNow = time.Now })
+
+	timeWindow := 12 * time.Hour
+	tenantID := ""
+
+	tests := []struct {
+		name               string
+		blocklist          []*backend.BlockMeta
+		minInputBlocks     int    // optional, defaults to global const
+		maxInputBlocks     int    // optional, defaults to global const
+		maxBlockBytes      uint64 // optional, defaults to ???
+		maxCompactionLevel int    // optional, default to global const
+		expected           []*backend.BlockMeta
+		expectedHash       string
+		expectedSecond     []*backend.BlockMeta
+		expectedHash2      string
+	}{
+		{
+			name:      "nil - nil",
+			blocklist: nil,
+			expected:  nil,
+		},
+		{
+			name:      "empty - nil",
+			blocklist: []*backend.BlockMeta{},
+			expected:  nil,
+		},
+		{
+			name: "only two",
+			blocklist: []*backend.BlockMeta{
+				{
+					BlockID: backend.MustParse("00000000-0000-0000-0000-000000000000"),
+					EndTime: now,
+				},
+				{
+					BlockID: backend.MustParse("00000000-0000-0000-0000-000000000001"),
+					EndTime: now,
+				},
+			},
+			expected: []*backend.BlockMeta{
+				{
+					BlockID: backend.MustParse("00000000-0000-0000-0000-000000000000"),
+					EndTime: now,
+				},
+				{
+					BlockID: backend.MustParse("00000000-0000-0000-0000-000000000001"),
+					EndTime: now,
+				},
+			},
+			expectedHash: fmt.Sprintf("%v-%v-%v-%v", tenantID, 0, now.Unix(), 0),
+		},
+		{
+			name: "choose smallest two",
+			blocklist: []*backend.BlockMeta{
+				{
+					BlockID:      backend.MustParse("00000000-0000-0000-0000-000000000002"),
+					TotalObjects: 0,
+					EndTime:      now,
+				},
+				{
+					BlockID:      backend.MustParse("00000000-0000-0000-0000-000000000000"),
+					TotalObjects: 1,
+					EndTime:      now,
+				},
+				{
+					BlockID:      backend.MustParse("00000000-0000-0000-0000-000000000001"),
+					TotalObjects: 0,
+					EndTime:      now,
+				},
+			},
+			maxInputBlocks: 2,
+			expected: []*backend.BlockMeta{
+				{
+					BlockID:      backend.MustParse("00000000-0000-0000-0000-000000000002"),
+					TotalObjects: 0,
+					EndTime:      now,
+				},
+				{
+					BlockID:      backend.MustParse("00000000-0000-0000-0000-000000000001"),
+					TotalObjects: 0,
+					EndTime:      now,
+				},
+			},
+			expectedHash: fmt.Sprintf("%v-%v-%v-%v", tenantID, 0, now.Unix(), 0),
+		},
+		{
+			name: "different windows",
+			blocklist: []*backend.BlockMeta{
+				{
+					BlockID: backend.MustParse("00000000-0000-0000-0000-000000000002"),
+					EndTime: now,
+				},
+				{
+					BlockID: backend.MustParse("00000000-0000-0000-0000-000000000000"),
+					EndTime: now.Add(-timeWindow),
+				},
+				{
+					BlockID: backend.MustParse("00000000-0000-0000-0000-000000000001"),
+					EndTime: now,
+				},
+				{
+					BlockID: backend.MustParse("00000000-0000-0000-0000-000000000004"),
+					EndTime: now.Add(-timeWindow),
+				},
+			},
+			expected: []*backend.BlockMeta{
+				{
+					BlockID: backend.MustParse("00000000-0000-0000-0000-000000000002"),
+					EndTime: now,
+				},
+				{
+					BlockID: backend.MustParse("00000000-0000-0000-0000-000000000001"),
+					EndTime: now,
+				},
+			},
+			expectedHash: fmt.Sprintf("%v-%v-%v-%v", tenantID, 0, now.Unix(), 0),
+			expectedSecond: []*backend.BlockMeta{
+				{
+					BlockID: backend.MustParse("00000000-0000-0000-0000-000000000000"),
+					EndTime: now.Add(-timeWindow),
+				},
+				{
+					BlockID: backend.MustParse("00000000-0000-0000-0000-000000000004"),
+					EndTime: now.Add(-timeWindow),
+				},
+			},
+			expectedHash2: fmt.Sprintf("%v-%v-%v-%v", tenantID, 0, now.Add(-timeWindow).Unix(), 0),
+		},
+		{
+			name: "different sizes",
+			blocklist: []*backend.BlockMeta{
+				{
+					BlockID:      backend.MustParse("00000000-0000-0000-0000-000000000004"),
+					EndTime:      now,
+					TotalObjects: 15,
+				},
+				{
+					BlockID:      backend.MustParse("00000000-0000-0000-0000-000000000002"),
+					EndTime:      now,
+					TotalObjects: 1,
+				},
+				{
+					BlockID:      backend.MustParse("00000000-0000-0000-0000-000000000000"),
+					EndTime:      now,
+					TotalObjects: 3,
+				},
+				{
+					BlockID:      backend.MustParse("00000000-0000-0000-0000-000000000001"),
+					EndTime:      now,
+					TotalObjects: 12,
+				},
+			},
+			maxInputBlocks: 2,
+			expected: []*backend.BlockMeta{
+				{
+					BlockID:      backend.MustParse("00000000-0000-0000-0000-000000000002"),
+					EndTime:      now,
+					TotalObjects: 1,
+				},
+				{
+					BlockID:      backend.MustParse("00000000-0000-0000-0000-000000000000"),
+					EndTime:      now,
+					TotalObjects: 3,
+				},
+			},
+			expectedHash: fmt.Sprintf("%v-%v-%v-%v", tenantID, 0, now.Unix(), 0),
+			expectedSecond: []*backend.BlockMeta{
+				{
+					BlockID:      backend.MustParse("00000000-0000-0000-0000-000000000001"),
+					EndTime:      now,
+					TotalObjects: 12,
+				},
+				{
+					BlockID:      backend.MustParse("00000000-0000-0000-0000-000000000004"),
+					EndTime:      now,
+					TotalObjects: 15,
+				},
+			},
+			expectedHash2: fmt.Sprintf("%v-%v-%v-%v", tenantID, 0, now.Unix(), 0),
+		},
+		{
+			name: "different compaction lvls",
+			blocklist: []*backend.BlockMeta{
+				{
+					BlockID:         backend.MustParse("00000000-0000-0000-0000-000000000002"),
+					EndTime:         now,
+					CompactionLevel: 1,
+				},
+				{
+					BlockID: backend.MustParse("00000000-0000-0000-0000-000000000000"),
+					EndTime: now,
+				},
+				{
+					BlockID:         backend.MustParse("00000000-0000-0000-0000-000000000003"),
+					EndTime:         now,
+					CompactionLevel: 1,
+				},
+				{
+					BlockID: backend.MustParse("00000000-0000-0000-0000-000000000001"),
+					EndTime: now,
+				},
+			},
+			expected: []*backend.BlockMeta{
+				{
+					BlockID: backend.MustParse("00000000-0000-0000-0000-000000000000"),
+					EndTime: now,
+				},
+				{
+					BlockID: backend.MustParse("00000000-0000-0000-0000-000000000001"),
+					EndTime: now,
+				},
+			},
+			expectedHash: fmt.Sprintf("%v-%v-%v-%v", tenantID, 0, now.Unix(), 0),
+			expectedSecond: []*backend.BlockMeta{
+				{
+					BlockID:         backend.MustParse("00000000-0000-0000-0000-000000000002"),
+					EndTime:         now,
+					CompactionLevel: 1,
+				},
+				{
+					BlockID:         backend.MustParse("00000000-0000-0000-0000-000000000003"),
+					EndTime:         now,
+					CompactionLevel: 1,
+				},
+			},
+			expectedHash2: fmt.Sprintf("%v-%v-%v-%v", tenantID, 1, now.Unix(), 0),
+		},
+		{
+			name: "active time window vs not",
+			blocklist: []*backend.BlockMeta{
+				{
+					BlockID: backend.MustParse("00000000-0000-0000-0000-000000000002"),
+					EndTime: now,
+				},
+				{
+					BlockID: backend.MustParse("00000000-0000-0000-0000-000000000000"),
+					EndTime: now,
+				},
+				{
+					BlockID:         backend.MustParse("00000000-0000-0000-0000-000000000004"),
+					EndTime:         now,
+					CompactionLevel: 1,
+				},
+				{
+					BlockID:         backend.MustParse("00000000-0000-0000-0000-000000000003"),
+					EndTime:         now.Add(-activeWindowDuration - time.Minute),
+					CompactionLevel: 1,
+				},
+				{
+					BlockID:         backend.MustParse("00000000-0000-0000-0000-000000000001"),
+					EndTime:         now.Add(-activeWindowDuration - time.Minute),
+					CompactionLevel: 0,
+				},
+			},
+			expected: []*backend.BlockMeta{
+				{
+					BlockID: backend.MustParse("00000000-0000-0000-0000-000000000002"),
+					EndTime: now,
+				},
+				{
+					BlockID: backend.MustParse("00000000-0000-0000-0000-000000000000"),
+					EndTime: now,
+				},
+			},
+			expectedHash: fmt.Sprintf("%v-%v-%v-%v", tenantID, 0, now.Unix(), 0),
+			expectedSecond: []*backend.BlockMeta{
+				{
+					BlockID:         backend.MustParse("00000000-0000-0000-0000-000000000001"),
+					EndTime:         now.Add(-activeWindowDuration - time.Minute),
+					CompactionLevel: 0,
+				},
+				{
+					BlockID:         backend.MustParse("00000000-0000-0000-0000-000000000003"),
+					EndTime:         now.Add(-activeWindowDuration - time.Minute),
+					CompactionLevel: 1,
+				},
+			},
+			expectedHash2: fmt.Sprintf("%v-%v-%v", tenantID, now.Add(-activeWindowDuration-time.Minute).Unix(), 0),
+		},
+		{
+			name: "choose lowest compaction level",
+			blocklist: []*backend.BlockMeta{
+				{
+					BlockID: backend.MustParse("00000000-0000-0000-0000-000000000002"),
+					EndTime: now,
+				},
+				{
+					BlockID: backend.MustParse("00000000-0000-0000-0000-000000000000"),
+					EndTime: now,
+				},
+				{
+					BlockID:         backend.MustParse("00000000-0000-0000-0000-000000000004"),
+					EndTime:         now,
+					CompactionLevel: 1,
+				},
+				{
+					BlockID:         backend.MustParse("00000000-0000-0000-0000-000000000004"),
+					EndTime:         now,
+					CompactionLevel: 1,
+				},
+				{
+					BlockID: backend.MustParse("00000000-0000-0000-0000-000000000004"),
+					EndTime: now.Add(-timeWindow),
+				},
+				{
+					BlockID: backend.MustParse("00000000-0000-0000-0000-000000000005"),
+					EndTime: now.Add(-timeWindow),
+				},
+			},
+			expected: []*backend.BlockMeta{
+				{
+					BlockID: backend.MustParse("00000000-0000-0000-0000-000000000002"),
+					EndTime: now,
+				},
+				{
+					BlockID: backend.MustParse("00000000-0000-0000-0000-000000000000"),
+					EndTime: now,
+				},
+			},
+			expectedHash: fmt.Sprintf("%v-%v-%v-%v", tenantID, 0, now.Unix(), 0),
+			expectedSecond: []*backend.BlockMeta{
+				{
+					BlockID: backend.MustParse("00000000-0000-0000-0000-000000000004"),
+					EndTime: now.Add(-timeWindow),
+				},
+				{
+					BlockID: backend.MustParse("00000000-0000-0000-0000-000000000005"),
+					EndTime: now.Add(-timeWindow),
+				},
+			},
+			expectedHash2: fmt.Sprintf("%v-%v-%v-%v", tenantID, 0, now.Add(-timeWindow).Unix(), 0),
+		},
+		{
+			name: "doesn't choose across time windows",
+			blocklist: []*backend.BlockMeta{
+				{
+					BlockID: backend.MustParse("00000000-0000-0000-0000-000000000001"),
+					EndTime: now,
+				},
+				{
+					BlockID: backend.MustParse("00000000-0000-0000-0000-000000000002"),
+					EndTime: now.Add(-timeWindow),
+				},
+			},
+			expected:       nil,
+			expectedHash:   "",
+			expectedSecond: nil,
+			expectedHash2:  "",
+		},
+		{
+			name: "doesn't exceed max compaction objects",
+			blocklist: []*backend.BlockMeta{
+				{
+					BlockID:      backend.MustParse("00000000-0000-0000-0000-000000000001"),
+					TotalObjects: 99,
+					EndTime:      now,
+				},
+				{
+					BlockID:      backend.MustParse("00000000-0000-0000-0000-000000000002"),
+					TotalObjects: 2,
+					EndTime:      now,
+				},
+			},
+			expected:       nil,
+			expectedHash:   "",
+			expectedSecond: nil,
+			expectedHash2:  "",
+		},
+		{
+			name: "doesn't exceed max block size",
+			blocklist: []*backend.BlockMeta{
+				{
+					BlockID: backend.MustParse("00000000-0000-0000-0000-000000000001"),
+					Size_:   50,
+					EndTime: now,
+				},
+				{
+					BlockID: backend.MustParse("00000000-0000-0000-0000-000000000002"),
+					Size_:   51,
+					EndTime: now,
+				},
+			},
+			maxBlockBytes:  100,
+			expected:       nil,
+			expectedHash:   "",
+			expectedSecond: nil,
+			expectedHash2:  "",
+		},
+		{
+			name: "Returns as many blocks as possible without exceeding max compaction objects",
+			blocklist: []*backend.BlockMeta{
+				{
+					BlockID:      backend.MustParse("00000000-0000-0000-0000-000000000001"),
+					TotalObjects: 50,
+					EndTime:      now,
+				},
+				{
+					BlockID:      backend.MustParse("00000000-0000-0000-0000-000000000002"),
+					TotalObjects: 50,
+					EndTime:      now,
+				},
+				{
+					BlockID:      backend.MustParse("00000000-0000-0000-0000-000000000003"),
+					TotalObjects: 50,
+					EndTime:      now,
+				},
+			},
+			expected: []*backend.BlockMeta{
+				{
+					BlockID:      backend.MustParse("00000000-0000-0000-0000-000000000001"),
+					TotalObjects: 50,
+					EndTime:      now,
+				},
+				{
+					BlockID:      backend.MustParse("00000000-0000-0000-0000-000000000002"),
+					TotalObjects: 50,
+					EndTime:      now,
+				},
+			},
+			expectedHash:   fmt.Sprintf("%v-%v-%v-%v", tenantID, 0, now.Unix(), 0),
+			expectedSecond: nil,
+			expectedHash2:  "",
+		},
+		{
+			name:          "Returns as many blocks as possible without exceeding max block size",
+			maxBlockBytes: 100,
+			blocklist: []*backend.BlockMeta{
+				{
+					BlockID: backend.MustParse("00000000-0000-0000-0000-000000000001"),
+					Size_:   50,
+					EndTime: now,
+				},
+				{
+					BlockID: backend.MustParse("00000000-0000-0000-0000-000000000002"),
+					Size_:   50,
+					EndTime: now,
+				},
+				{
+					BlockID: backend.MustParse("00000000-0000-0000-0000-000000000003"),
+					Size_:   1,
+					EndTime: now,
+				},
+			},
+			expected: []*backend.BlockMeta{
+				{
+					BlockID: backend.MustParse("00000000-0000-0000-0000-000000000001"),
+					Size_:   50,
+					EndTime: now,
+				},
+				{
+					BlockID: backend.MustParse("00000000-0000-0000-0000-000000000002"),
+					Size_:   50,
+					EndTime: now,
+				},
+			},
+			expectedHash:   fmt.Sprintf("%v-%v-%v-%v", tenantID, 0, now.Unix(), 0),
+			expectedSecond: nil,
+			expectedHash2:  "",
+		},
+		{
+			// First compaction gets 3 blocks, second compaction gets 2 more
+			name:           "choose more than 2 blocks",
+			maxInputBlocks: 3,
+			blocklist: []*backend.BlockMeta{
+				{
+					BlockID:      backend.MustParse("00000000-0000-0000-0000-000000000001"),
+					EndTime:      now,
+					TotalObjects: 1,
+				},
+				{
+					BlockID:      backend.MustParse("00000000-0000-0000-0000-000000000002"),
+					EndTime:      now,
+					TotalObjects: 2,
+				},
+				{
+					BlockID:      backend.MustParse("00000000-0000-0000-0000-000000000003"),
+					EndTime:      now,
+					TotalObjects: 3,
+				},
+				{
+					BlockID:      backend.MustParse("00000000-0000-0000-0000-000000000004"),
+					EndTime:      now,
+					TotalObjects: 4,
+				},
+				{
+					BlockID:      backend.MustParse("00000000-0000-0000-0000-000000000005"),
+					EndTime:      now,
+					TotalObjects: 5,
+				},
+			},
+			expected: []*backend.BlockMeta{
+				{
+					BlockID:      backend.MustParse("00000000-0000-0000-0000-000000000001"),
+					EndTime:      now,
+					TotalObjects: 1,
+				},
+				{
+					BlockID:      backend.MustParse("00000000-0000-0000-0000-000000000002"),
+					EndTime:      now,
+					TotalObjects: 2,
+				},
+				{
+					BlockID:      backend.MustParse("00000000-0000-0000-0000-000000000003"),
+					EndTime:      now,
+					TotalObjects: 3,
+				},
+			},
+			expectedHash: fmt.Sprintf("%v-%v-%v-%v", tenantID, 0, now.Unix(), 0),
+			expectedSecond: []*backend.BlockMeta{
+				{
+					BlockID:      backend.MustParse("00000000-0000-0000-0000-000000000004"),
+					EndTime:      now,
+					TotalObjects: 4,
+				},
+				{
+					BlockID:      backend.MustParse("00000000-0000-0000-0000-000000000005"),
+					EndTime:      now,
+					TotalObjects: 5,
+				},
+			},
+			expectedHash2: fmt.Sprintf("%v-%v-%v-%v", tenantID, 0, now.Unix(), 0),
+		},
+		{
+			name: "honors minimum block count",
+			blocklist: []*backend.BlockMeta{
+				{
+					BlockID: backend.MustParse("00000000-0000-0000-0000-000000000001"),
+					EndTime: now,
+				},
+				{
+					BlockID: backend.MustParse("00000000-0000-0000-0000-000000000002"),
+					EndTime: now,
+				},
+			},
+			minInputBlocks: 3,
+			maxInputBlocks: 3,
+			expected:       nil,
+			expectedHash:   "",
+			expectedSecond: nil,
+			expectedHash2:  "",
+		},
+		{
+			name: "can choose blocks not at the lowest compaction level",
+			blocklist: []*backend.BlockMeta{
+				{
+					BlockID:         backend.MustParse("00000000-0000-0000-0000-000000000001"),
+					EndTime:         now,
+					CompactionLevel: 0,
+				},
+				{
+					BlockID:         backend.MustParse("00000000-0000-0000-0000-000000000002"),
+					EndTime:         now,
+					CompactionLevel: 1,
+				},
+				{
+					BlockID:         backend.MustParse("00000000-0000-0000-0000-000000000003"),
+					EndTime:         now,
+					CompactionLevel: 1,
+				},
+				{
+					BlockID:         backend.MustParse("00000000-0000-0000-0000-000000000004"),
+					EndTime:         now,
+					CompactionLevel: 1,
+				},
+			},
+			minInputBlocks: 3,
+			maxInputBlocks: 3,
+			expected: []*backend.BlockMeta{
+				{
+					BlockID:         backend.MustParse("00000000-0000-0000-0000-000000000002"),
+					EndTime:         now,
+					CompactionLevel: 1,
+				},
+				{
+					BlockID:         backend.MustParse("00000000-0000-0000-0000-000000000003"),
+					EndTime:         now,
+					CompactionLevel: 1,
+				},
+				{
+					BlockID:         backend.MustParse("00000000-0000-0000-0000-000000000004"),
+					EndTime:         now,
+					CompactionLevel: 1,
+				},
+			},
+			expectedHash:   fmt.Sprintf("%v-%v-%v-%v", tenantID, 1, now.Unix(), 0),
+			expectedSecond: nil,
+			expectedHash2:  "",
+		},
+		{
+			name: "doesn't select blocks in last active window",
+			blocklist: []*backend.BlockMeta{
+				{
+					BlockID:         backend.MustParse("00000000-0000-0000-0000-000000000001"),
+					EndTime:         now.Add(-activeWindowDuration),
+					CompactionLevel: 0,
+				},
+				{
+					BlockID:         backend.MustParse("00000000-0000-0000-0000-000000000002"),
+					EndTime:         now.Add(-activeWindowDuration),
+					CompactionLevel: 0,
+				},
+			},
+		},
+		{
+			name: "ensures blocks of different versions are not compacted",
+			blocklist: []*backend.BlockMeta{
+				{
+					BlockID: backend.MustParse("00000000-0000-0000-0000-000000000001"),
+					EndTime: now,
+					Version: "vParquet5",
+				},
+				{
+					BlockID: backend.MustParse("00000000-0000-0000-0000-000000000002"),
+					EndTime: now,
+					Version: "vParquet3",
+				},
+			},
+			expected:       nil,
+			expectedHash:   "",
+			expectedSecond: nil,
+			expectedHash2:  "",
+		},
+		{
+			name: "ensures blocks of the same version are compacted",
+			blocklist: []*backend.BlockMeta{
+				{
+					BlockID: backend.MustParse("00000000-0000-0000-0000-000000000001"),
+					EndTime: now,
+					Version: "vParquet5",
+				},
+				{
+					BlockID: backend.MustParse("00000000-0000-0000-0000-000000000002"),
+					EndTime: now,
+					Version: "vParquet3",
+				},
+				{
+					BlockID: backend.MustParse("00000000-0000-0000-0000-000000000003"),
+					EndTime: now,
+					Version: "vParquet5",
+				},
+				{
+					BlockID: backend.MustParse("00000000-0000-0000-0000-000000000004"),
+					EndTime: now,
+					Version: "vParquet3",
+				},
+			},
+			expected: []*backend.BlockMeta{
+				{
+					BlockID: backend.MustParse("00000000-0000-0000-0000-000000000002"),
+					EndTime: now,
+					Version: "vParquet3",
+				},
+				{
+					BlockID: backend.MustParse("00000000-0000-0000-0000-000000000004"),
+					EndTime: now,
+					Version: "vParquet3",
+				},
+			},
+			expectedHash: fmt.Sprintf("%v-%v-%v-%v", tenantID, 0, now.Unix(), 0),
+			expectedSecond: []*backend.BlockMeta{
+				{
+					BlockID: backend.MustParse("00000000-0000-0000-0000-000000000001"),
+					EndTime: now,
+					Version: "vParquet5",
+				},
+				{
+					BlockID: backend.MustParse("00000000-0000-0000-0000-000000000003"),
+					EndTime: now,
+					Version: "vParquet5",
+				},
+			},
+			expectedHash2: fmt.Sprintf("%v-%v-%v-%v", tenantID, 0, now.Unix(), 0),
+		},
+		{
+			name: "blocks with different dedicated columns are not selected together",
+			blocklist: []*backend.BlockMeta{
+				{
+					BlockID: backend.MustParse("00000000-0000-0000-0000-000000000001"),
+					EndTime: now,
+					DedicatedColumns: backend.DedicatedColumns{
+						{Scope: "span", Name: "foo", Type: "int"},
+					},
+				},
+				{
+					BlockID: backend.MustParse("00000000-0000-0000-0000-000000000002"),
+					EndTime: now,
+					DedicatedColumns: backend.DedicatedColumns{
+						{Scope: "span", Name: "foo", Type: "string"},
+					},
+				},
+				{
+					BlockID: backend.MustParse("00000000-0000-0000-0000-000000000003"),
+					EndTime: now,
+					DedicatedColumns: backend.DedicatedColumns{
+						{Scope: "span", Name: "foo", Type: "int"},
+					},
+				},
+				{
+					BlockID: backend.MustParse("00000000-0000-0000-0000-000000000004"),
+					EndTime: now,
+					DedicatedColumns: backend.DedicatedColumns{
+						{Scope: "span", Name: "foo", Type: "string"},
+					},
+				},
+			},
+			expected: []*backend.BlockMeta{
+				{
+					BlockID: backend.MustParse("00000000-0000-0000-0000-000000000001"),
+					EndTime: now,
+					DedicatedColumns: backend.DedicatedColumns{
+						{Scope: "span", Name: "foo", Type: "int"},
+					},
+				},
+				{
+					BlockID: backend.MustParse("00000000-0000-0000-0000-000000000003"),
+					EndTime: now,
+					DedicatedColumns: backend.DedicatedColumns{
+						{Scope: "span", Name: "foo", Type: "int"},
+					},
+				},
+			},
+			expectedHash: fmt.Sprintf("%v-%v-%v-%v", tenantID, 0, now.Unix(), 0),
+			expectedSecond: []*backend.BlockMeta{
+				{
+					BlockID: backend.MustParse("00000000-0000-0000-0000-000000000002"),
+					EndTime: now,
+					DedicatedColumns: backend.DedicatedColumns{
+						{Scope: "span", Name: "foo", Type: "string"},
+					},
+				},
+				{
+					BlockID: backend.MustParse("00000000-0000-0000-0000-000000000004"),
+					EndTime: now,
+					DedicatedColumns: backend.DedicatedColumns{
+						{Scope: "span", Name: "foo", Type: "string"},
+					},
+				},
+			},
+			expectedHash2: fmt.Sprintf("%v-%v-%v-%v", tenantID, 0, now.Unix(), 0),
+		},
+		{
+			name: "blocks are grouped by replication factor",
+			blocklist: []*backend.BlockMeta{
+				{
+					BlockID:           backend.MustParse("00000000-0000-0000-0000-000000000001"),
+					EndTime:           now,
+					ReplicationFactor: 1,
+				},
+				{
+					BlockID:           backend.MustParse("00000000-0000-0000-0000-000000000002"),
+					EndTime:           now,
+					ReplicationFactor: 3,
+				},
+				{
+					BlockID:           backend.MustParse("00000000-0000-0000-0000-000000000003"),
+					EndTime:           now,
+					ReplicationFactor: 1,
+				},
+				{
+					BlockID:           backend.MustParse("00000000-0000-0000-0000-000000000004"),
+					EndTime:           now,
+					ReplicationFactor: 3,
+				},
+			},
+			expected: []*backend.BlockMeta{
+				{
+					BlockID:           backend.MustParse("00000000-0000-0000-0000-000000000001"),
+					EndTime:           now,
+					ReplicationFactor: 1,
+				},
+				{
+					BlockID:           backend.MustParse("00000000-0000-0000-0000-000000000003"),
+					EndTime:           now,
+					ReplicationFactor: 1,
+				},
+			},
+			expectedHash: fmt.Sprintf("%v-%v-%v-%v", tenantID, 0, now.Unix(), 1),
+			expectedSecond: []*backend.BlockMeta{
+				{
+					BlockID:           backend.MustParse("00000000-0000-0000-0000-000000000002"),
+					EndTime:           now,
+					ReplicationFactor: 3,
+				},
+				{
+					BlockID:           backend.MustParse("00000000-0000-0000-0000-000000000004"),
+					EndTime:           now,
+					ReplicationFactor: 3,
+				},
+			},
+			expectedHash2: fmt.Sprintf("%v-%v-%v-%v", tenantID, 0, now.Unix(), 3),
+		},
+		{
+			name: "unsupported blocks are ignored",
+			blocklist: []*backend.BlockMeta{
+				{
+					BlockID: backend.MustParse("00000000-0000-0000-0000-000000000001"),
+					EndTime: now,
+					Version: "preview1",
+				},
+				{
+					BlockID: backend.MustParse("00000000-0000-0000-0000-000000000002"),
+					EndTime: now,
+					Version: "preview1",
+				},
+			},
+			expected:       nil,
+			expectedHash:   "",
+			expectedSecond: nil,
+			expectedHash2:  "",
+		},
+		{
+			name: "blocks above the max compaction level are not selected for compaction",
+			blocklist: []*backend.BlockMeta{
+				{
+					BlockID:           backend.MustParse("00000000-0000-0000-0000-000000000001"),
+					EndTime:           now,
+					ReplicationFactor: 1,
+					CompactionLevel:   uint32(10),
+				},
+				{
+					BlockID:           backend.MustParse("00000000-0000-0000-0000-000000000002"),
+					EndTime:           now,
+					ReplicationFactor: 1,
+					CompactionLevel:   uint32(10),
+				},
+			},
+			maxCompactionLevel: 10,
+			expected:           nil,
+			expectedSecond:     nil,
+		},
+		{
+			name: "blocks under the max compaction level are selected for compaction",
+			blocklist: []*backend.BlockMeta{
+				{
+					BlockID:           backend.MustParse("00000000-0000-0000-0000-000000000001"),
+					EndTime:           now,
+					ReplicationFactor: 1,
+					CompactionLevel:   uint32(10),
+				},
+				{
+					BlockID:           backend.MustParse("00000000-0000-0000-0000-000000000002"),
+					EndTime:           now,
+					ReplicationFactor: 1,
+					CompactionLevel:   uint32(10),
+				},
+			},
+			maxCompactionLevel: 11,
+			expected: []*backend.BlockMeta{
+				{
+					BlockID:           backend.MustParse("00000000-0000-0000-0000-000000000001"),
+					EndTime:           now,
+					ReplicationFactor: 1,
+					CompactionLevel:   uint32(10),
+				},
+				{
+					BlockID:           backend.MustParse("00000000-0000-0000-0000-000000000002"),
+					EndTime:           now,
+					ReplicationFactor: 1,
+					CompactionLevel:   uint32(10),
+				},
+			},
+			expectedHash: fmt.Sprintf("%v-%v-%v-%v", tenantID, 10, now.Unix(), 1),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			minBlocks := DefaultMinInputBlocks
+			if tt.minInputBlocks > 0 {
+				minBlocks = tt.minInputBlocks
+			}
+
+			maxBlocks := DefaultMaxInputBlocks
+			if tt.maxInputBlocks > 0 {
+				maxBlocks = tt.maxInputBlocks
+			}
+
+			maxSize := uint64(1024 * 1024)
+			if tt.maxBlockBytes > 0 {
+				maxSize = tt.maxBlockBytes
+			}
+
+			// For testing, assign all data to valid encoding
+			// if not specified.
+			for _, b := range tt.blocklist {
+				if b.Version == "" {
+					b.Version = encoding.DefaultEncoding().Version()
+				}
+			}
+			for _, b := range tt.expected {
+				if b.Version == "" {
+					b.Version = encoding.DefaultEncoding().Version()
+				}
+			}
+			for _, b := range tt.expectedSecond {
+				if b.Version == "" {
+					b.Version = encoding.DefaultEncoding().Version()
+				}
+			}
+
+			maxLevel := DefaultMaxCompactionLevel
+			if tt.maxCompactionLevel > 0 {
+				maxLevel = tt.maxCompactionLevel
+			}
+
+			selector := NewTimeWindowBlockSelector(tt.blocklist, time.Second, 100, maxSize, minBlocks, maxBlocks, maxLevel)
+
+			actual, hash := selector.BlocksToCompact()
+			assert.Equal(t, tt.expected, actual)
+			assert.Equal(t, tt.expectedHash, hash)
+
+			actual, hash = selector.BlocksToCompact()
+			assert.Equal(t, tt.expectedSecond, actual)
+			assert.Equal(t, tt.expectedHash2, hash)
+		})
+	}
+}
+
+func benchmarkBlocklist(n int, withDedicatedColumns bool) []*backend.BlockMeta {
+	now := time.Now()
+	version := encoding.DefaultEncoding().Version()
+
+	var dcs backend.DedicatedColumns
+	if withDedicatedColumns {
+		dcs = backend.DedicatedColumns{
+			{Scope: backend.DedicatedColumnScopeSpan, Name: "http.method", Type: backend.DedicatedColumnTypeString},
+			{Scope: backend.DedicatedColumnScopeSpan, Name: "http.status_code", Type: backend.DedicatedColumnTypeString},
+			{Scope: backend.DedicatedColumnScopeSpan, Name: "http.route", Type: backend.DedicatedColumnTypeString},
+			{Scope: backend.DedicatedColumnScopeResource, Name: "service.name", Type: backend.DedicatedColumnTypeString},
+			{Scope: backend.DedicatedColumnScopeResource, Name: "k8s.pod.name", Type: backend.DedicatedColumnTypeString},
+		}
+	}
+
+	blocklist := make([]*backend.BlockMeta, 0, n)
+	for i := 0; i < n; i++ {
+		blocklist = append(blocklist, &backend.BlockMeta{
+			BlockID:           backend.MustParse(fmt.Sprintf("00000000-0000-0000-0000-%012d", i)),
+			EndTime:           now,
+			TotalObjects:      int64(1000 + i%500),
+			Version:           version,
+			DedicatedColumns:  dcs,
+			ReplicationFactor: 1,
+		})
+	}
+	return blocklist
+}
+
+// BenchmarkBlocksToCompact_WithDedicatedColumns guards against regressing the
+// per-entry DedicatedColumnsHash caching: prod max_input_blocks runs 6-8, and
+// BlocksToCompact's comparison loop re-checks hash equality on every candidate
+// stripe, so an uncached hash would show up here as a large gap against the
+// no-dedicated-columns case.
+func BenchmarkBlocksToCompact_NoDedicatedColumns(b *testing.B) {
+	blocklist := benchmarkBlocklist(1000, false)
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		selector := NewTimeWindowBlockSelector(blocklist, time.Hour, 6_000_000, 100*1024*1024*1024, DefaultMinInputBlocks, 7, DefaultMaxCompactionLevel)
+		for {
+			blocks, _ := selector.BlocksToCompact()
+			if blocks == nil {
+				break
+			}
+		}
+	}
+}
+
+func BenchmarkBlocksToCompact_WithDedicatedColumns(b *testing.B) {
+	blocklist := benchmarkBlocklist(1000, true)
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		selector := NewTimeWindowBlockSelector(blocklist, time.Hour, 6_000_000, 100*1024*1024*1024, DefaultMinInputBlocks, 7, DefaultMaxCompactionLevel)
+		for {
+			blocks, _ := selector.BlocksToCompact()
+			if blocks == nil {
+				break
+			}
+		}
+	}
+}

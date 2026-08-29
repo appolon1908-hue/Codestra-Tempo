@@ -1,0 +1,513 @@
+package vparquet5
+
+import (
+	"context"
+	"math/rand"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/stretchr/testify/require"
+
+	tempo_io "github.com/grafana/tempo/pkg/io"
+	"github.com/grafana/tempo/pkg/tempopb"
+	commonv1 "github.com/grafana/tempo/pkg/tempopb/common/v1"
+	resourcev1 "github.com/grafana/tempo/pkg/tempopb/resource/v1"
+	tracev1 "github.com/grafana/tempo/pkg/tempopb/trace/v1"
+	"github.com/grafana/tempo/pkg/util"
+	"github.com/grafana/tempo/pkg/util/test"
+	"github.com/grafana/tempo/tempodb/backend"
+	"github.com/grafana/tempo/tempodb/backend/local"
+	"github.com/grafana/tempo/tempodb/encoding/common"
+)
+
+func TestBackendBlockSearch(t *testing.T) {
+	t.Parallel()
+	// Trace
+	// This is a fully-populated trace that we search for every condition
+	wantTr := &Trace{
+		TraceID:           test.ValidTraceID(nil),
+		StartTimeUnixNano: uint64(1000 * time.Second),
+		EndTimeUnixNano:   uint64(2000 * time.Second),
+		DurationNano:      uint64((100 * time.Millisecond).Nanoseconds()),
+		RootServiceName:   "RootService",
+		RootSpanName:      "RootSpan",
+		ResourceSpans: []ResourceSpans{
+			{
+				Resource: Resource{
+					ServiceName: "myservice",
+					Attrs: []Attribute{
+						attr("bat", "baz"),
+						attr("cluster", "cluster"),
+						attr("namespace", "namespace"),
+						attr("pod", "pod"),
+						attr("container", "container"),
+						attr("k8s.cluster.name", "k8scluster"),
+						attr("k8s.namespace.name", "k8snamespace"),
+						attr("k8s.pod.name", "k8spod"),
+						attr("k8s.container.name", "k8scontainer"),
+					},
+					DedicatedAttributes: DedicatedAttributes{
+						String01: []string{"dedicated-resource-attr-value-1"},
+						String02: []string{"dedicated-resource-attr-value-2"},
+						String03: []string{"dedicated-resource-attr-value-3"},
+						String04: []string{"dedicated-resource-attr-value-4"},
+						String05: []string{"dedicated-resource-attr-value-5"},
+						Int01:    []int64{123},
+					},
+				},
+				ScopeSpans: []ScopeSpans{
+					{
+						SpanCount: 1,
+						Spans: []Span{
+							{
+								Name:         "hello",
+								SpanID:       []byte{},
+								ParentSpanID: []byte{},
+								StatusCode:   int(tracev1.Status_STATUS_CODE_ERROR),
+								Attrs: []Attribute{
+									attr("foo", "bar"),
+									attr("http.method", "get"),
+									attr("http.url", "url/hello/world"),
+									attr("http.status_code", 500),
+								},
+								DedicatedAttributes: DedicatedAttributes{
+									String01: []string{"dedicated-span-attr-value-1"},
+									String02: []string{"dedicated-span-attr-value-2"},
+									String03: []string{"dedicated-span-attr-value-3"},
+									String04: []string{"dedicated-span-attr-value-4"},
+									String05: []string{test.DedicatedBlobTestString()},
+									Int01:    []int64{456},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	// make a bunch of traces and include our wantTr above
+	total := 1000
+	insertAt := rand.Intn(total)
+	allTraces := make([]*Trace, 0, total)
+	for i := 0; i < total; i++ {
+		if i == insertAt {
+			allTraces = append(allTraces, wantTr)
+			continue
+		}
+
+		id := test.ValidTraceID(nil)
+		pbTrace := test.MakeTrace(10, id)
+		pqTrace, _ := traceToParquet(&backend.BlockMeta{}, id, pbTrace, nil)
+		allTraces = append(allTraces, pqTrace)
+	}
+
+	b := makeBackendBlockWithTraces(t, allTraces)
+	ctx := context.TODO()
+
+	// Helper function to make a tag search
+	makeReq := func(k, v string) *tempopb.SearchRequest {
+		return &tempopb.SearchRequest{
+			Tags: map[string]string{
+				k: v,
+			},
+		}
+	}
+
+	// Matches
+	searchesThatMatch := []*tempopb.SearchRequest{
+		{
+			// Empty request
+		},
+		{
+			MinDurationMs: 99,
+			MaxDurationMs: 101,
+		},
+		{
+			Start: 1000,
+			End:   2000,
+		},
+		{
+			// Overlaps start
+			Start: 999,
+			End:   1001,
+		},
+		{
+			// Overlaps end
+			Start: 1999,
+			End:   2001,
+		},
+
+		// Well-known resource attributes
+		makeReq(LabelServiceName, "service"),
+		makeReq(LabelCluster, "cluster"),
+		makeReq(LabelNamespace, "namespace"),
+		makeReq(LabelPod, "pod"),
+		makeReq(LabelContainer, "container"),
+		makeReq(LabelK8sClusterName, "k8scluster"),
+		makeReq(LabelK8sNamespaceName, "k8snamespace"),
+		makeReq(LabelK8sPodName, "k8spod"),
+		makeReq(LabelK8sContainerName, "k8scontainer"),
+
+		// Dedicated resource attributes
+		makeReq("dedicated.resource.3", "dedicated-resource-attr-value-3"),
+		makeReq("dedicated.resource.6", "123"), // Will be converted to integer comparison
+
+		// Well-known span attributes
+		makeReq(LabelName, "ell"),
+		makeReq(LabelHTTPMethod, "get"),
+		makeReq(LabelHTTPUrl, "url/hello/world"),
+		makeReq(LabelStatusCode, StatusCodeError),
+
+		// Dedicated span attributes
+		makeReq("dedicated.span.4", "dedicated-span-attr-value-4"),
+		makeReq("dedicated.span.6", "456"), // Will be converted to integer comparison
+
+		// Span attributes
+		makeReq("foo", "bar"),
+		// Resource attributes
+		makeReq("bat", "baz"),
+
+		// Multiple
+		{
+			Tags: map[string]string{
+				"service.name": "service",
+				"http.method":  "get",
+				"foo":          "bar",
+			},
+		},
+	}
+	expected := &tempopb.TraceSearchMetadata{
+		TraceID:           util.TraceIDToHexString(wantTr.TraceID),
+		StartTimeUnixNano: wantTr.StartTimeUnixNano,
+		DurationMs:        uint32(wantTr.DurationNano / uint64(time.Millisecond)),
+		RootServiceName:   wantTr.RootServiceName,
+		RootTraceName:     wantTr.RootSpanName,
+	}
+
+	findInResults := func(id string, res []*tempopb.TraceSearchMetadata) *tempopb.TraceSearchMetadata {
+		for _, r := range res {
+			if r.TraceID == id {
+				return r
+			}
+		}
+		return nil
+	}
+
+	for _, req := range searchesThatMatch {
+		res, err := b.Search(ctx, req, common.DefaultSearchOptions())
+		require.NoError(t, err)
+
+		meta := findInResults(expected.TraceID, res.Traces)
+		require.NotNil(t, meta, "search request:", req)
+		require.Equal(t, expected, meta, "search request:", req)
+	}
+
+	// Excludes
+	searchesThatDontMatch := []*tempopb.SearchRequest{
+		{
+			MinDurationMs: 101,
+		},
+		{
+			MaxDurationMs: 99,
+		},
+		{
+			Start: 100,
+			End:   200,
+		},
+
+		// Well-known resource attributes
+		makeReq(LabelServiceName, "foo"),
+		makeReq(LabelCluster, "foo"),
+		makeReq(LabelNamespace, "foo"),
+		makeReq(LabelPod, "foo"),
+		makeReq(LabelContainer, "foo"),
+
+		// Dedicated resource attributes
+		makeReq("dedicated.resource.3", "dedicated-resource-attr-value-1"),
+		makeReq("dedicated.resource.6", "9999"),
+
+		// Former well-known span attributes
+		makeReq(LabelHTTPMethod, "post"),
+		makeReq(LabelHTTPUrl, "asdf"),
+		makeReq(LabelHTTPStatusCode, "200"),
+		makeReq(LabelHTTPStatusCode, "500"),
+		makeReq(LabelStatusCode, StatusCodeOK),
+
+		// Dedicated span attributes
+		makeReq("dedicated.span.4", "dedicated-span-attr-value-5"),
+		makeReq("dedicated.span.6", "9999"),
+
+		// Span attributes
+		makeReq("foo", "baz"),
+
+		// Multiple
+		{
+			Tags: map[string]string{
+				"http.status_code": "500",
+				"service.name":     "asdf",
+			},
+		},
+	}
+	for _, req := range searchesThatDontMatch {
+		res, err := b.Search(ctx, req, common.DefaultSearchOptions())
+		require.NoError(t, err)
+		meta := findInResults(expected.TraceID, res.Traces)
+		require.Nil(t, meta, req)
+	}
+}
+
+// TestSearchLegacyTagsHTTPStatusCode tests the old legacy tag-based search
+// against http.status_code stored in a new vParquet5 dedicated integer column.
+func TestSearchLegacyTagsHTTPStatusCode(t *testing.T) {
+	ctx := context.Background()
+	id := test.ValidTraceID(nil)
+
+	meta := &backend.BlockMeta{DedicatedColumns: backend.DefaultDedicatedColumns()}
+	pbTrace := &tempopb.Trace{
+		ResourceSpans: []*tracev1.ResourceSpans{{
+			Resource: &resourcev1.Resource{
+				Attributes: []*commonv1.KeyValue{{
+					Key: LabelServiceName,
+					Value: &commonv1.AnyValue{
+						Value: &commonv1.AnyValue_StringValue{StringValue: "foo"},
+					},
+				}},
+			},
+			ScopeSpans: []*tracev1.ScopeSpans{{
+				Spans: []*tracev1.Span{{
+					Name:              "span",
+					SpanId:            []byte("spanid01"),
+					StartTimeUnixNano: uint64(time.Second),
+					EndTimeUnixNano:   uint64(2 * time.Second),
+					Attributes: []*commonv1.KeyValue{{
+						Key: LabelHTTPStatusCode,
+						Value: &commonv1.AnyValue{
+							Value: &commonv1.AnyValue_IntValue{IntValue: 500},
+						},
+					}},
+				}},
+			}},
+		}},
+	}
+
+	pqTrace, _ := traceToParquet(meta, id, pbTrace, nil)
+	// Includes http.status_code as a span-level dedicated integer column.
+	dc := backend.DefaultDedicatedColumns()
+	b := makeBackendBlockWithTracesWithDedicatedColumns(t, []*Trace{pqTrace}, dc)
+
+	req := &tempopb.SearchRequest{
+		Tags: map[string]string{
+			LabelServiceName:    "foo",
+			LabelHTTPStatusCode: "500",
+		},
+		Limit: 10,
+	}
+
+	res, err := b.Search(ctx, req, common.DefaultSearchOptions())
+	require.NoError(t, err)
+	require.Len(t, res.Traces, 1)
+
+	expected := &tempopb.TraceSearchMetadata{
+		TraceID:           util.TraceIDToHexString(id),
+		StartTimeUnixNano: pqTrace.StartTimeUnixNano,
+		DurationMs:        uint32(pqTrace.DurationNano / uint64(time.Millisecond)),
+		RootServiceName:   pqTrace.RootServiceName,
+		RootTraceName:     pqTrace.RootSpanName,
+	}
+	require.Equal(t, expected, res.Traces[0])
+}
+
+func makeBackendBlockWithTraces(t *testing.T, trs []*Trace) *backendBlock {
+	return makeBackendBlockWithTracesWithDedicatedColumns(t, trs, test.MakeDedicatedColumns())
+}
+
+func makeBackendBlockWithTracesWithDedicatedColumns(t *testing.T, trs []*Trace, dc backend.DedicatedColumns) *backendBlock {
+	rawR, rawW, _, err := local.New(&local.Config{
+		Path: t.TempDir(),
+	})
+	require.NoError(t, err)
+
+	r := backend.NewReader(rawR)
+	w := backend.NewWriter(rawW)
+	ctx := context.Background()
+
+	cfg := &common.BlockConfig{
+		BloomFP:             0.01,
+		BloomShardSizeBytes: 100 * 1024,
+	}
+
+	meta := backend.NewBlockMeta("fake", uuid.New(), VersionString)
+	meta.TotalObjects = 1
+	meta.DedicatedColumns = dc
+
+	s, newMeta := newStreamingBlock(ctx, cfg, meta, r, w, tempo_io.NewBufferedWriter)
+
+	for i, tr := range trs {
+		err = s.Add(tr, 0, 0)
+		require.NoError(t, err)
+		if i%100 == 0 {
+			_, err := s.Flush()
+			require.NoError(t, err)
+		}
+	}
+
+	_, err = s.Complete()
+	require.NoError(t, err)
+
+	b := newBackendBlock(newMeta, r)
+
+	return b
+}
+
+func makeTraces() ([]*Trace, map[string]string, map[string]string, map[string]string) {
+	traces := []*Trace{}
+	intrinsicVals := map[string]string{}
+	resourceAttrVals := map[string]string{}
+	spanAttrVals := map[string]string{}
+
+	resourceAttrVals[LabelCluster] = "cluster"
+	resourceAttrVals[LabelServiceName] = "servicename"
+	resourceAttrVals[LabelNamespace] = "ns"
+	resourceAttrVals[LabelPod] = "pod"
+	resourceAttrVals[LabelContainer] = "con"
+	resourceAttrVals[LabelK8sClusterName] = "kclust"
+	resourceAttrVals[LabelK8sNamespaceName] = "kns"
+	resourceAttrVals[LabelK8sPodName] = "kpod"
+	resourceAttrVals[LabelK8sContainerName] = "k8scon"
+
+	dedicatedResourceAttrs := DedicatedAttributes{
+		String01: []string{"dedicated-resource-attr-value-1"},
+		String02: []string{"dedicated-resource-attr-value-2"},
+		String03: []string{"dedicated-resource-attr-value-3"},
+		String04: []string{"dedicated-resource-attr-value-4"},
+		String05: []string{"dedicated-resource-attr-value-5"},
+	}
+	resourceAttrVals["dedicated.resource.1"] = dedicatedResourceAttrs.String01[0]
+	resourceAttrVals["dedicated.resource.2"] = dedicatedResourceAttrs.String02[0]
+	resourceAttrVals["dedicated.resource.3"] = dedicatedResourceAttrs.String03[0]
+	resourceAttrVals["dedicated.resource.4"] = dedicatedResourceAttrs.String04[0]
+	resourceAttrVals["dedicated.resource.5"] = dedicatedResourceAttrs.String05[0]
+
+	intrinsicVals[LabelName] = "span"
+	// todo: the below 3 are not supported in traceql and should be removed when support for tags based search is removed
+	intrinsicVals[LabelRootServiceName] = "rootsvc"
+	intrinsicVals[LabelStatusCode] = "2"
+	intrinsicVals[LabelRootSpanName] = "rootspan"
+
+	spanAttrVals[LabelHTTPMethod] = "method"
+	spanAttrVals[LabelHTTPUrl] = "url"
+	spanAttrVals[LabelHTTPStatusCode] = "404"
+
+	dedicatedSpanAttrs := DedicatedAttributes{
+		String01: []string{"dedicated-span-attr-value-1"},
+		String02: []string{"dedicated-span-attr-value-2"},
+		String03: []string{"dedicated-span-attr-value-3"},
+		String04: []string{"dedicated-span-attr-value-4"},
+		String05: []string{test.DedicatedBlobTestString()},
+	}
+	spanAttrVals["dedicated.span.1"] = dedicatedSpanAttrs.String01[0]
+	spanAttrVals["dedicated.span.2"] = dedicatedSpanAttrs.String02[0]
+	spanAttrVals["dedicated.span.3"] = dedicatedSpanAttrs.String03[0]
+	spanAttrVals["dedicated.span.4"] = dedicatedSpanAttrs.String04[0]
+	spanAttrVals["dedicated.span.5"] = dedicatedSpanAttrs.String05[0]
+
+	for i := 0; i < 10; i++ {
+		tr := &Trace{
+			RootServiceName: "rootsvc",
+			RootSpanName:    "rootspan",
+		}
+
+		for j := 0; j < 3; j++ {
+			key := test.RandomString()
+			val := test.RandomString()
+			resourceAttrVals[key] = val
+
+			rs := ResourceSpans{
+				Resource: Resource{
+					ServiceName: "servicename",
+					Attrs: []Attribute{
+						attr(key, val),
+						attr("cluster", "cluster"),
+						attr("namespace", "ns"),
+						attr("pod", "pod"),
+						attr("container", "con"),
+						attr("k8s.cluster.name", "kclust"),
+						attr("k8s.namespace.name", "kns"),
+						attr("k8s.pod.name", "kpod"),
+						attr("k8s.container.name", "k8scon"),
+					},
+					DedicatedAttributes: dedicatedResourceAttrs,
+				},
+				ScopeSpans: []ScopeSpans{
+					{},
+				},
+			}
+			tr.ResourceSpans = append(tr.ResourceSpans, rs)
+
+			for k := 0; k < 10; k++ {
+				key := test.RandomString()
+				val := test.RandomString()
+				spanAttrVals[key] = val
+
+				span := Span{
+					Name:       "span",
+					StatusCode: 2,
+					Attrs: []Attribute{
+						attr(key, val),
+						attr("http.method", "method"),
+						attr("http.url", "url"),
+						attr("http.status_code", 404),
+					},
+					DedicatedAttributes: dedicatedSpanAttrs,
+				}
+
+				rs.ScopeSpans[0].Spans = append(rs.ScopeSpans[0].Spans, span)
+			}
+
+		}
+
+		traces = append(traces, tr)
+	}
+
+	return traces, intrinsicVals, resourceAttrVals, spanAttrVals
+}
+
+func BenchmarkBackendBlockSearchTraces(b *testing.B) {
+	testCases := []struct {
+		name string
+		tags map[string]string
+	}{
+		{"noMatch", map[string]string{"foo": "bar"}},
+		{"partialMatch", map[string]string{"foo": "bar", "component": "gRPC"}},
+		{"service.name", map[string]string{"service.name": "a"}},
+	}
+
+	ctx := context.TODO()
+	block := blockForBenchmarks(b)
+
+	opts := common.DefaultSearchOptions()
+	opts.StartPage = 10
+	opts.TotalPages = 10
+
+	for _, tc := range testCases {
+
+		req := &tempopb.SearchRequest{
+			Tags:  tc.tags,
+			Limit: 20,
+		}
+
+		b.Run(tc.name, func(b *testing.B) {
+			b.ResetTimer()
+			bytesRead := 0
+			for i := 0; i < b.N; i++ {
+				resp, err := block.Search(ctx, req, opts)
+				require.NoError(b, err)
+				bytesRead += int(resp.Metrics.InspectedBytes)
+			}
+			b.SetBytes(int64(bytesRead) / int64(b.N))
+			b.ReportMetric(float64(bytesRead)/float64(b.N), "bytes/op")
+		})
+	}
+}

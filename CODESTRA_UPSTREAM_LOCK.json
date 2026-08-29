@@ -1,0 +1,9 @@
+{
+  "schema_version": "1.0",
+  "upstream_clone_url": "https://github.com/grafana/tempo.git",
+  "upstream_ref": "main",
+  "upstream_commit": "049347c455383b93cd8557760f18c1f269cccc2b",
+  "import_path": "upstream",
+  "synchronized_at": "2026-08-29T17:22:39.569927+00:00",
+  "deployment_enabled": false
+}

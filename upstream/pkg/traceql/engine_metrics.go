@@ -1,0 +1,2638 @@
+package traceql
+
+import (
+	"container/heap"
+	"context"
+	"errors"
+	"fmt"
+	"math"
+	"math/bits"
+	"math/rand"
+	"sort"
+	"sync"
+	"time"
+
+	"github.com/go-kit/log/level"
+	"github.com/grafana/tempo/pkg/tempopb"
+	commonv1proto "github.com/grafana/tempo/pkg/tempopb/common/v1"
+	"github.com/grafana/tempo/pkg/util"
+	"github.com/grafana/tempo/pkg/util/log"
+	"github.com/prometheus/common/model"
+	"github.com/prometheus/prometheus/model/labels"
+)
+
+const (
+	internalLabelMetaType      = "__meta_type"
+	internalMetaTypeCount      = "__count"
+	internalLabelBucket        = "__bucket"
+	internalLabelQueryFragment = "__query_fragment"
+	maxExemplarsPerBucket      = 2
+	// maxExemplars is a safety cap applied at the engine entry points to bound memory
+	// usage regardless of what the caller requests.
+	maxExemplars uint32 = 100000
+	// NormalNaN is a quiet NaN. This is also math.NaN().
+	normalNaN uint64 = 0x7ff8000000000001
+)
+
+func DefaultQueryRangeStep(start, end uint64) uint64 {
+	delta := time.Duration(end - start)
+
+	// Try to get this many data points
+	// Our baseline is 1 hour @ 15s intervals == 240 data points
+	baseline := delta / 240
+
+	// Edge case - when the time window is less than 1 minute, Grafana
+	// shows millisconds precision. In this case we can use a step in the millisecond range.
+	// In all other cases, the minimum step will be 1s.
+	if delta < time.Minute {
+		g := 50 * time.Millisecond
+		if baseline > g {
+			rounded := baseline / g * g
+			return uint64(rounded.Nanoseconds())
+		}
+		// Minimum granularity.
+		return uint64(g.Nanoseconds())
+	}
+
+	// Default granularities. These match the timestamp
+	// precisions in vParquet5 and later block formats.
+	granularities := []time.Duration{
+		time.Hour,
+		5 * time.Minute,
+		time.Minute,
+		15 * time.Second,
+		5 * time.Second,
+		time.Second,
+	}
+
+	for _, g := range granularities {
+		if baseline > g {
+			// Round down to nearest multiple of this granularity.
+			// This means that we err on the side of more data points.
+			rounded := baseline / g * g
+			return uint64(rounded.Nanoseconds())
+		}
+	}
+
+	// Default minimum granularity.
+	return uint64(time.Second.Nanoseconds())
+}
+
+// TrimToBlockOverlap returns the overlap between the given time range and block.  It is used to
+// split a block to only the portion overlapping, or when the entire block is within range then
+// opportunistically remove time slots that are known to be unused.
+// When possible and not exceeding the request range, borders are aligned to the step.
+// When a block is split then the borders will maintain the nanosecond precision of the request.
+func TrimToBlockOverlap(req *tempopb.QueryRangeRequest, blockStart, blockEnd time.Time) (uint64, uint64, uint64) {
+	start := req.Start
+	end := req.End
+	step := req.Step
+
+	// We subtract 1 nanosecond from the block's start time
+	// to make sure we include the left border of the block.
+	start2 := uint64(blockStart.UnixNano()) - 1
+	// Block's endTime is rounded down to the nearest second and considered inclusive.
+	// In order to include the right border with nanoseconds, we add 1 second
+	blockEnd = blockEnd.Add(time.Second)
+	end2 := uint64(blockEnd.UnixNano())
+
+	// Align the block data range to the step. This is because
+	// low-precision timestamps within the block may be rounded up to
+	// this step.  If the boundaries exceed the overall range
+	// they will get trimmed back down.
+	start2 = alignStart(start2, end2, step, IsInstant(req))
+	end2 = alignEnd(start2, end2, step, IsInstant(req))
+
+	// Now trim to the overlap preserving nanosecond precision for
+	// when we split a block.
+	start = max(start, start2)
+	end = min(end, end2)
+
+	// if no instant flag but step is instant, restore it
+	// this can happen during new version rollout
+	if !req.HasInstant() && IsInstant(req) {
+		step = end - start
+	}
+
+	// if had no instant flag set, had no instant step and become instant,
+	// add one nanosecond. This usually happens to small blocks.
+	wasAssumedRange := !req.HasInstant() && !IsInstant(req)
+	willBecomeInstant := (end-start == step)
+	if wasAssumedRange && willBecomeInstant {
+		end++
+	}
+
+	return start, end, step
+}
+
+// TrimToBefore shortens the query window to only include before the given time.
+// Request must be in unix nanoseconds already.
+func TrimToBefore(req *tempopb.QueryRangeRequest, before time.Time) {
+	wasInstant := IsInstant(req)
+	beforeNs := uint64(before.UnixNano())
+
+	req.Start = min(req.Start, beforeNs)
+	req.End = min(req.End, beforeNs)
+	// if has no instant query indicator param, restore step
+	if !req.HasInstant() && wasInstant && !IsInstant(req) {
+		req.Step = req.End - req.Start
+	}
+}
+
+// TrimToAfter shortens the query window to only include after the given time.
+// Request must be in unix nanoseconds already.
+func TrimToAfter(req *tempopb.QueryRangeRequest, before time.Time) {
+	wasInstant := IsInstant(req)
+	beforeNs := uint64(before.UnixNano())
+
+	req.Start = max(req.Start, beforeNs)
+	req.End = max(req.End, beforeNs)
+	// if has no instant query indicator param, restore step
+	if !req.HasInstant() && wasInstant && !IsInstant(req) {
+		req.Step = req.End - req.Start
+	}
+}
+
+// IsInstant returns true if the request is an instant query. It relies on the instant flag.
+// If the flag is not provided, it falls back on determining by step and range.
+// The fallback logic is to provide consistent results during rollout of the instant flag
+// and will be removed in a future release.
+func IsInstant(req *tempopb.QueryRangeRequest) bool {
+	if req == nil {
+		return false
+	}
+	if req.HasInstant() {
+		return req.GetInstant()
+	}
+	// false or no field defined, fallback to old logic.
+	return req.End-req.Start == req.Step
+}
+
+// AlignRequest shifts the start and end times of the request to align with the step
+// interval.  This gives more consistent results across refreshes of queries like "last 1 hour".
+// Without alignment each refresh is shifted by seconds or even milliseconds and the time series
+// calculations are sublty different each time. It's not wrong, but less preferred behavior.
+func AlignRequest(req *tempopb.QueryRangeRequest) {
+	if IsInstant(req) {
+		return
+	}
+
+	// It doesn't really matter but the request fields are expected to be in nanoseconds.
+	req.Start = alignStart(req.Start, req.End, req.Step, false)
+	req.End = alignEnd(req.Start, req.End, req.Step, false)
+
+	if req.Start > req.Step { // to avoid overflow
+		req.Start -= req.Step // force to have additional initial bucket
+	}
+}
+
+func AlignEndToLeft(req *tempopb.QueryRangeRequest) {
+	if IsInstant(req) {
+		return
+	}
+
+	if req.Step == 0 {
+		return
+	}
+
+	mod := req.End % req.Step
+	req.End -= mod
+}
+
+// Start time is rounded down to next step
+func alignStart(start, _, step uint64, instant bool) uint64 {
+	if step == 0 {
+		return 0
+	}
+	if instant {
+		return start
+	}
+
+	return start - start%step
+}
+
+// End time is rounded up to next step
+func alignEnd(_, end, step uint64, instant bool) uint64 {
+	if step == 0 {
+		return 0
+	}
+	if instant {
+		return end
+	}
+
+	mod := end % step
+	if mod == 0 {
+		return end
+	}
+
+	return end + (step - mod)
+}
+
+type Label struct {
+	Name  string
+	Value Static
+}
+
+type Labels []Label
+
+func LabelsFromProto(ls []commonv1proto.KeyValue) Labels {
+	out := make(Labels, 0, len(ls))
+	for _, l := range ls {
+		out = append(out, Label{Name: l.Key, Value: StaticFromAnyValue(l.Value)})
+	}
+	return out
+}
+
+func LabelsFromArgs(args ...any) Labels {
+	if len(args)%2 != 0 {
+		panic("LabelsFromArgs must be called with an even number of arguments")
+	}
+
+	out := make(Labels, 0, len(args)/2)
+
+	for i := 0; i < len(args); i += 2 {
+		name := args[i].(string)
+		var val Static
+		switch arg := args[i+1].(type) {
+		case string:
+			val = NewStaticString(arg)
+		case int:
+			val = NewStaticInt(arg)
+		case float64:
+			val = NewStaticFloat(arg)
+		default:
+			panic(fmt.Sprintf("LabelsFromArgs type not yet supported: %T", arg))
+
+		}
+
+		out = append(out, Label{Name: name, Value: val})
+	}
+
+	return out
+}
+
+func (ls Labels) Has(name string) bool {
+	for _, l := range ls {
+		if l.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+func (ls Labels) GetValue(name string) Static {
+	for _, l := range ls {
+		if l.Name == name {
+			return l.Value
+		}
+	}
+	return NewStaticNil()
+}
+
+// String returns the prometheus-formatted version of the labels. Which is downcasting
+// the typed TraceQL values to strings, with some special casing.
+func (ls Labels) String() string {
+	promLabels := labels.NewBuilder(labels.EmptyLabels())
+	for _, l := range ls {
+		var promValue string
+		switch l.Value.Type {
+		case TypeNil:
+			promValue = "<nil>"
+		case TypeString:
+			s := l.Value.EncodeToString(false)
+			switch s {
+			case "nil":
+				promValue = "<nil>"
+			case "":
+				promValue = "<empty>"
+			default:
+				promValue = s
+			}
+		case TypeInt:
+			promValue = "int(" + l.Value.EncodeToString(false) + ")"
+		default:
+			promValue = l.Value.EncodeToString(false)
+		}
+		promLabels.Set(l.Name, promValue)
+	}
+
+	return promLabels.Labels().String()
+}
+
+func (ls Labels) MapKey() SeriesMapKey {
+	key := SeriesMapKey{}
+	var i int
+	for _, l := range ls {
+		if l.Name == model.MetricNameLabel {
+			continue
+		}
+		key[i] = SeriesMapLabel{Name: l.Name, Value: l.Value.MapKey()}
+		i++
+	}
+	return key
+}
+
+// Add returns a copy of the labels with the given label added to the end.
+func (ls Labels) Add(label Label) Labels {
+	cp := make(Labels, len(ls)+1)
+	copy(cp, ls)
+	cp[len(cp)-1] = label
+	return cp
+}
+
+type Exemplar struct {
+	Labels      Labels
+	Value       float64
+	TimestampMs uint64
+}
+
+type TimeSeries struct {
+	Labels    Labels
+	Values    []float64
+	Exemplars []Exemplar
+}
+
+type SeriesMapLabel struct {
+	Name  string
+	Value StaticMapKey
+}
+
+// One slot beyond maxGroupBys: batchMetricsEvaluator.Results reserves it for the
+// __query_fragment label it adds when a query is one arm of a math expression.
+const maxSeriesMapKeyLabels = maxGroupBys + 1
+
+type SeriesMapKey [maxSeriesMapKeyLabels]SeriesMapLabel
+
+// SeriesSet is a set of unique timeseries. They are mapped by the "Prometheus"-style
+// text description: {x="a",y="b"} for convenience.
+type SeriesSet map[SeriesMapKey]TimeSeries
+
+func (set SeriesSet) ToProto(req *tempopb.QueryRangeRequest) []*tempopb.TimeSeries {
+	mapper := NewIntervalMapperFromReq(req)
+	resp := make([]*tempopb.TimeSeries, 0, len(set))
+
+	for _, s := range set {
+		labels := make([]commonv1proto.KeyValue, 0, len(s.Labels))
+		for _, label := range s.Labels {
+			labels = append(
+				labels,
+				commonv1proto.KeyValue{
+					Key:   label.Name,
+					Value: label.Value.AsAnyValue(),
+				},
+			)
+		}
+
+		intervals := mapper.IntervalCount()
+		samples := make([]tempopb.Sample, 0, intervals)
+		for i, value := range s.Values {
+			// todo: this loop should be able to be restructured to directly pass over
+			// the desired intervals
+			if i >= intervals || math.IsNaN(value) {
+				continue
+			}
+
+			ts := mapper.TimestampOf(i)
+			samples = append(samples, tempopb.Sample{
+				TimestampMs: time.Unix(0, int64(ts)).UnixMilli(),
+				Value:       value,
+			})
+		}
+		// Do not include empty TimeSeries
+		if len(samples) == 0 {
+			continue
+		}
+
+		var exemplars []tempopb.Exemplar
+		if len(s.Exemplars) > 0 {
+			exemplars = make([]tempopb.Exemplar, 0, len(s.Exemplars))
+		}
+		for _, e := range s.Exemplars {
+			// skip exemplars that has NaN value
+			i := mapper.IntervalMs(int64(e.TimestampMs))
+			if i < 0 || i >= len(s.Values) || math.IsNaN(s.Values[i]) { // strict bounds check
+				continue
+			}
+
+			labels := make([]commonv1proto.KeyValue, 0, len(e.Labels))
+			for _, label := range e.Labels {
+				labels = append(
+					labels,
+					commonv1proto.KeyValue{
+						Key:   label.Name,
+						Value: label.Value.AsAnyValue(),
+					},
+				)
+			}
+
+			exemplars = append(exemplars, tempopb.Exemplar{
+				Labels:      labels,
+				Value:       e.Value,
+				TimestampMs: int64(e.TimestampMs),
+			})
+		}
+
+		ss := &tempopb.TimeSeries{
+			Labels:    labels,
+			Samples:   samples,
+			Exemplars: exemplars,
+		}
+
+		resp = append(resp, ss)
+	}
+
+	return resp
+}
+
+// VectorAggregator turns a vector of spans into a single numeric scalar
+type VectorAggregator interface {
+	Observe(s Span)
+	Sample() float64
+}
+
+// RangeAggregator sorts spans into time slots
+// TODO - for efficiency we probably combine this with VectorAggregator (see todo about CountOverTimeAggregator)
+type RangeAggregator interface {
+	Observe(s Span)
+	ObserveExemplar(float64, uint64, Labels)
+	Samples() []float64
+	Exemplars() []Exemplar
+	Length() int
+}
+
+// SpanAggregator sorts spans into series
+type SpanAggregator interface {
+	Observe(Span)
+	ObserveExemplar(Span, float64, uint64)
+	Series() SeriesSet
+	Length() int
+}
+
+// spanExtrapolation returns the per-span sampling multiplier (= 1 / sampling
+// probability) surfaced by the storage layer as IntrinsicSpanMultiplier.
+// Falls back to 1.0 when the storage layer didn't expose a value or it is
+// invalid — callers may safely call this on every span.
+func spanExtrapolation(s Span) float64 {
+	v, ok := s.AttributeFor(IntrinsicSpanMultiplierAttribute)
+	if !ok {
+		return 1.0
+	}
+	f := v.Float()
+	if math.IsNaN(f) || f <= 0 {
+		return 1.0
+	}
+	return f
+}
+
+// CountOverTimeAggregator counts the number of spans. It can also
+// calculate the rate when given a multiplier.
+// TODO - Rewrite me to be []float64 which is more efficient
+type CountOverTimeAggregator struct {
+	count       float64
+	rateMult    float64
+	extrapolate bool
+}
+
+var _ VectorAggregator = (*CountOverTimeAggregator)(nil)
+
+func NewCountOverTimeAggregator() *CountOverTimeAggregator {
+	return &CountOverTimeAggregator{
+		rateMult: 1.0,
+	}
+}
+
+func NewRateAggregator(rateMult float64) *CountOverTimeAggregator {
+	return &CountOverTimeAggregator{
+		rateMult: rateMult,
+	}
+}
+
+// SetExtrapolate toggles per-span sampling extrapolation. When true, each
+// observed span contributes spanExtrapolation(span) instead of 1.
+func (c *CountOverTimeAggregator) SetExtrapolate(extrapolate bool) {
+	c.extrapolate = extrapolate
+}
+
+func (c *CountOverTimeAggregator) Observe(s Span) {
+	if c.extrapolate {
+		// The value returned by spanExtrapolation is already stochastically
+		// rounded at storage decode time when the tracestate carries an
+		// OTEP-235 R-value, so the per-span contribution is integer whenever
+		// the SDK gave us the randomness to make that decision.
+		c.count += spanExtrapolation(s)
+		return
+	}
+	c.count++
+}
+
+func (c *CountOverTimeAggregator) Sample() float64 {
+	return c.count * c.rateMult
+}
+
+// MinOverTimeAggregator it calculates the mininum value over time. It can also
+// calculate the rate when given a multiplier.
+type OverTimeAggregator struct {
+	getSpanAttValue func(s Span) float64
+	agg             func(current, n float64) float64
+	val             float64
+	op              SimpleAggregationOp
+	extrapolate     bool
+}
+
+var _ VectorAggregator = (*OverTimeAggregator)(nil)
+
+func NewOverTimeAggregator(attr Attribute, op SimpleAggregationOp) *OverTimeAggregator {
+	var fn func(s Span) float64
+	var agg func(current, n float64) float64
+
+	switch op {
+	case maxOverTimeAggregation:
+		agg = maxOverTime()
+	case minOverTimeAggregation:
+		agg = minOverTime()
+	case sumOverTimeAggregation:
+		agg = sumOverTime()
+	}
+
+	switch attr {
+	case IntrinsicDurationAttribute:
+		fn = func(s Span) float64 {
+			return float64(s.DurationNanos()) / float64(time.Second)
+		}
+	default:
+		fn = func(s Span) float64 {
+			f, a := FloatizeAttribute(s, attr)
+			if a == TypeNil {
+				return math.Float64frombits(normalNaN)
+			}
+			return f
+		}
+	}
+
+	return &OverTimeAggregator{
+		getSpanAttValue: fn,
+		agg:             agg,
+		val:             math.Float64frombits(normalNaN),
+		op:              op,
+	}
+}
+
+// SetExtrapolate toggles per-span sampling extrapolation. Only applies to
+// sum_over_time; min/max remain unscaled (population extremes don't scale
+// with sampling).
+func (c *OverTimeAggregator) SetExtrapolate(extrapolate bool) {
+	if c.op == sumOverTimeAggregation {
+		c.extrapolate = extrapolate
+	}
+}
+
+func (c *OverTimeAggregator) Observe(s Span) {
+	v := c.getSpanAttValue(s)
+	if c.extrapolate {
+		v *= spanExtrapolation(s)
+	}
+	c.val = c.agg(c.val, v)
+}
+
+func (c *OverTimeAggregator) Sample() float64 {
+	return c.val
+}
+
+// StepAggregator sorts spans into time slots using a step interval like 30s or 1m
+type StepAggregator struct {
+	intervalMapper  IntervalMapper
+	vectors         []VectorAggregator
+	exemplars       []Exemplar
+	exemplarBuckets bucketSet
+}
+
+var _ RangeAggregator = (*StepAggregator)(nil)
+
+func NewStepAggregator(q *tempopb.QueryRangeRequest, innerAgg func() VectorAggregator) *StepAggregator {
+	const instant = false // never used for instant queries
+	mapper := NewIntervalMapper(q.Start, q.End, q.Step, instant)
+	intervals := mapper.IntervalCount()
+	vectors := make([]VectorAggregator, intervals)
+	for i := range vectors {
+		vectors[i] = innerAgg()
+	}
+
+	return &StepAggregator{
+		intervalMapper:  mapper,
+		vectors:         vectors,
+		exemplars:       make([]Exemplar, 0, q.Exemplars),
+		exemplarBuckets: newExemplarBucketSet(q.Exemplars, q.Start, q.End, q.Step, instant),
+	}
+}
+
+func (s *StepAggregator) Observe(span Span) {
+	interval := s.intervalMapper.Interval(span.StartTimeUnixNanos())
+	if interval == -1 {
+		return
+	}
+	s.vectors[interval].Observe(span)
+}
+
+func (s *StepAggregator) ObserveExemplar(value float64, ts uint64, lbls Labels) {
+	if s.exemplarBuckets.testTotal() {
+		return
+	}
+	if s.exemplarBuckets.addAndTest(ts) {
+		return
+	}
+
+	s.exemplars = append(s.exemplars, Exemplar{
+		Labels:      lbls,
+		Value:       value,
+		TimestampMs: ts,
+	})
+}
+
+func (s *StepAggregator) Samples() []float64 {
+	ss := make([]float64, len(s.vectors))
+	for i, v := range s.vectors {
+		ss[i] = v.Sample()
+	}
+	return ss
+}
+
+func (s *StepAggregator) Exemplars() []Exemplar {
+	return s.exemplars
+}
+
+func (s *StepAggregator) Length() int {
+	return 0
+}
+
+// InstantAggregator is similar to StepAggregator but always has only one interval.
+// It's used for instant queries where we only need a single data point.
+type InstantAggregator struct {
+	start, end uint64
+	vector     VectorAggregator
+}
+
+var _ RangeAggregator = (*InstantAggregator)(nil)
+
+func NewInstantAggregator(start, end uint64, innerAgg func() VectorAggregator) *InstantAggregator {
+	return &InstantAggregator{
+		start:  start,
+		end:    end,
+		vector: innerAgg(),
+	}
+}
+
+func (i *InstantAggregator) Observe(span Span) {
+	// if outside the range, skip
+	if ts := span.StartTimeUnixNanos(); ts < i.start || ts > i.end {
+		return
+	}
+	i.vector.Observe(span)
+}
+
+func (i *InstantAggregator) ObserveExemplar(float64, uint64, Labels) {
+	// instant query does not have exemplars, so we skip
+}
+
+func (i *InstantAggregator) Samples() []float64 {
+	return []float64{i.vector.Sample()}
+}
+
+func (i *InstantAggregator) Exemplars() []Exemplar {
+	return nil
+}
+
+func (i *InstantAggregator) Length() int {
+	return 0
+}
+
+const maxGroupBys = 5 // TODO - This isn't ideal but see comment below.
+
+// FastValues is an array of attribute values (static values) that can be used
+// as a map key.  This offers good performance and works with native Go maps and
+// has no chance for collisions (whereas a hash32 has a non-zero chance of
+// collisions).  However, it means we have to arbitrarily set an upper limit on
+// the maximum number of values.
+
+type (
+	FastStatic1 [1]StaticMapKey
+	FastStatic2 [2]StaticMapKey
+	FastStatic3 [3]StaticMapKey
+	FastStatic4 [4]StaticMapKey
+	FastStatic5 [5]StaticMapKey
+)
+
+type FastStatic interface {
+	FastStatic1 | FastStatic2 | FastStatic3 | FastStatic4 | FastStatic5
+}
+
+type (
+	StaticVals1 [1]Static
+	StaticVals2 [2]Static
+	StaticVals3 [3]Static
+	StaticVals4 [4]Static
+	StaticVals5 [5]Static
+)
+
+type StaticVals interface {
+	StaticVals1 | StaticVals2 | StaticVals3 | StaticVals4 | StaticVals5
+}
+
+// GroupingAggregator groups spans into series based on attribute values.
+type GroupingAggregator[F FastStatic, S StaticVals] struct {
+	// Config
+	by          []Attribute               // Original attributes: .foo
+	byLookups   [][]Attribute             // Lookups: span.foo resource.foo
+	byFunc      func(Span) (Static, bool) // Dynamic label calculated by a callback
+	byFuncLabel string                    // Name of the dynamic label
+	innerAgg    func() RangeAggregator
+
+	// Data
+	series     map[F]aggregatorWitValues[S]
+	lastSeries aggregatorWitValues[S]
+	buf        fastStaticWithValues[F, S]
+	lastBuf    fastStaticWithValues[F, S]
+}
+
+type aggregatorWitValues[S StaticVals] struct {
+	agg  RangeAggregator
+	vals S
+}
+
+type fastStaticWithValues[F FastStatic, S StaticVals] struct {
+	fast F
+	vals S
+}
+
+var _ SpanAggregator = (*GroupingAggregator[FastStatic1, StaticVals1])(nil)
+
+func NewGroupingAggregator(aggName string, innerAgg func() RangeAggregator, by []Attribute, byFunc func(Span) (Static, bool), byFuncLabel string) SpanAggregator {
+	if len(by) == 0 && byFunc == nil {
+		return &UngroupedAggregator{
+			name:     aggName,
+			innerAgg: innerAgg(),
+		}
+	}
+
+	lookups := make([][]Attribute, len(by))
+	for i, attr := range by {
+		if attr.Intrinsic == IntrinsicNone && attr.Scope == AttributeScopeNone {
+			// Unscoped attribute. Check span-level, then resource-level.
+			// TODO - Is this taken care of by span.AttributeFor now?
+			lookups[i] = []Attribute{
+				NewScopedAttribute(AttributeScopeSpan, false, attr.Name),
+				NewScopedAttribute(AttributeScopeResource, false, attr.Name),
+			}
+		} else {
+			lookups[i] = []Attribute{attr}
+		}
+	}
+
+	aggNum := len(lookups)
+	if byFunc != nil {
+		aggNum++
+	}
+
+	switch aggNum {
+	case 1:
+		return newGroupingAggregator[FastStatic1, StaticVals1](innerAgg, by, byFunc, byFuncLabel, lookups)
+	case 2:
+		return newGroupingAggregator[FastStatic2, StaticVals2](innerAgg, by, byFunc, byFuncLabel, lookups)
+	case 3:
+		return newGroupingAggregator[FastStatic3, StaticVals3](innerAgg, by, byFunc, byFuncLabel, lookups)
+	case 4:
+		return newGroupingAggregator[FastStatic4, StaticVals4](innerAgg, by, byFunc, byFuncLabel, lookups)
+	case 5:
+		return newGroupingAggregator[FastStatic5, StaticVals5](innerAgg, by, byFunc, byFuncLabel, lookups)
+	default:
+		panic("unsupported number of group-bys")
+	}
+}
+
+func newGroupingAggregator[F FastStatic, S StaticVals](innerAgg func() RangeAggregator, by []Attribute, byFunc func(Span) (Static, bool), byFuncLabel string, lookups [][]Attribute) SpanAggregator {
+	return &GroupingAggregator[F, S]{
+		series:      map[F]aggregatorWitValues[S]{},
+		by:          by,
+		byFunc:      byFunc,
+		byFuncLabel: byFuncLabel,
+		byLookups:   lookups,
+		innerAgg:    innerAgg,
+	}
+}
+
+// getGroupingValues gets the grouping values for the span and stores them in the buffer.
+// Returns false if the span should be dropped.
+func (g *GroupingAggregator[F, S]) getGroupingValues(span Span) bool {
+	// Get grouping values
+	// Reuse same buffer
+	// There is no need to reset, the number of group-by attributes
+	// is fixed after creation.
+	for i, lookups := range g.byLookups {
+		val := lookup(lookups, span)
+		g.buf.vals[i] = val
+		g.buf.fast[i] = val.MapKey()
+	}
+
+	// If dynamic label exists calculate and append it
+	if g.byFunc != nil {
+		v, ok := g.byFunc(span)
+		if !ok {
+			// Totally drop this span
+			return false
+		}
+		g.buf.vals[len(g.byLookups)] = v
+		g.buf.fast[len(g.byLookups)] = v.MapKey()
+	}
+
+	return true
+}
+
+// getSeries gets the series for the current span.
+// It will reuse the last series if possible.
+func (g *GroupingAggregator[F, S]) getSeries() aggregatorWitValues[S] {
+	// Fast path
+	if g.lastSeries.agg != nil && g.lastBuf.fast == g.buf.fast {
+		return g.lastSeries
+	}
+
+	s, ok := g.series[g.buf.fast]
+	if !ok {
+		s.agg = g.innerAgg()
+		s.vals = g.buf.vals
+		g.series[g.buf.fast] = s
+	}
+
+	g.lastBuf = g.buf
+	g.lastSeries = s
+	return s
+}
+
+// Observe the span by looking up its group-by attributes, mapping to the series,
+// and passing to the inner aggregate.  This is a critical hot path.
+func (g *GroupingAggregator[F, S]) Observe(span Span) {
+	if !g.getGroupingValues(span) {
+		return
+	}
+
+	s := g.getSeries()
+	s.agg.Observe(span)
+}
+
+func (g *GroupingAggregator[F, S]) ObserveExemplar(span Span, value float64, ts uint64) {
+	if !g.getGroupingValues(span) {
+		return
+	}
+
+	s := g.getSeries()
+
+	// Observe exemplar
+	all := span.AllAttributes()
+	lbls := make(Labels, 0, len(all))
+	for k, v := range span.AllAttributes() {
+		lbls = append(lbls, Label{k.String(), v})
+	}
+	s.agg.ObserveExemplar(value, ts, lbls)
+}
+
+func (g *GroupingAggregator[F, S]) Length() int {
+	return len(g.series)
+}
+
+// labelsFor gives the final labels for the series. Slower and not on the hot path.
+// This is tweaked to match what prometheus does where possible with an exception.
+// In the case of all values missing.
+// (1) Standard case: a label is created for each group-by value in the series:
+//
+//	Ex: rate() by (x,y) can yield:
+//	{x=a,y=b}
+//	{x=c,y=d}
+//	etc
+//
+// (2) Nils are dropped. A nil can be present for any label, so any combination
+// of the remaining labels is possible. Label order is preserved.
+//
+//	Ex: rate() by (x,y,z) can yield all of these combinations:
+//	{x=..., y=..., z=...}
+//	{x=...,        z=...}
+//	{x=...              }
+//	{       y=..., z=...}
+//	{       y=...       }
+//	etc
+//
+// (3) Exceptional case: All Nils. For the TraceQL data-type aware labels we still drop
+// all nils which results in an empty label set. But Prometheus-style always have
+// at least 1 label, so in that case we have to force at least 1 label or else things
+// may not be handled correctly downstream.  In this case we take the first label and
+// make it the string "nil"
+//
+//	Ex: rate() by (x,y,z) and all nil yields:
+//	{x="nil"}
+func (g *GroupingAggregator[F, S]) labelsFor(vals S) (Labels, SeriesMapKey) {
+	labels := make(Labels, 0, len(g.by)+1)
+	for i := range g.by {
+		if vals[i].Type == TypeNil {
+			continue
+		}
+		labels = append(labels, Label{g.by[i].String(), vals[i]})
+	}
+	if g.byFunc != nil {
+		labels = append(labels, Label{g.byFuncLabel, vals[len(g.by)]})
+	}
+
+	if len(labels) == 0 {
+		// When all nil then force one
+		labels = append(labels, Label{g.by[0].String(), NewStaticNil()})
+	}
+
+	return labels, labels.MapKey()
+}
+
+func (g *GroupingAggregator[F, S]) Series() SeriesSet {
+	ss := SeriesSet{}
+
+	for _, s := range g.series {
+		labels, key := g.labelsFor(s.vals)
+
+		ss[key] = TimeSeries{
+			Labels:    labels,
+			Values:    s.agg.Samples(),
+			Exemplars: s.agg.Exemplars(),
+		}
+	}
+
+	return ss
+}
+
+// UngroupedAggregator builds a single series with no labels. e.g. {} | rate()
+type UngroupedAggregator struct {
+	name     string
+	innerAgg RangeAggregator
+}
+
+var _ SpanAggregator = (*UngroupedAggregator)(nil)
+
+func (u *UngroupedAggregator) Observe(span Span) {
+	u.innerAgg.Observe(span)
+}
+
+func (u *UngroupedAggregator) ObserveExemplar(span Span, value float64, ts uint64) {
+	all := span.AllAttributes()
+	lbls := make(Labels, 0, len(all))
+	for k, v := range all {
+		lbls = append(lbls, Label{k.String(), v})
+	}
+	u.innerAgg.ObserveExemplar(value, ts, lbls)
+}
+
+func (u *UngroupedAggregator) Length() int {
+	return 0
+}
+
+// Series output.
+// This is tweaked to match what prometheus does.  For ungrouped metrics we
+// fill in a placeholder metric name with the name of the aggregation.
+// rate() => {__name__=rate}
+func (u *UngroupedAggregator) Series() SeriesSet {
+	labels := LabelsFromArgs(model.MetricNameLabel, u.name)
+
+	return SeriesSet{
+		labels.MapKey(): {
+			Labels:    labels,
+			Values:    u.innerAgg.Samples(),
+			Exemplars: u.innerAgg.Exemplars(),
+		},
+	}
+}
+
+func (e *Engine) CompileMetricsQueryRangeNonRaw(req *tempopb.QueryRangeRequest, mode AggregateMode, opts ...CompileOption) (*MetricsFrontendEvaluator, error) {
+	if req.Exemplars > maxExemplars {
+		level.Warn(log.Logger).Log("msg", "capping exemplars to safety limit", "requested", req.Exemplars, "cap", maxExemplars)
+		req.Exemplars = maxExemplars
+	}
+
+	if req.Start <= 0 {
+		return nil, fmt.Errorf("start required")
+	}
+	if req.End <= 0 {
+		return nil, fmt.Errorf("end required")
+	}
+	if req.End <= req.Start {
+		return nil, fmt.Errorf("end must be greater than start")
+	}
+	if req.Step <= 0 {
+		return nil, fmt.Errorf("step required")
+	}
+
+	expr, err := Parse(req.Query, opts...)
+	if err != nil {
+		return nil, fmt.Errorf("compiling query: %w", err)
+	}
+	if err := expr.validate(); err != nil {
+		return nil, fmt.Errorf("compiling query: %w", err)
+	}
+
+	sp := batchSeriesProcessor(expr.SeriesProcessor)
+	if len(sp) == 0 {
+		return nil, fmt.Errorf("not a metrics query")
+	}
+	sp.init(req, mode)
+
+	// Only run second stage in final mode
+	var secondStage secondStageElement
+	if ss := expr.MetricsSecondStage(); mode == AggregateModeFinal && ss != nil {
+		ss.init(req)
+		secondStage = ss
+	}
+
+	return &MetricsFrontendEvaluator{
+		seriesProcessor:    sp,
+		metricsSecondStage: secondStage,
+	}, nil
+}
+
+// metricsPipelineExtrapolator is implemented by metrics pipelines that
+// support per-span sampling extrapolation.
+type metricsPipelineExtrapolator interface {
+	SetExtrapolate(bool)
+}
+
+// applyExtrapolation toggles per-span extrapolation on the pipeline if it
+// supports it, and adds the multiplier intrinsic to the storage request so
+// the storage layer surfaces it. Must be called before sp.init().
+func applyExtrapolation(pipeline spanProcessor, req *FetchSpansRequest) {
+	if ext, ok := pipeline.(metricsPipelineExtrapolator); ok {
+		ext.SetExtrapolate(true)
+	}
+	if !req.HasAttribute(IntrinsicSpanMultiplierAttribute) {
+		req.SecondPassConditions = append(req.SecondPassConditions, Condition{
+			Attribute: IntrinsicSpanMultiplierAttribute,
+		})
+	}
+}
+
+// CompileMetricsQueryRange returns an evaluator that can be reused across multiple data sources.
+func (e *Engine) CompileMetricsQueryRange(req *tempopb.QueryRangeRequest, opts ...CompileOption) (MetricsEvaluator, error) {
+	cfg := applyCompileOptions(opts...)
+
+	if req.Start <= 0 {
+		return nil, fmt.Errorf("start required")
+	}
+	if req.End <= 0 {
+		return nil, fmt.Errorf("end required")
+	}
+	if req.End <= req.Start {
+		return nil, fmt.Errorf("end must be greater than start")
+	}
+	if req.Step <= 0 {
+		return nil, fmt.Errorf("step required")
+	}
+
+	expr, storageReqs, err := CompileFetchSpanRequests(req.Query, opts...)
+	if err != nil {
+		return nil, fmt.Errorf("compiling query: %w", err)
+	}
+
+	// distribute exemplars for each sub-query
+	exemplarsCapacity := int(req.Exemplars)
+	if req.Exemplars > maxExemplars {
+		level.Warn(log.Logger).Log("msg", "capping exemplars to safety limit", "requested", req.Exemplars, "cap", maxExemplars)
+		exemplarsCapacity = int(maxExemplars)
+	}
+	exemplars := exemplarsCapacity / len(expr.Pipeline)
+	if exemplarsCapacity > 0 && exemplars == 0 {
+		exemplars = 1 // at least one per sub-query when exemplars are requested
+	}
+
+	// Watchers are scoped to this Compile call. EngineBytesWatcher is installed fresh when enabled via
+	// WithEngineBytesTracking; additional watchers come from WithWatchers (e.g. per-tenant overrides).
+	// Access to watchers is synchronized by each metricsEvaluator's own (optional) lock; see WithLock.
+	watchers := &spanWatchers{}
+	if cfg.engineBytesTracking {
+		watchers.Add(NewEngineBytesWatcher())
+	}
+	watchers.Add(cfg.watchers...)
+
+	// Per-span sampling extrapolation. Hint in the query takes precedence
+	// over the default passed in via WithExtrapolation. Must apply before
+	// sp.init() so inner aggregators capture the flag.
+	extrapolate := false
+	if cfg.extrapolate != nil {
+		extrapolate = *cfg.extrapolate
+	}
+	if b, ok := expr.Hints.GetBool(HintExtrapolate, cfg.allowUnsafeHints); ok {
+		extrapolate = b
+	}
+
+	bme := &batchMetricsEvaluator{
+		evals:    make(map[string]*metricsEvaluator, len(expr.Pipeline)),
+		watchers: watchers,
+	}
+	for key, pipeline := range expr.Pipeline {
+		sp := expr.BatchSpanProcessor[key]
+		if sp == nil {
+			return nil, fmt.Errorf("not a metrics query")
+		}
+
+		storageReq := storageReqs[key]
+
+		if extrapolate {
+			applyExtrapolation(sp, &storageReq)
+		}
+
+		// This initializes all step buffers, counters, etc
+		sp.init(req, AggregateModeRaw)
+
+		e.applySampleHints(expr, pipeline, &storageReq, cfg.allowUnsafeHints)
+
+		exemplars := exemplars
+		if exemplarsCapacity < 0 {
+			exemplars = 0
+		} else {
+			exemplarsCapacity -= exemplars
+		}
+
+		me := &metricsEvaluator{
+			storageReq:        &storageReq,
+			metricsPipeline:   sp,
+			timeOverlapCutoff: cfg.timeOverlapCutoff,
+			maxExemplars:      exemplars,
+			exemplarMap:       make(map[string]struct{}, exemplars), // TODO: Lazy, use bloom filter, CM sketch or something
+			needsFullTrace:    NeedsFullTrace(pipeline),
+			mtx:               cfg.lock,
+		}
+
+		// Determine usage of new fetch layer.
+		// Hint in the query takes precedence over passed in options which are hard-coded or from tenant config.
+		me.spanOnlyFetch = true
+		if cfg.spanOnlyFetch != nil {
+			me.spanOnlyFetch = *cfg.spanOnlyFetch
+		}
+		if b, ok := expr.Hints.GetBool(HintNewFetch, cfg.allowUnsafeHints); ok {
+			me.spanOnlyFetch = b
+		}
+
+		// If the request range is fully aligned to the step, then we can use lower
+		// precision data that matches the step while still returning accurate results.
+		// When the range isn't an even multiple, it means that we are on the split
+		// between backend and recent data, or the edges of the request. In that case
+		// we use full nanosecond precision.
+		var precision time.Duration
+		if (req.Start%req.Step) == 0 && (req.End%req.Step) == 0 {
+			precision = time.Duration(req.Step)
+		}
+
+		// Span start time (always required)
+		if !storageReq.HasAttribute(IntrinsicSpanStartTimeAttribute) {
+			// Technically we only need the start time of matching spans, so we add it to the second pass.
+			// However this is often optimized back to the first pass when it lets us avoid a second pass altogether.
+			storageReq.SecondPassConditions = append(storageReq.SecondPassConditions, Condition{Attribute: IntrinsicSpanStartTimeAttribute, Precision: precision})
+		} else {
+			// Update the existing condition to use low precision
+			for i, c := range storageReq.Conditions {
+				if c.Attribute == IntrinsicSpanStartTimeAttribute {
+					storageReq.Conditions[i].Precision = precision
+					break
+				}
+			}
+		}
+
+		// Timestamp filtering
+		// (1) Include any overlapping trace
+		//     It can be faster to skip the trace-level timestamp check
+		//     when all or most of the traces overlap the window.
+		//     So this is done dynamically on a per-fetcher basis in Do()
+		// (2) Only include spans that started in this time frame.
+		//     This is checked outside the fetch layer in the evaluator. Timestamp
+		//     is only checked on the spans that are the final results.
+		// TODO - I think there are cases where we can push this down.
+		// Queries like {status=error} | rate() don't assert inter-span conditions
+		// and we could filter on span start time without affecting correctness.
+		// Queries where we can't are like:  {A} >> {B} | rate() because only require
+		// that {B} occurs within our time range but {A} is allowed to occur any time.
+		me.checkTime = true
+		me.start = req.Start
+		me.end = req.End
+
+		if me.maxExemplars > 0 {
+			cb := func() bool { return me.exemplarCount < me.maxExemplars }
+			meta := ExemplarMetaConditionsWithout(cb, storageReq.SecondPassConditions, storageReq.AllConditions)
+			storageReq.SecondPassConditions = append(storageReq.SecondPassConditions, meta...)
+		}
+
+		// Share the request's watchers and load their attributes via the second pass.
+		// This keeps optimize() from eliminating the second pass while a watcher is active.
+		// Watching happens in Do/DoSpansOnly on the final matched spans.
+		me.watchers = watchers
+		if watchers.Active() {
+			storageReq.SecondPassConditions = append(storageReq.SecondPassConditions, watchers.Conditions()...)
+		}
+
+		// Setup second pass callback.  It might be optimized away
+		storageReq.SecondPass = func(s *Spanset) ([]*Spanset, error) {
+			if s == nil || len(s.Spans) == 0 {
+				return nil, nil
+			}
+			// The traceql engine isn't thread-safe.
+			// But parallelization is required for good metrics performance.
+			// So we do external locking here, when needed (see WithLock).
+			if me.mtx != nil {
+				me.mtx.Lock()
+				defer me.mtx.Unlock()
+			}
+			return pipeline.evaluate([]*Spanset{s})
+		}
+
+		optimize(&storageReq)
+		bme.evals[key] = me
+	}
+
+	return bme, nil
+}
+
+func (e *Engine) applySampleHints(expr *RootExpr, pipeline Pipeline, req *FetchSpansRequest, allowUnsafeHints bool) {
+	// Debug sampling hints, remove once we settle on approach.
+	if traceSample, traceSampleOk := expr.Hints.GetFloat(HintTraceSample, allowUnsafeHints); traceSampleOk {
+		req.TraceSampler = newProbablisticSampler(traceSample)
+	}
+	if spanSample, spanSampleOk := expr.Hints.GetFloat(HintSpanSample, allowUnsafeHints); spanSampleOk {
+		req.SpanSampler = newProbablisticSampler(spanSample)
+	}
+
+	if sample, sampleOk := expr.Hints.GetBool(HintSample, allowUnsafeHints); sampleOk && sample {
+		// Automatic sampling
+		// Get other params
+		s := newAdaptiveSampler()
+		if debug, ok := expr.Hints.GetBool(HintDebug, allowUnsafeHints); ok {
+			s.debug = debug
+		}
+		if info, ok := expr.Hints.GetBool(HintInfo, allowUnsafeHints); ok {
+			s.info = info
+		}
+
+		// Classify the query and determine if it needs to be at the trace-level or can be at span-level (better)
+		if NeedsFullTrace(pipeline) {
+			req.TraceSampler = s
+		} else {
+			req.SpanSampler = s
+		}
+	}
+
+	if sampleFraction, ok := expr.Hints.GetFloat(HintSample, allowUnsafeHints); ok && sampleFraction > 0 && sampleFraction < 1 {
+		// Fixed sampling rate.
+		s := newProbablisticSampler(sampleFraction)
+
+		// Classify the query and determine if it needs to be at the trace-level or can be at span-level (better)
+		if NeedsFullTrace(pipeline) {
+			req.TraceSampler = s
+		} else {
+			req.SpanSampler = s
+		}
+	}
+}
+
+// optimize numerous things within the request that is specific to metrics.
+func optimize(req *FetchSpansRequest) {
+	if !req.AllConditions || req.SecondPassSelectAll {
+		return
+	}
+
+	// Unscoped attributes like .foo require the second pass to evaluate
+	for _, c := range req.Conditions {
+		if c.Attribute.Scope == AttributeScopeNone && c.Attribute.Intrinsic == IntrinsicNone {
+			// Unscoped (non-intrinsic) attribute
+			return
+		}
+	}
+
+	// There is an issue where multiple conditions &&'ed on the same
+	// attribute can look like AllConditions==true, but are implemented
+	// in the storage layer like ||'ed and require the second pass callback (engine).
+	// TODO(mdisibio) - This would be a big performance improvement if we can fix the storage layer
+	// Example:
+	//   { span.http.status_code >= 500 && span.http.status_code < 600 } | rate() by (span.http.status_code)
+	exists := make(map[Attribute]struct{}, len(req.Conditions))
+	for _, c := range req.Conditions {
+		if _, ok := exists[c.Attribute]; ok {
+			// Don't optimize
+			return
+		}
+		exists[c.Attribute] = struct{}{}
+	}
+
+	// Special optimization for queries like:
+	//  {} | rate()
+	//  {} | rate() by (rootName)
+	//  {} | rate() by (resource.service.name)
+	// When the second pass consists only of intrinsics, then it's possible to
+	// move them to the first pass and increase performance. It avoids the second pass/bridge
+	// layer and doesn't alter the correctness of the query.
+	// This can't be done for plain attributes or in all cases.
+	if len(req.SecondPassConditions) > 0 {
+		if !allIntrinsics(req.SecondPassConditions) {
+			// Cannot move them.
+			return
+		}
+
+		// Move all to first pass
+		req.Conditions = append(req.Conditions, req.SecondPassConditions...)
+		req.SecondPassConditions = nil
+	}
+
+	// If the remaining first layer is a single condition, then we can
+	// eliminate the callback.
+	if len(req.Conditions) == 1 {
+		req.SecondPass = nil
+		return
+	}
+
+	// Finally if the entire remaining first layer is intrinsics, then we can
+	// elmininate the callback.
+	// TODO(mdisibio): We can't eliminate the callback if other conditions exist, despite AllConditions, because the storage layer
+	// doesn't strictly honor AllConditions for multiple attributes of the same type in the shared columns.
+	// For example: { span.string_a = "foo" && span.string_b = "bar" } | rate()
+	// This query requires the callback to assert the attributes correctly.
+	// Dedicated columns aren't affected but we don't have the information to distinguish that here.
+	if len(req.Conditions) > 0 && allIntrinsics(req.Conditions) {
+		req.SecondPass = nil
+	}
+}
+
+func allIntrinsics(conds []Condition) bool {
+	for _, cond := range conds {
+		if cond.Attribute.Intrinsic != IntrinsicNone {
+			continue
+		}
+
+		// This is a very special case. resource.service.name is also always present
+		// (required by spec) so it can be moved too.
+		if cond.Attribute.Scope == AttributeScopeResource && cond.Attribute.Name == "service.name" {
+			continue
+		}
+
+		// Anything else is not an intrinsic
+		return false
+	}
+	return true
+}
+
+func lookup(needles []Attribute, haystack Span) Static {
+	for _, n := range needles {
+		if v, ok := haystack.AttributeFor(n); ok {
+			return v
+		}
+	}
+
+	return NewStaticNil()
+}
+
+type MetricsEvaluator interface {
+	Do(ctx context.Context, f SpansetFetcher, fetcherStart, fetcherEnd uint64, maxSeries int) error
+	Length() int
+	Metrics() EvaluatorMetrics
+	Results() SeriesSet
+}
+
+// batchMetricsEvaluator runs one metricsEvaluator per sub-pipeline of a query
+// and is itself the request-scoped object returned by CompileMetricsQueryRange.
+type batchMetricsEvaluator struct {
+	evals map[string]*metricsEvaluator
+	// watchers collect extra on-demand metrics for the whole request.
+	// A single shared instance is fed every matched span from every sub-pipeline
+	watchers *spanWatchers
+}
+
+var _ MetricsEvaluator = (*batchMetricsEvaluator)(nil)
+
+func (e *batchMetricsEvaluator) Do(ctx context.Context, f SpansetFetcher, fetcherStart, fetcherEnd uint64, maxSeries int) error {
+	for _, eval := range e.evals {
+		if err := eval.Do(ctx, f, fetcherStart, fetcherEnd, maxSeries); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (e *batchMetricsEvaluator) Length() int {
+	var total int
+	for _, eval := range e.evals {
+		total += eval.Length()
+	}
+	return total
+}
+
+func (e *batchMetricsEvaluator) Metrics() EvaluatorMetrics {
+	var combined EvaluatorMetrics
+	addMetric := func(k string, v int64) {
+		if combined.AdditionalMetrics == nil {
+			combined.AdditionalMetrics = make(map[string]int64)
+		}
+		combined.AdditionalMetrics[k] += v
+	}
+	for _, eval := range e.evals {
+		m := eval.Metrics()
+		combined.Bytes += m.Bytes
+		combined.SpansTotal += m.SpansTotal
+		combined.SpansDeduped += m.SpansDeduped
+		combined.BackendReads += m.BackendReads
+		combined.BackendBytes += m.BackendBytes
+		for k, v := range m.AdditionalMetrics {
+			addMetric(k, v)
+		}
+	}
+
+	for k, v := range e.watchers.Stats() {
+		addMetric(k, v)
+	}
+	return combined
+}
+
+func (e *batchMetricsEvaluator) Results() SeriesSet {
+	if len(e.evals) == 1 {
+		for _, eval := range e.evals {
+			return eval.Results()
+		}
+	}
+
+	merged := make(SeriesSet)
+	for q, eval := range e.evals {
+		for _, v := range eval.Results() {
+			v.Labels = v.Labels.Add(Label{Name: internalLabelQueryFragment, Value: NewStaticString(q)})
+			merged[v.Labels.MapKey()] = v
+		}
+	}
+	return merged
+}
+
+type metricsEvaluator struct {
+	start, end                      uint64
+	checkTime                       bool
+	needsFullTrace                  bool
+	spanOnlyFetch                   bool
+	maxExemplars, exemplarCount     int
+	exemplarMap                     map[string]struct{}
+	timeOverlapCutoff               float64
+	storageReq                      *FetchSpansRequest
+	metricsPipeline                 spanProcessor
+	spansTotal, spansDeduped, bytes uint64
+	// Accumulated FetchSpansStats across all blocks fetched by this evaluator.
+	// Per-role maps are flattened into scalars.
+	backendReads      uint64
+	backendBytes      uint64
+	additionalMetrics map[string]int64
+	watchers          *spanWatchers
+	mtx               *sync.Mutex
+}
+
+// EvaluatorMetrics is the snapshot returned by MetricsEvaluator.Metrics().
+type EvaluatorMetrics struct {
+	Bytes             uint64
+	SpansTotal        uint64
+	SpansDeduped      uint64
+	BackendReads      uint64
+	BackendBytes      uint64
+	AdditionalMetrics map[string]int64
+}
+
+var _ = MetricsEvaluator(&metricsEvaluator{})
+
+func (e *metricsEvaluator) FetchSpansRequest() FetchSpansRequest {
+	return *e.storageReq
+}
+
+func timeRangeOverlap(reqStart, reqEnd, dataStart, dataEnd uint64) float64 {
+	st := max(reqStart, dataStart)
+	end := min(reqEnd, dataEnd)
+
+	if end <= st {
+		return 0
+	}
+
+	return float64(end-st) / float64(dataEnd-dataStart)
+}
+
+// Do metrics on the given source of data and merge the results into the working set.  Optionally, if provided,
+// uses the known time range of the data for last-minute optimizations. Time range is unix nanos
+
+func (e *metricsEvaluator) Do(ctx context.Context, f SpansetFetcher, fetcherStart, fetcherEnd uint64, maxSeries int) error {
+	if !e.needsFullTrace && e.spanOnlyFetch {
+		// The query can operate at a span level so attempt.
+		// This is faster. If not supported then fallback to spanset level.
+		err := e.DoSpansOnly(ctx, f, fetcherStart, fetcherEnd, maxSeries)
+		if !errors.Is(err, util.ErrUnsupported) {
+			// We ran successfully or some other error.
+			// In the case of unsupported, keep going and use original SpansetFetcher.
+			return err
+		}
+	}
+
+	// Make a copy of the request so we can modify it.
+	storageReq := *e.storageReq
+
+	if fetcherStart > 0 && fetcherEnd > 0 &&
+		// exclude special case for a block with the same start and end
+		fetcherStart != fetcherEnd {
+		// Dynamically decide whether to use the trace-level timestamp columns
+		// for filtering.
+		overlap := timeRangeOverlap(e.start, e.end, fetcherStart, fetcherEnd)
+
+		if overlap == 0.0 {
+			// This shouldn't happen but might as well check.
+			// No overlap == nothing to do
+			return nil
+		}
+
+		// Our heuristic is if the overlap between the given fetcher (i.e. block)
+		// and the request is less than X%, use them.  Above X%, the cost of loading
+		// them doesn't outweight the benefits. The default 20% was measured in
+		// local benchmarking.
+		if overlap < e.timeOverlapCutoff {
+			storageReq.StartTimeUnixNanos = e.start
+			storageReq.EndTimeUnixNanos = e.end // Should this be exclusive?
+		}
+	}
+
+	fetch, err := f.Fetch(ctx, storageReq)
+	if errors.Is(err, util.ErrUnsupported) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+
+	defer fetch.Results.Close()
+
+	seriesCount := 0
+	if e.mtx != nil {
+		e.mtx.Lock()
+	}
+	watch := e.watchers.Active()
+	if e.mtx != nil {
+		e.mtx.Unlock()
+	}
+
+	for {
+		ss, err := fetch.Results.Next(ctx)
+		if err != nil {
+			return err
+		}
+		if ss == nil {
+			break
+		}
+
+		if e.mtx != nil {
+			e.mtx.Lock()
+		}
+
+		if e.storageReq.TraceSampler != nil {
+			e.storageReq.TraceSampler.Measured()
+		}
+
+		var validSpansCount int
+		var randomSpanIndex int
+
+		needExemplar := e.maxExemplars > 0 && e.sampleExemplar(ss.TraceID)
+
+		for i, s := range ss.Spans {
+
+			if e.checkTime {
+				st := s.StartTimeUnixNanos()
+				if st <= e.start || st > e.end {
+					continue
+				}
+			}
+
+			if e.storageReq.SpanSampler != nil {
+				e.storageReq.SpanSampler.Measured()
+			}
+
+			validSpansCount++
+			e.metricsPipeline.observe(s)
+			if watch {
+				watch = e.watchers.WatchSpan(s)
+			}
+
+			if !needExemplar {
+				continue
+			}
+
+			// Reservoir sampling - select a random span for exemplar
+			// Each span has a 1/validSpansCount probability of being selected
+			if validSpansCount == 1 || rand.Intn(validSpansCount) == 0 {
+				randomSpanIndex = i
+			}
+		}
+		e.spansTotal += uint64(validSpansCount)
+
+		if needExemplar && validSpansCount > 0 {
+			e.metricsPipeline.observeExemplar(ss.Spans[randomSpanIndex])
+		}
+
+		seriesCount = e.metricsPipeline.length()
+
+		if e.mtx != nil {
+			e.mtx.Unlock()
+		}
+		ss.Release()
+
+		if maxSeries > 0 && seriesCount >= maxSeries {
+			break
+		}
+	}
+
+	if e.mtx != nil {
+		e.mtx.Lock()
+		defer e.mtx.Unlock()
+	}
+	if fetch.Stats != nil {
+		e.accumulateFetchStats(fetch.Stats())
+	}
+
+	return nil
+}
+
+// DoSpansOnly is the same as Do but using the new span-only fetch layer.
+func (e *metricsEvaluator) DoSpansOnly(ctx context.Context, f SpansetFetcher, fetcherStart, fetcherEnd uint64, maxSeries int) error {
+	// Make a copy of the request so we can modify it.
+	storageReq := *e.storageReq
+
+	if fetcherStart > 0 && fetcherEnd > 0 &&
+		// exclude special case for a block with the same start and end
+		fetcherStart != fetcherEnd {
+		// Dynamically decide whether to use the trace-level timestamp columns
+		// for filtering.
+		overlap := timeRangeOverlap(e.start, e.end, fetcherStart, fetcherEnd)
+
+		if overlap == 0.0 {
+			// This shouldn't happen but might as well check.
+			// No overlap == nothing to do
+			return nil
+		}
+
+		// Our heuristic is if the overlap between the given fetcher (i.e. block)
+		// and the request is less than X%, use them.  Above X%, the cost of loading
+		// them doesn't outweight the benefits. The default 20% was measured in
+		// local benchmarking.
+		if overlap < e.timeOverlapCutoff {
+			storageReq.StartTimeUnixNanos = e.start
+			storageReq.EndTimeUnixNanos = e.end // Should this be exclusive?
+		}
+	}
+
+	fetch, err := f.FetchSpans(ctx, storageReq)
+	if err != nil {
+		return err
+	}
+
+	defer fetch.Results.Close()
+
+	if e.mtx != nil {
+		e.mtx.Lock()
+	}
+	watch := e.watchers.Active()
+	if e.mtx != nil {
+		e.mtx.Unlock()
+	}
+
+	for {
+		done, err := func() (done bool, err error) {
+			s, err := fetch.Results.Next(ctx)
+			if err != nil {
+				return true, err
+			}
+			if s == nil {
+				return true, nil
+			}
+
+			// Acquire lock while doing engine work, if required. It is
+			// not required above while doing storage work.
+			if e.mtx != nil {
+				e.mtx.Lock()
+				defer e.mtx.Unlock()
+			}
+
+			if e.checkTime {
+				st := s.StartTimeUnixNanos()
+				if st <= e.start || st > e.end {
+					return false, nil
+				}
+			}
+
+			if e.storageReq.SpanSampler != nil {
+				e.storageReq.SpanSampler.Measured()
+			}
+
+			e.metricsPipeline.observe(s)
+			if watch {
+				watch = e.watchers.WatchSpan(s)
+			}
+			e.spansTotal++
+
+			if e.maxExemplars > 0 && e.exemplarCount < e.maxExemplars {
+				traceID, ok := s.AttributeFor(IntrinsicTraceIDAttribute)
+				if ok {
+					if e.sampleExemplar(traceID.valBytes) {
+						e.metricsPipeline.observeExemplar(s)
+					}
+				}
+			}
+
+			if maxSeries > 0 && e.metricsPipeline.length() >= maxSeries {
+				return true, nil
+			}
+			return
+		}()
+		if err != nil {
+			return err
+		}
+		if done {
+			break
+		}
+	}
+
+	if e.mtx != nil {
+		e.mtx.Lock()
+		defer e.mtx.Unlock()
+	}
+	if fetch.Stats != nil {
+		e.accumulateFetchStats(fetch.Stats())
+	}
+
+	return nil
+}
+
+func (e *metricsEvaluator) Length() int {
+	if e.mtx != nil {
+		e.mtx.Lock()
+		defer e.mtx.Unlock()
+	}
+	return e.metricsPipeline.length()
+}
+
+// Metrics returns a snapshot of the accumulated read-side stats from every
+// fetch this evaluator has consumed. Callers MUST hold no locks on e.mtx.
+func (e *metricsEvaluator) Metrics() EvaluatorMetrics {
+	if e.mtx != nil {
+		e.mtx.Lock()
+		defer e.mtx.Unlock()
+	}
+
+	var additional map[string]int64
+	if len(e.additionalMetrics) > 0 {
+		additional = make(map[string]int64, len(e.additionalMetrics))
+		for k, v := range e.additionalMetrics {
+			additional[k] = v
+		}
+	}
+	return EvaluatorMetrics{
+		Bytes:             e.bytes,
+		SpansTotal:        e.spansTotal,
+		SpansDeduped:      e.spansDeduped,
+		BackendReads:      e.backendReads,
+		BackendBytes:      e.backendBytes,
+		AdditionalMetrics: additional,
+	}
+}
+
+// accumulateFetchStats merges one fetch's stats into the evaluator. Caller
+// must hold e.mtx.
+func (e *metricsEvaluator) accumulateFetchStats(s FetchSpansStats) {
+	e.bytes += s.Bytes
+	for _, v := range s.BackendReadsByRole {
+		e.backendReads += v
+	}
+	for _, v := range s.BackendBytesByRole {
+		e.backendBytes += v
+	}
+
+	var cacheHits, cacheMisses, cacheBytes uint64
+	for _, v := range s.CacheHitsByRole {
+		cacheHits += v
+	}
+	for _, v := range s.CacheMissesByRole {
+		cacheMisses += v
+	}
+	for _, v := range s.CacheBytesByRole {
+		cacheBytes += v
+	}
+
+	addIfNonZero := func(key string, v uint64) {
+		if v == 0 {
+			return
+		}
+		if e.additionalMetrics == nil {
+			e.additionalMetrics = map[string]int64{}
+		}
+		e.additionalMetrics[key] += int64(v)
+	}
+	addIfNonZero(tempopb.AdditionalMetricRowGroupsInspected, uint64(s.RowGroupsInspected))
+	addIfNonZero(tempopb.AdditionalMetricRowGroupsSkipped, uint64(s.RowGroupsSkipped))
+	addIfNonZero(tempopb.AdditionalMetricPagesInspected, uint64(s.PagesInspected))
+	addIfNonZero(tempopb.AdditionalMetricPagesSkipped, uint64(s.PagesSkipped))
+	addIfNonZero(tempopb.AdditionalMetricCacheHits, cacheHits)
+	addIfNonZero(tempopb.AdditionalMetricCacheMisses, cacheMisses)
+	addIfNonZero(tempopb.AdditionalMetricCacheBytes, cacheBytes)
+}
+
+func (e *metricsEvaluator) Results() SeriesSet {
+	if e.mtx != nil {
+		e.mtx.Lock()
+		defer e.mtx.Unlock()
+	}
+
+	spanMultiplier := 1.0
+	if e.storageReq.SpanSampler != nil {
+		spanMultiplier = e.storageReq.SpanSampler.FinalScalingFactor()
+	}
+	traceMultiplier := 1.0
+	if e.storageReq.TraceSampler != nil {
+		traceMultiplier = e.storageReq.TraceSampler.FinalScalingFactor()
+	}
+
+	multiplier := spanMultiplier * traceMultiplier
+
+	// NOTE: skip processing of second stage because not all first stage functions can't be pushed down.
+	// for example: if query has avg_over_time(), then we can't push it down to second stage, and second stage
+	// can only be processed on the frontend.
+	// we could do this but it would require knowing if the first stage functions
+	// can be pushed down to second stage or not so we are skipping it for now, and will handle it later.
+	ss := e.metricsPipeline.result(multiplier)
+
+	return ss
+}
+
+func (e *metricsEvaluator) sampleExemplar(id []byte) bool {
+	if len(e.exemplarMap) >= e.maxExemplars {
+		return false
+	}
+	if len(id) == 0 {
+		return false
+	}
+
+	// Avoid sampling exemplars for the same trace
+	// Check does zero allocs
+	if _, ok := e.exemplarMap[string(id)]; ok {
+		return false
+	}
+
+	e.exemplarMap[string(id)] = struct{}{}
+	e.exemplarCount++
+	return true
+}
+
+// MetricsFrontendEvaluator pipes the sharded job results back into the engine
+// for the rest of the pipeline. Works uniformly for math and non-math queries.
+type MetricsFrontendEvaluator struct {
+	mtx                sync.Mutex
+	seriesProcessor    seriesProcessor
+	metricsSecondStage secondStageElement
+}
+
+func (m *MetricsFrontendEvaluator) ObserveSeries(in []*tempopb.TimeSeries) {
+	m.mtx.Lock()
+	defer m.mtx.Unlock()
+	m.seriesProcessor.observeSeries(in)
+}
+
+func (m *MetricsFrontendEvaluator) Results() SeriesSet {
+	m.mtx.Lock()
+	defer m.mtx.Unlock()
+
+	// Job results are not scaled by sampling, but this is here for the interface.
+	results := m.seriesProcessor.result(1.0)
+
+	if m.metricsSecondStage != nil {
+		// metrics second stage is only set when query has second stage function and mode = final
+		// if we have metrics second stage, pass first stage results through
+		// second stage for further processing.
+		results = m.metricsSecondStage.process(results)
+	}
+	return results
+}
+
+func (m *MetricsFrontendEvaluator) Length() int {
+	m.mtx.Lock()
+	defer m.mtx.Unlock()
+	return m.seriesProcessor.length()
+}
+
+type SeriesAggregator interface {
+	Combine([]*tempopb.TimeSeries)
+	Results() SeriesSet
+	Length() int
+}
+
+type SimpleAggregationOp int
+
+const (
+	sumAggregation SimpleAggregationOp = iota
+	minOverTimeAggregation
+	maxOverTimeAggregation
+	sumOverTimeAggregation
+)
+
+type SimpleAggregator struct {
+	ss              SeriesSet
+	exemplarBuckets bucketSet
+	intervalMapper  IntervalMapper
+	aggregationFunc func(existingValue float64, newValue float64) float64
+	initWithNaN     bool
+}
+
+func NewSimpleCombiner(req *tempopb.QueryRangeRequest, op SimpleAggregationOp) *SimpleAggregator {
+	var initWithNaN bool
+	var f func(existingValue float64, newValue float64) float64
+	switch op {
+	case minOverTimeAggregation:
+		// Simple min aggregator. It calculates the minimum between existing values and a new sample
+		f = minOverTime()
+		initWithNaN = true
+	case maxOverTimeAggregation:
+		// Simple max aggregator. It calculates the maximum between existing values and a new sample
+		f = maxOverTime()
+		initWithNaN = true
+	case sumOverTimeAggregation:
+		f = sumOverTime()
+		initWithNaN = true
+	default:
+		// Simple addition aggregator. It adds existing values with the new sample.
+		f = func(existingValue float64, newValue float64) float64 { return existingValue + newValue }
+		initWithNaN = false
+
+	}
+	return &SimpleAggregator{
+		ss:              make(SeriesSet),
+		exemplarBuckets: newExemplarBucketSet(req.Exemplars, req.Start, req.End, req.Step, IsInstant(req)),
+		intervalMapper:  NewIntervalMapperFromReq(req),
+		aggregationFunc: f,
+		initWithNaN:     initWithNaN,
+	}
+}
+
+func (b *SimpleAggregator) Combine(in []*tempopb.TimeSeries) {
+	nan := math.Float64frombits(normalNaN)
+
+	for _, ts := range in {
+		// Convert proto labels to traceql labels
+		labels, _ := convertProtoLabelsToTraceQL(ts.Labels, false)
+		key := labels.MapKey()
+
+		existing, ok := b.ss[key]
+		if !ok {
+
+			existing = TimeSeries{
+				Labels:    labels,
+				Values:    make([]float64, b.intervalMapper.IntervalCount()),
+				Exemplars: make([]Exemplar, 0, len(ts.Exemplars)),
+			}
+			if b.initWithNaN {
+				for i := range existing.Values {
+					existing.Values[i] = nan
+				}
+			}
+
+			b.ss[key] = existing
+		}
+
+		for _, sample := range ts.Samples {
+			j := b.intervalMapper.IntervalMs(sample.TimestampMs)
+			if j >= 0 && j < len(existing.Values) {
+				existing.Values[j] = b.aggregationFunc(existing.Values[j], sample.Value)
+			}
+		}
+
+		prevLen := len(existing.Exemplars)
+		b.aggregateExemplars(ts, &existing)
+		if len(existing.Exemplars) != prevLen {
+			b.ss[key] = existing
+		}
+	}
+}
+
+func (b *SimpleAggregator) aggregateExemplars(ts *tempopb.TimeSeries, existing *TimeSeries) {
+	for _, exemplar := range ts.Exemplars {
+		if b.exemplarBuckets.testTotal() {
+			break
+		}
+		if b.exemplarBuckets.addAndTest(uint64(exemplar.TimestampMs)) { // nolint: gosec // G115
+			continue // Skip this exemplar and continue, next exemplar might fit in a different bucket
+		}
+		labels, _ := convertProtoLabelsToTraceQL(exemplar.Labels, false)
+		existing.Exemplars = append(existing.Exemplars, Exemplar{
+			Labels:      labels,
+			Value:       exemplar.Value,
+			TimestampMs: uint64(exemplar.TimestampMs),
+		})
+	}
+}
+
+func (b *SimpleAggregator) Results() SeriesSet {
+	return b.ss
+}
+
+func (b *SimpleAggregator) Length() int {
+	return len(b.ss)
+}
+
+type HistogramBucket struct {
+	Max   float64
+	Count int
+}
+
+type Histogram struct {
+	Buckets []HistogramBucket
+}
+
+func (h *Histogram) Record(bucket float64, count int) {
+	for i := range h.Buckets {
+		if h.Buckets[i].Max == bucket {
+			h.Buckets[i].Count += count
+			return
+		}
+	}
+
+	h.Buckets = append(h.Buckets, HistogramBucket{
+		Max:   bucket,
+		Count: count,
+	})
+}
+
+type IntervalMapper interface {
+	// Interval the given timestamp within the range and step.
+	Interval(ts uint64) int
+	// IntervalMs is the same as Bucket except the input and calculations are in unix milliseconds.
+	IntervalMs(ts int64) int
+	TimestampOf(interval int) uint64
+	// IntervalCount is the number of intervals in the range with step.
+	IntervalCount() int
+}
+
+func NewIntervalMapperFromReq(req *tempopb.QueryRangeRequest) IntervalMapper {
+	return NewIntervalMapper(req.Start, req.End, req.Step, IsInstant(req))
+}
+
+func NewIntervalMapper(start, end, step uint64, instant bool) IntervalMapper {
+	startMs := start - start%uint64(time.Millisecond)
+	endMs := end - end%uint64(time.Millisecond)
+	if instant {
+		return &IntervalMapperInstant{
+			start:   start,
+			end:     end,
+			startMs: startMs,
+			endMs:   endMs,
+		}
+	}
+	mapper := &IntervalMapperQueryRange{
+		start:   alignStart(start, end, step, instant),
+		end:     alignEnd(start, end, step, instant),
+		step:    step,
+		startMs: alignStart(startMs, endMs, step, instant),
+		endMs:   alignEnd(startMs, endMs, step, instant),
+	}
+	// pre-calculate intervals
+	intervals := (mapper.end - mapper.start) / mapper.step
+	mapper.intervalCount = int(intervals)
+	return mapper
+}
+
+type IntervalMapperQueryRange struct {
+	start, end, step uint64
+	startMs, endMs   uint64
+	intervalCount    int
+}
+
+func (i IntervalMapperQueryRange) Interval(ts uint64) int {
+	return i.interval(ts, i.start, i.end, i.step)
+}
+
+func (i IntervalMapperQueryRange) IntervalMs(tsmill int64) int {
+	ts := uint64(time.Duration(tsmill) * time.Millisecond)
+	// TODO: step is not truncated to milliseconds, it might be a bug
+	return i.interval(ts, i.startMs, i.endMs, i.step)
+}
+
+func (i IntervalMapperQueryRange) interval(ts, start, end, step uint64) int {
+	if !i.isTsValid(ts, start, end, step) {
+		return -1
+	}
+	if ts <= start { // to avoid overflow
+		return 0 // if pass validation and less than start, always first interval
+	}
+
+	offset := ts - start
+	// Calculate which interval the timestamp falls into
+	// Since intervals are right-closed: (start; start+step], (start+step; start+2*step], etc.
+	// we need to handle the case where ts is exactly on a step boundary
+	interval := offset / step
+	if interval*step == offset { // the same as offset % step == 0
+		// ts is exactly on a step boundary, so it belongs to the previous interval
+		interval--
+	}
+	return int(interval)
+}
+
+func (i IntervalMapperQueryRange) TimestampOf(interval int) uint64 {
+	// start as initial offset plus interval's offset
+	return i.start + (uint64(interval)+1)*i.step
+}
+
+func (i IntervalMapperQueryRange) IntervalCount() int {
+	return i.intervalCount
+}
+
+func (i IntervalMapperQueryRange) isTsValid(ts, start, end, step uint64) bool {
+	return ts > start && ts <= end && end != start && step != 0
+}
+
+type IntervalMapperInstant struct {
+	start, end     uint64
+	startMs, endMs uint64
+}
+
+func (i IntervalMapperInstant) Interval(ts uint64) int {
+	if !i.isTsValid(ts, i.start, i.end) {
+		return -1
+	}
+	return 0 // Instant queries only have one bucket
+}
+
+func (i IntervalMapperInstant) IntervalMs(tsmill int64) int {
+	ts := uint64(time.Duration(tsmill) * time.Millisecond)
+	if !i.isTsValid(ts, i.startMs, i.endMs) {
+		return -1
+	}
+
+	return 0 // Instant queries only have one bucket
+}
+
+func (i IntervalMapperInstant) IntervalCount() int {
+	return 1 // Instant queries only have one bucket
+}
+
+func (i IntervalMapperInstant) TimestampOf(int) uint64 {
+	return i.end
+}
+
+func (i IntervalMapperInstant) isTsValid(ts, start, end uint64) bool {
+	return ts >= start && ts <= end && end != start
+}
+
+type histSeries struct {
+	labels          Labels
+	hist            []Histogram
+	exemplars       []Exemplar
+	exemplarBuckets bucketSet
+}
+
+type HistogramAggregator struct {
+	ss             map[string]histSeries
+	qs             []float64
+	intervalMapper IntervalMapper
+	exemplarLimit  uint32
+	// Reusable buffer for all label processing
+	labelBuffer            Labels
+	exemplarBucketsCreator func() bucketSet
+}
+
+func NewHistogramAggregator(req *tempopb.QueryRangeRequest, qs []float64, exemplarLimit uint32) *HistogramAggregator {
+	return &HistogramAggregator{
+		ss:             make(map[string]histSeries),
+		qs:             qs,
+		intervalMapper: NewIntervalMapperFromReq(req),
+		exemplarLimit:  exemplarLimit,
+		labelBuffer:    make(Labels, 0, 8), // Pre-allocate with reasonable capacity
+		exemplarBucketsCreator: func() bucketSet {
+			return newExemplarBucketSet(exemplarLimit, req.Start, req.End, req.Step, IsInstant(req))
+		},
+	}
+}
+
+func (h *HistogramAggregator) Combine(in []*tempopb.TimeSeries) {
+	for _, ts := range in {
+		// Convert proto labels to traceql labels while stripping the bucket label
+		var bucket Static
+		h.labelBuffer, bucket = convertProtoLabelsToTraceQL(ts.Labels, true)
+
+		if bucket.Type == TypeNil {
+			// Bad __bucket label?
+			continue
+		}
+
+		withoutBucketStr := h.labelBuffer.String()
+
+		existing, ok := h.ss[withoutBucketStr]
+		if !ok {
+			// Create a copy of the labels since the buffer will be reused
+			withoutBucket := make(Labels, len(h.labelBuffer))
+			copy(withoutBucket, h.labelBuffer)
+
+			// Create a fresh histogram slice for each series to avoid sharing memory
+			// Pool reuse was causing data contamination between series
+			histSlice := make([]Histogram, h.intervalMapper.IntervalCount())
+
+			existing = histSeries{
+				labels: withoutBucket,
+				hist:   histSlice,
+				// Pre-allocate exemplars slice with capacity hint to reduce allocations
+				exemplars:       make([]Exemplar, 0, len(ts.Exemplars)),
+				exemplarBuckets: h.exemplarBucketsCreator(),
+			}
+		}
+
+		b := bucket.Float()
+
+		for _, sample := range ts.Samples {
+			if sample.Value == 0 {
+				continue
+			}
+			j := h.intervalMapper.IntervalMs(sample.TimestampMs)
+			if j >= 0 && j < len(existing.hist) {
+				existing.hist[j].Record(b, int(sample.Value))
+			}
+		}
+
+		// Collect exemplars per series, not globally
+		for _, exemplar := range ts.Exemplars {
+			if existing.exemplarBuckets.testTotal() {
+				break
+			}
+			if existing.exemplarBuckets.addAndTest(uint64(exemplar.TimestampMs)) {
+				continue // Skip this exemplar and continue, next exemplar might fit in a different bucket
+			}
+
+			// Convert exemplar labels directly (no need for buffer reuse here)
+			labels, _ := convertProtoLabelsToTraceQL(exemplar.Labels, false)
+
+			existing.exemplars = append(existing.exemplars, Exemplar{
+				Labels:      labels,
+				Value:       exemplar.Value,
+				TimestampMs: uint64(exemplar.TimestampMs),
+			})
+		}
+		h.ss[withoutBucketStr] = existing
+	}
+}
+
+func (h *HistogramAggregator) Results() SeriesSet {
+	results := make(SeriesSet, len(h.ss)*len(h.qs))
+
+	// Aggregate buckets across all series and time intervals for better quantile calculation
+	aggregatedBuckets := make(map[float64]int) // bucketMax -> totalCount
+
+	for _, in := range h.ss {
+		// Aggregate bucket counts across all time intervals
+		for _, hist := range in.hist {
+			for _, bucket := range hist.Buckets {
+				aggregatedBuckets[bucket.Max] += bucket.Count
+			}
+		}
+	}
+
+	// Calculate quantile values from aggregated distribution
+	// Convert map to sorted slice
+	buckets := make([]HistogramBucket, 0, len(aggregatedBuckets))
+	for bucketMax, count := range aggregatedBuckets {
+		buckets = append(buckets, HistogramBucket{
+			Max:   bucketMax,
+			Count: count,
+		})
+	}
+
+	sort.Slice(buckets, func(i, j int) bool {
+		return buckets[i].Max < buckets[j].Max
+	})
+
+	quantileValues := make([]float64, len(h.qs))
+	for i, q := range h.qs {
+		quantileValues[i] = Log2Quantile(q, buckets)
+	}
+
+	// Build results using the calculated quantile values
+	for _, in := range h.ss {
+		for i := range in.hist {
+			if len(in.hist[i].Buckets) > 0 {
+				// Sort interval buckets in place for performance
+				sort.Slice(in.hist[i].Buckets, func(a, b int) bool {
+					return in.hist[i].Buckets[a].Max < in.hist[i].Buckets[b].Max
+				})
+			}
+		}
+
+		// For each input series, we create a new series for each quantile.
+		for qIdx, q := range h.qs {
+			// Append label for the quantile
+			labels := append(Labels(nil), in.labels...)
+			labels = append(labels, Label{"p", NewStaticFloat(q)})
+
+			ts := TimeSeries{
+				Labels: labels,
+				Values: make([]float64, len(in.hist)),
+			}
+
+			for i := range in.hist {
+				if len(in.hist[i].Buckets) == 0 {
+					ts.Values[i] = 0.0
+					continue
+				}
+
+				// Use sorted buckets for quantile calculation
+				ts.Values[i] = Log2Quantile(q, in.hist[i].Buckets)
+			}
+
+			// Select exemplars for this quantile using simplified assignment logic
+			for _, exemplar := range in.exemplars {
+				if h.assignExemplarToQuantile(exemplar.Value, quantileValues, buckets) == qIdx {
+					ts.Exemplars = append(ts.Exemplars, exemplar)
+				}
+			}
+
+			results[labels.MapKey()] = ts
+		}
+	}
+
+	return results
+}
+
+// assignExemplarToQuantile determines which quantile (if any) an exemplar should be assigned to.
+// Returns the quantile index, or -1 if the exemplar doesn't fit any quantile reasonably well.
+// This uses a simple closest-match strategy with reasonable bucket validation.
+func (h *HistogramAggregator) assignExemplarToQuantile(exemplarValue float64, quantileValues []float64, buckets []HistogramBucket) int {
+	if len(quantileValues) == 0 || len(buckets) == 0 {
+		return -1
+	}
+
+	bestIdx := -1
+	bestDiff := math.Inf(1)
+
+	for i, quantileValue := range quantileValues {
+		// Find the closest quantile value for better visual alignment
+		diff := math.Abs(exemplarValue - quantileValue)
+		if diff < bestDiff {
+			bestDiff = diff
+			bestIdx = i
+		}
+	}
+
+	return bestIdx
+}
+
+func (h *HistogramAggregator) Length() int {
+	return len(h.ss) * len(h.qs)
+}
+
+// Log2Bucketize rounds the given value to the next powers-of-two bucket.
+func Log2Bucketize(v uint64) float64 {
+	if v < 2 {
+		return -1
+	}
+
+	return float64(uint64(1) << (64 - bits.LeadingZeros64(v-1)))
+
+	// OLD:
+	// return math.Pow(2, math.Ceil(math.Log2(float64(v))))
+}
+
+// Log2Quantile returns the quantile given bucket labeled with float ranges and counts. Uses
+// exponential power-of-two interpolation between buckets as needed.
+func Log2Quantile(p float64, buckets []HistogramBucket) float64 {
+	value, _ := Log2QuantileWithBucket(p, buckets)
+	return value
+}
+
+// Log2QuantileWithBucket returns both the quantile value and the bucket index where the quantile falls.
+// This avoids rescanning buckets when you need to determine which bucket contains a specific value.
+func Log2QuantileWithBucket(p float64, buckets []HistogramBucket) (float64, int) {
+	if math.IsNaN(p) ||
+		p < 0 ||
+		p > 1 ||
+		len(buckets) == 0 {
+		return 0, -1
+	}
+
+	totalCount := 0
+	for _, b := range buckets {
+		totalCount += b.Count
+	}
+
+	if totalCount == 0 {
+		return 0, -1
+	}
+
+	// Maximum amount of samples to include. We round up to better handle
+	// percentiles on low sample counts (<100).
+	maxSamples := int(math.Ceil(p * float64(totalCount)))
+
+	if maxSamples == 0 {
+		// We have to read at least one sample.
+		maxSamples = 1
+	}
+
+	// Find the bucket where the percentile falls in.
+	var total, bucket int
+	for i, b := range buckets {
+		// Next bucket
+		bucket = i
+
+		// If we can't fully consume the samples in this bucket
+		// then we are done.
+		if total+b.Count > maxSamples {
+			break
+		}
+
+		// Consume all samples in this bucket
+		total += b.Count
+
+		// p100 or happen to read the exact number of samples.
+		// Quantile is the max range for the bucket. No reason
+		// to enter interpolation below.
+		if total == maxSamples {
+			return b.Max, bucket
+		}
+	}
+
+	// Fraction to interpolate between buckets, sample-count wise.
+	// 0.5 means halfway
+	interp := float64(maxSamples-total) / float64(buckets[bucket].Count)
+
+	// Exponential interpolation between buckets
+	// The current bucket represents the maximum value
+	maxV := math.Log2(buckets[bucket].Max)
+	var minV float64
+	if bucket > 0 {
+		// Prior bucket represents the min
+		minV = math.Log2(buckets[bucket-1].Max)
+	} else {
+		// There is no prior bucket, assume powers of 2
+		minV = maxV - 1
+	}
+	return math.Pow(2, minV+(maxV-minV)*interp), bucket
+}
+
+var (
+	_ SeriesAggregator = (*SimpleAggregator)(nil)
+	_ SeriesAggregator = (*HistogramAggregator)(nil)
+)
+
+func FloatizeAttribute(s Span, a Attribute) (float64, StaticType) {
+	v, ok := s.AttributeFor(a)
+	if !ok {
+		return 0, TypeNil
+	}
+
+	f := v.Float()
+	if math.IsNaN(f) {
+		return 0, TypeNil
+	}
+	return f, v.Type
+}
+
+// convertProtoLabelsToTraceQL converts protobuf labels to traceql Labels format.
+// If skipBucket is true, it will skip any label with key matching internalLabelBucket.
+// Returns the converted labels and the bucket value (if found and not skipped).
+func convertProtoLabelsToTraceQL(protoLabels []commonv1proto.KeyValue, skipBucket bool) (Labels, Static) {
+	// TODO: consider memory pooling for Labels and Static to reduce allocations
+	labels := make(Labels, 0, len(protoLabels))
+	var bucket Static
+
+	for i := range protoLabels {
+		l := &protoLabels[i]
+		if skipBucket && l.Key == internalLabelBucket {
+			bucket = StaticFromAnyValue(l.Value)
+			continue
+		}
+		labels = append(labels, Label{
+			Name:  l.Key,
+			Value: StaticFromAnyValue(l.Value),
+		})
+	}
+
+	return labels, bucket
+}
+
+// processTopK implements TopKBottomK topk method
+func processTopK(input SeriesSet, valueLength, limit int) SeriesSet {
+	result := make(SeriesSet)
+	// Min heap for top-k (smallest values at top for easy replacement)
+	h := &seriesHeap{}
+	heap.Init(h)
+
+	// process each timestamp
+	for i := 0; i < valueLength; i++ {
+		// process each series for this timestamp
+		for key, series := range input {
+			if i >= len(series.Values) {
+				continue
+			}
+
+			value := series.Values[i]
+			if math.IsNaN(value) {
+				continue // Skip NaN values
+			}
+
+			// If heap not full yet, add the value
+			if h.Len() < limit {
+				heap.Push(h, seriesValue{
+					key:   key,
+					value: value,
+				})
+				continue
+			}
+
+			// If new value is greater than smallest in heap, replace it
+			// For ties (equal values), use series key comparison to maintain determinism
+			smallest := (*h)[0]
+			if dataPointGreaterThan(seriesValue{key: key, value: value}, smallest) {
+				heap.Pop(h)
+				heap.Push(h, seriesValue{
+					key:   key,
+					value: value,
+				})
+			}
+		}
+
+		// we have iterated over all series for this timestamp
+		// empty the heap and record these series in result set
+		for h.Len() > 0 {
+			sv := heap.Pop(h).(seriesValue)
+			initSeriesInResult(result, sv.key, input, valueLength)
+			// Set only this timestamp's value
+			result[sv.key].Values[i] = input[sv.key].Values[i]
+		}
+	}
+
+	return result
+}
+
+// processBottomK implements TopKBottomK bottomk method
+func processBottomK(input SeriesSet, valueLength, limit int) SeriesSet {
+	result := make(SeriesSet)
+
+	// Max heap for bottom-k (largest values at top for easy replacement)
+	h := &reverseSeriesHeap{}
+	heap.Init(h)
+
+	// Process each timestamp
+	for i := 0; i < valueLength; i++ {
+		// Process each series for this timestamp
+		for key, series := range input {
+			if i >= len(series.Values) {
+				continue
+			}
+
+			value := series.Values[i]
+			if math.IsNaN(value) {
+				continue // Skip NaN values
+			}
+
+			// If heap not full yet, add the value
+			if h.Len() < limit {
+				heap.Push(h, seriesValue{
+					key:   key,
+					value: value,
+				})
+				continue
+			}
+
+			// If new value is less than largest in heap, replace it
+			// For ties (equal values), use series key comparison to maintain determinism
+			largest := (*h)[0]
+			if dataPointLessThan(seriesValue{key: key, value: value}, largest) {
+				heap.Pop(h)
+				heap.Push(h, seriesValue{
+					key:   key,
+					value: value,
+				})
+			}
+		}
+
+		// we have iterated over all series for this timestamp
+		// empty the heap and record these series in result set
+		for h.Len() > 0 {
+			sv := heap.Pop(h).(seriesValue)
+			initSeriesInResult(result, sv.key, input, valueLength)
+			// Set only this timestamp's value
+			result[sv.key].Values[i] = input[sv.key].Values[i]
+		}
+	}
+
+	return result
+}
+
+// initSeriesInResult ensures that a series exists in the result map, and
+// initializes it with NaN values if it doesn't exist in the result set.
+func initSeriesInResult(result SeriesSet, key SeriesMapKey, input SeriesSet, valueLength int) {
+	if _, exists := result[key]; exists {
+		// series already exists, no need to initialize
+		return
+	}
+	// series doesn't exist, initialize it
+	// Copy the series labels and exemplars from the input
+	result[key] = TimeSeries{
+		Labels:    input[key].Labels,
+		Values:    make([]float64, valueLength),
+		Exemplars: input[key].Exemplars,
+	}
+
+	// Initialize all values to NaN because we only want to set values for this timestamp
+	for j := range result[key].Values {
+		result[key].Values[j] = math.NaN()
+	}
+}

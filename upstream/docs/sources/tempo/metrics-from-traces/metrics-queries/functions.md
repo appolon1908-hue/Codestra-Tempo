@@ -1,0 +1,649 @@
+---
+title: TraceQL metrics functions
+menuTitle: TraceQL metrics functions
+description: Learn about functions used in TraceQL metrics queries
+aliases:
+  - ../../traceql/metrics-queries/functions/ # /docs/tempo/next/traceql/metrics-queries/functions/
+weight: 600
+keywords:
+  - metrics query
+  - TraceQL metrics
+---
+
+# TraceQL metrics functions
+
+<!-- If you add a new function to this page, make sure you also add it to the _index.md#functions section.-->
+
+TraceQL metrics query functions are aggregate operators that can be appended to any TraceQL span selector to compute time-series metrics directly from trace data.
+You can answer questions about system behavior by aggregating trace data on-the-fly.
+
+## Available functions
+
+[TraceQL](http://grafana.com/docs/tempo/<TEMPO_VERSION>/traceql/) supports `rate`, `count_over_time`, `sum_over_time`, `min_over_time`, `max_over_time`, `avg_over_time`, `quantile_over_time`,
+`histogram_over_time`, and `compare` functions. These methods can be appended to any TraceQL query to calculate and
+return the desired metrics like:
+
+```
+{} | rate()
+```
+
+Note that `topk` and `bottomk` are also supported to only return a subset of series. These can only be added
+after a metrics query like:
+
+```
+{} | rate() by (resource.service.name) | topk(10)
+```
+
+You can also apply comparison operators to metrics results to keep only data points that meet a given threshold.
+These can be added after a metrics query like:
+
+```
+{} | rate() by (resource.service.name) > 10
+```
+
+These functions can be added as an operator at the end of any TraceQL query.
+
+| Function                                                     | Description                                                                                        | Example                                                                         |
+| ------------------------------------------------------------ | -------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
+| [`rate()`](#the-rate-function)                              | Calculates the number of matching spans per second.                                                | `{ span:status = error } \| rate()`                                             |
+| [`count_over_time()`](#the-count_over_time-function)         | Counts the number of matching spans per time interval.                                             | `{ span:name = "GET /:endpoint" } \| count_over_time()`                         |
+| [`sum_over_time()`](#the-sum_over_time-function)             | Sums the value for the specified attribute across all matching spans per time interval.            | `{ } \| sum_over_time(span.http.response.size)`                                 |
+| [`min_over_time()`](#the-min_over_time-function)             | Returns the minimum value for the specified attribute across all matching spans per time interval. | `{ span:name = "GET /:endpoint" } \| min_over_time(span:duration)`              |
+| [`max_over_time()`](#the-max_over_time-function)             | Returns the maximum value for the specified attribute across all matching spans per time interval. | `{ span:name = "GET /:endpoint" } \| max_over_time(span:duration)`              |
+| [`avg_over_time()`](#the-avg_over_time-function)             | Returns the average value for the specified attribute across all matching spans per time interval. | `{ span:name = "GET /:endpoint" } \| avg_over_time(span:duration)`              |
+| [`quantile_over_time()`](#the-quantile_over_time-function)   | The quantile of the values in the specified interval.                                              | `{ span:name = "GET /:endpoint" } \| quantile_over_time(span:duration, .99)`    |
+| [`histogram_over_time()`](#the-histogram_over_time-function) | Evaluate frequency distribution over time.                                                         | `{ } \| histogram_over_time(span:duration) by (span.http.target)`               |
+| [`topk()`](#the-topk-function)                               | Returns only the top `k` results from a metrics query.                                             | `{ resource.service.name = "foo" } \| rate() by (span.http.url) \| topk(10)`    |
+| [`bottomk()`](#the-bottomk-function)                         | Returns only the bottom `k` results from a metrics query.                                          | `{ resource.service.name = "foo" } \| rate() by (span.http.url) \| bottomk(10)` |
+| [Comparison operators](#comparison-operators)                 | Filters metric data points that don't meet a threshold condition.                                  | `{ } \| rate() > 10`                                                            |
+| [Arithmetic expressions](#arithmetic-expressions)            | Combines two or more metrics queries with `+`, `-`, `*`, `/`.                                      | `({status=error} \| rate()) / ({} \| rate())`                                   |
+
+### Group results with `by()`
+
+You can use the optional `by()` clause with metrics functions in TraceQL metrics queries to group aggregated results by specified span attributes like service name, endpoint, or status.
+
+Without `by()`, you get a single aggregated value across all matching spans.
+
+```traceql
+{ span:status = error } | rate()
+```
+
+With `by()`, you get separate time series for each unique combination of the grouped attributes.
+
+```traceql
+{ span:status = error } | rate() by(resource.service.name)
+```
+
+## The `rate` function
+
+The `rate` function calculates the number of matching spans per second that match the given span selectors.
+
+The following query shows the rate of errors by service and span name.
+This is a TraceQL specific way of gathering rate metrics that would otherwise be generated by the span metrics
+processor.
+
+For example, this query:
+
+```traceql
+{ span:status = error } | rate() by (resource.service.name, span:name)
+```
+
+Is an equivalent to using span-generated metrics and running the query.
+
+This example calculates the rate of the erroring spans coming from the service `foo`.
+Rate is a `spans/sec` quantity.
+
+```traceql
+{ resource.service.name = "foo" && span:status = error } | rate()
+```
+
+Combined with the `by()` operator, this can be even more powerful.
+
+```traceql
+{ resource.service.name = "foo" && span:status = error } | rate() by (span.http.route)
+```
+
+This example still rates the erroring spans in the service `foo` but the metrics are broken
+down by HTTP route.
+This might let you determine that `/api/sad` had a higher rate of erroring
+spans than `/api/happy`, for example.
+
+## The `count_over_time` function
+
+The `count_over_time()` function counts the number of matching spans per time interval.
+The time interval that the count is computed over is set by the `step` parameter.
+
+### The `step` parameter
+
+The `step` parameter defines the granularity of the returned time-series.
+For example, `step=15s` returns a data point every 15s within the time range.
+By default, `step` automatically chooses a dynamic value based on the query start time and end time.
+
+Any value used for `step` needs to include a duration value, such as `30s` for `s`econds or `1m` for `m`inutes.
+
+You can configure this parameter using Grafana Explore or using the Tempo API.
+
+To check or change the `step` value using Grafana Explore:
+
+1. Select your Tempo data source.
+1. Select either the **Search** or **TraceQL** query type tab.
+1. Expand the **Metrics options** to view the **Step** value.
+
+![The Step value in the Metrics options in Grafana Explore](/media/docs/tempo/tempo-ds-query-metrics-options-step.png)
+
+This example counts the number of spans with name `"GET /:endpoint"` broken down by status code. You might see that
+there are 10 `"GET /:endpoint"` spans with status code 200 and 15 `"GET /:endpoint"` spans with status code 400.
+
+```traceql
+{ span:name = "GET /:endpoint" } | count_over_time() by (span.http.status_code)
+
+```
+
+## Over-time functions
+
+The over-time functions let you aggregate numerical values across matching spans per time interval.
+The time interval that these functions compute over is set by the `step` parameter.
+
+For more information, refer to the [`step` API parameter](https://grafana.com/docs/tempo/<TEMPO_VERSION>/api_docs/#traceql-metrics).
+
+These functions accept the numerical field that you want to aggregate on.
+
+### The `sum_over_time` function
+
+The `sum_over_time()` function lets you aggregate numerical values by computing the sum value of them.
+The time interval that the sum is computed over is set by the `step` parameter.
+
+### The `min_over_time` function
+
+The `min_over_time()` function lets you aggregate numerical attributes by calculating their minimum value.
+For example, you could choose to calculate the minimum duration of a group of spans, or you could choose to calculate
+the minimum value of a custom attribute you've attached to your spans, like `span.shopping.cart.entries`.
+The time interval that the minimum is computed over is set by the `step` parameter.
+
+This example computes the minimum duration for each `http.target` of all spans named `"GET /:endpoint"`.
+Any numerical attribute on the span is fair game.
+
+```traceql
+{ span:name = "GET /:endpoint" } | min_over_time(span:duration) by (span.http.target)
+```
+
+This example computes the minimum status code value of all spans named `"GET /:endpoint"`.
+
+```traceql
+{ span:name = "GET /:endpoint" } | min_over_time(span.http.status_code)
+```
+
+### The `max_over_time` function
+
+The `max_over_time()` function lets you aggregate numerical values by computing the maximum value of them, such as the all
+important span duration.
+The time interval that the maximum is computed over is set by the `step` parameter.
+
+This example computes the maximum duration for each `http.target` of all spans named `"GET /:endpoint"`.
+
+```traceql
+{ span:name = "GET /:endpoint" } | max_over_time(span:duration) by (span.http.target)
+```
+
+```traceql
+{ span:name = "GET /:endpoint" } | max_over_time(span.http.response.size)
+```
+
+### The `avg_over_time` function
+
+The `avg_over_time()` function lets you aggregate numerical values by computing the average value of them, such as the all
+important span duration.
+The time interval that the average is computed over is set by the `step` parameter.
+
+This example computes the average duration for each `http.status_code` of all spans named `"GET /:endpoint"`.
+
+```traceql
+{ span:name = "GET /:endpoint" } | avg_over_time(span:duration) by (span.http.status_code)
+```
+
+```traceql
+{ span:name = "GET /:endpoint" } | avg_over_time(span.http.response.size)
+```
+
+### The `quantile_over_time` function
+
+The `quantile_over_time()` function lets you aggregate numerical values, such as the all important span duration, by computing quantiles over time.
+You can specify multiple quantiles in the same query.
+
+The example below computes the 99th, 90th, and 50th percentile of the duration attribute on all spans with name
+`GET /:endpoint`.
+
+```traceql
+{ span:name = "GET /:endpoint" } | quantile_over_time(span:duration, .99, .9, .5)
+```
+
+You can group by any span or resource attribute.
+
+```traceql
+{ span:name = "GET /:endpoint" } | quantile_over_time(span:duration, .99) by (span.http.target)
+```
+
+Quantiles aren't limited to span duration.
+Any numerical attribute on the span is fair game.
+To demonstrate this flexibility, consider this nonsensical quantile on `span.http.status_code`:
+
+```traceql
+{ span:name = "GET /:endpoint" } | quantile_over_time(span.http.status_code, .99, .9, .5)
+```
+
+This computes the 99th, 90th, and 50th percentile of the values of the `status_code` attribute for all spans named
+`GET /:endpoint`.
+This is unlikely to tell you anything useful (what does a median status code of `347` mean?), but it works.
+
+As a further example, imagine a custom attribute like `span.temperature`.
+You could use a similar query to know what the 50th percentile and 95th percentile temperatures were across all your
+spans.
+
+### The `histogram_over_time` function
+
+The `histogram_over_time()` function lets you evaluate frequency distribution over time for numerical values, such as span duration.
+This function groups values into buckets and shows how frequently values fall into each bucket over time.
+
+This example evaluates the frequency distribution of span duration, grouped by HTTP target:
+
+```traceql
+{ } | histogram_over_time(span:duration) by (span.http.target)
+```
+
+## Arithmetic expressions
+
+Individual metrics functions like `rate()` and `count_over_time()` answer questions about a single group of spans.
+However, many real-world questions require comparing or combining two groups, for example, "what percentage of requests are errors?" or "how does this service's throughput compare to overall throughput?"
+
+Arithmetic expressions let you answer these questions in a single TraceQL query by combining metrics queries with `+`, `-`, `*`, and `/`.
+Without this, you'd need to run separate queries and combine them externally using tools like Grafana Math expressions.
+
+You can combine two metrics queries with each other, or combine a metrics query with a constant number (a scalar) to scale or shift its values.
+
+Each sub-query must be wrapped in parentheses.
+
+### Syntax
+
+```
+(<spanset pipeline> | <metrics function>) <operator> (<spanset pipeline> | <metrics function>)
+```
+
+For example, to calculate an error rate ratio:
+
+```traceql
+({status=error} | rate()) / ({} | rate())
+```
+
+### Supported operators
+
+| Operator | Description |
+|----------|-------------|
+| `+` | Addition |
+| `-` | Subtraction |
+| `*` | Multiplication |
+| `/` | Division |
+
+### Examples
+
+Calculate the error rate as a proportion of total requests:
+
+```traceql
+({status=error} | count_over_time()) / ({} | count_over_time())
+```
+
+Compute the share of requests by service:
+
+```traceql
+({resource.service.name="frontend"} | rate()) / ({} | rate())
+```
+
+Add rates from two different span selectors:
+
+```traceql
+({} | rate()) + ({} | rate())
+```
+
+Combine multiple operations:
+
+```traceql
+({} | rate()) + ({} | count_over_time()) | topk(5)
+```
+
+### Scalar operands
+
+You can use a constant number (a scalar) as one side of an arithmetic expression to scale or shift the values of a metrics query.
+The number can appear on either side of the operator, and it applies to every series and every data point in the result.
+Scalars can be integers, floating-point numbers, or negative values. You can use multiple operations in a single expression:
+
+```traceql
+({} | rate()) / 2.5
+({} | rate()) - 5
+({} | rate()) * (-100)
+100 + ({} | rate())
+```
+
+Scalar operands let you shape a metric into the form you want to read or alert on, without post-processing the result in Grafana or another tool. You can use them to:
+* Express a ratio as a percentage
+* Rescale a rate
+* Set alert and panel thresholds
+* Convert units
+
+To express a ratio as a percentage, multiply an error-rate ratio by `100` to read it as a percentage instead of a fraction.
+
+```traceql
+100 * ({status=error} | count_over_time()) / ({} | count_over_time())
+```
+
+The operands can be used to rescale a rate. Because `rate()` returns matching spans per second, multiply by `60` to read it as a per-minute value.
+
+```traceql
+({} | rate()) * 60
+```
+
+Use scalar operands to set alert and panel thresholds in one place. Bake the conversion into the query so the value matches the unit your threshold expects, instead of maintaining the math separately in each dashboard or alert rule.
+
+```traceql
+100 * ({status=error} | rate()) / ({} | rate()) > 5
+```
+
+To convert units, divide or multiply by a constant to read a value in the unit you want, for example, bytes as mebibytes.
+
+```traceql
+({} | avg_over_time(span.http.response.body.size)) / (1024 * 1024)
+```
+
+In scalar-only subexpressions, integer arithmetic keeps integer semantics, so `1 / 2` evaluates to `0`, while `1.0 / 2.0` evaluates to `0.5`.
+
+{{< admonition type="note" >}}
+Duration literals such as `10s` can't be used as scalar operands in arithmetic. For example, `({} | rate()) * 10s` isn't valid.
+{{< /admonition >}}
+
+### Group-by with arithmetic
+
+You can use `by()` in each sub-query.
+When both sides use the same `by()` attributes, results are matched by label.
+When one side has labels and the other doesn't, the unlabeled side is applied to every labeled series.
+
+```traceql
+({status=error} | rate() by (resource.service.name)) / ({} | rate() by (resource.service.name))
+```
+
+To calculate each service's share of total throughput, group only one side. The unlabeled total rate is applied to every per-service series:
+
+```traceql
+({} | rate() by (resource.service.name)) / ({} | rate())
+```
+
+### Post-expression operations
+
+You can apply `topk`, `bottomk`, and comparison operators after an arithmetic expression, just as you can with a single metrics query:
+
+```traceql
+({status=error} | rate()) / ({} | rate()) | topk(5)
+```
+
+```traceql
+({status=error} | rate()) / ({} | rate()) > 10
+```
+
+```traceql
+({} | rate()) + ({} | rate()) | topk(5) > 10
+```
+
+### Division by zero and missing data
+
+Division by zero returns `NaN`.
+When a time bucket has no matching spans for a sub-query, that sub-query returns `NaN` for the bucket.
+Following IEEE-754 semantics, any arithmetic operation involving `NaN` returns `NaN`, so `NaN + 5` evaluates to `NaN` and `NaN * 5` evaluates to `NaN`.
+
+### Limitations
+
+- Each sub-query must be enclosed in parentheses. Bare expressions like `{} | rate() + {} | rate()` aren't valid.
+- Duration literals such as `10s` can't be used as scalar operands.
+- The `compare()` function can't be used in arithmetic expressions.
+
+## Multi-stage metrics queries
+
+Multi-stage metrics queries are queries that turn your spans into metrics and then perform additional operations on those metrics.
+
+### The `topk` function
+
+The `topk` function lets you aggregate and process TraceQL metrics by returning only the top `k` results.
+This function is similar to its equivalent PromQL function.
+
+When a query response is larger than the maximum, you can use `topk` to return only the specified number
+from 1 through `k` of the top results.
+
+For example:
+
+```traceql
+{ resource.service.name = "foo" } | rate() by (span.http.url)  | topk(10)
+```
+
+The first part, `{ resource.service.name = "foo" }`, takes all spans in the service `foo`.
+The spans are rated by the URL, for example, the most active endpoints on a service.
+
+Adding `topk(10)` returns the top 10 most common instead of the entire list.
+
+In TraceQL, `topk` works similar to how it functions in PromQL.
+The `topk` function is evaluated at each data point.
+
+If you do a `topk` of 10, you might get a 20 series. For example, on this data point, the top 10 are `A` through `J`.
+
+On the next data point, `A` through `I` might still be the top 9, but `J` might have fallen off for `K`.
+Because it's evaluated at each data point, you'll get the top series for each data point.
+
+### The `bottomk` function
+
+The `bottomk` function lets you aggregate and process TraceQL metrics by returning only the bottom `k` results.
+This function is similar to its equivalent PromQL function.
+
+When a query response is larger than the maximum, you can use `bottomk` to return only the specified number
+from 1 through `k` of the bottom results.
+
+For example:
+
+```traceql
+{ resource.service.name = "foo" } | rate() by (span.http.url)  | bottomk(10)
+```
+
+The first part, `{ resource.service.name = "foo" }`, takes all spans in the service `foo`.
+The spans are rated by the URL, for example, the least active endpoints on a service.
+
+Adding `bottomk(10)` returns the bottom 10 least common instead of the entire list.
+
+In TraceQL, `bottomk` works similar to how it functions in PromQL.
+The `bottomk` function is evaluated at each data point.
+
+If you do a `bottomk` of 10, you might get a 20 series. For example, on this data point, the bottom 10 are `A` through `J`.
+
+On the next data point, `A` through `I` might still be the bottom 9, but `J` might have fallen off for `K`.
+Because it's evaluated at each data point, you'll get the bottom series for each data point.
+
+### Comparison operators
+
+You can apply comparison operators to the results of any metrics query to keep only the data points that meet a given condition.
+This lets you filter out noise and focus on the values that matter, for example, only showing series where the rate exceeds a threshold.
+
+The supported comparison operators are `>`, `>=`, `<`, `<=`, `=`, and `!=`.
+You can compare against integers, floats, and durations, for example, `1s` or `500ms`.
+
+{{< admonition type="note" >}}
+Comparison operators, `topk`, and `bottomk` aren't supported with the `compare()` function.
+{{< /admonition >}}
+
+Data points that don't match the condition are removed from the results.
+If all data points in a series are removed, the entire series is dropped.
+
+For example, this query computes the rate of all spans grouped by service, and then keeps only services where the rate exceeds 10 spans per second:
+
+```traceql
+{} | rate() by (resource.service.name) > 10
+```
+
+You can use duration values to filter on time-based metrics.
+This example finds endpoints where the average span duration is greater than one second:
+
+```traceql
+{ span:name = "GET /:endpoint" } | avg_over_time(span:duration) > 1s
+```
+
+To exclude zero values from your results:
+
+```traceql
+{} | count_over_time() by (name) != 0
+```
+
+#### Combining with `topk` and `bottomk`
+
+Comparison operators can be combined with `topk` and `bottomk` in any order.
+Each operation is applied in sequence from left to right.
+
+For example, you can first select the top 5 series and then filter to only those above a threshold:
+
+```traceql
+{} | rate() by (span.http.url) | topk(5) > 10
+```
+
+Or filter first, then select the top results from what remains:
+
+```traceql
+{} | rate() by (span.http.url) > 0 | topk(5)
+```
+
+Sampling hints work alongside comparison operators:
+
+```traceql
+{} | count_over_time() by (name) | topk(10) >= 5 with(sample=0.1)
+```
+
+## Data sampling
+
+TraceQL metrics queries support sampling to optimize performance and control sampling behavior.
+There are four sampling methods available:
+
+- Dynamic sampling using `with(sample=true)`, which automatically determines the optimal sampling strategy and amount based on query characteristics.
+- Fixed sampling using `with(sample=0.xx)`
+- Fixed span sampling using `with(span_sample=0.xx)`, which selects the specified percentage of spans.
+- Fixed trace sampling using `with(trace_sample=0.xx)`, which selects complete traces for analysis.
+
+Refer to the [TraceQL metrics sampling](/docs/tempo/<TEMPO_VERSION>/metrics-from-traces/metrics-queries/sampling-guide/) documentation for more information.
+
+{{< admonition  type="note" >}}
+Sampling hints only work with TraceQL metrics queries (those using functions like `rate()`, `count_over_time()`, etc.).
+{{< /admonition >}}
+
+### Dynamic sampling: `with(sample=true)`
+
+Automatically determines optimal sampling strategy based on query selectivity and data volume.
+
+```
+{ resource.service.name="frontend" } | rate() with(sample=true)
+```
+
+### Fixed span sampling: `with(span_sample=0.xx)`
+
+Samples a fixed percentage of spans for span-level aggregations.
+
+```
+{ span:status=error } | count_over_time() with(span_sample=0.1)
+```
+
+### Fixed trace sampling: `with(trace_sample=0.xx)`
+
+Samples a fixed percentage of traces for trace-level aggregations.
+
+```
+{ } | count_over_time() by (resource.service.name) with(trace_sample=0.05)
+```
+
+## Extrapolation from ingest-time sampling: `with(extrapolate=true)` (experimental)
+
+{{< docs/experimental product="Tempo" >}}
+
+If your traces were sampled at ingest time by an OpenTelemetry probability
+sampler (for example, an OTel Collector `probabilistic_sampler` in
+`proportional` mode), each surviving span carries a W3C tracestate value that
+encodes the sampling probability. `with(extrapolate=true)` scales each matched
+span's contribution by `1 / sampling_probability` so the emitted metric
+represents the un-sampled population rather than what actually reached storage.
+
+For example, at 15% ingest sampling, the extrapolated rate is roughly 6.7 times
+the stored rate:
+
+```traceql
+{ resource.service.name="api" } | rate() with(extrapolate=true)
+```
+
+Applies to `rate`, `count_over_time`, `sum_over_time`, `avg_over_time`,
+`histogram_over_time`, `quantile_over_time`, and `compare`. `min_over_time`
+and `max_over_time` are intentionally unaffected because extremes don't
+scale with sampling.
+
+## The `compare` function
+
+{{< admonition type="note">}}
+This function is primarily used to drive the [**Comparison** tab](/docs/grafana/latest/explore/simplified-exploration/traces/investigate/analyze-tracing-data/#use-the-comparison-tab) in Traces Drilldown.
+{{< /admonition >}}
+
+The `compare` function splits a set of spans into two groups: a selection and a baseline.
+It returns time-series for all attributes found on the spans to highlight the differences between the two groups.
+
+This powerful function is best understood by using the [**Comparison** tab in Traces Drilldown](https://grafana.com/docs/grafana/<GRAFANA_VERSION>/explore/simplified-exploration/traces/investigate/analyze-tracing-data/#use-the-comparison-tab).
+You can also understand this function by looking at example outputs below.
+
+The function is used like other metrics functions: when it's placed after any trace query, it converts the query into a
+metrics query:
+`...any spanset pipeline... | compare({subset filters}, <topN>, <start timestamp>, <end timestamp>)`
+
+Example:
+
+```traceql
+{ resource.service.name="a" && span.http.path="/myapi" } | compare({span:status=error})
+```
+
+This function is generally run as an instant query.
+An instant query gives a single value at the end of the selected time range.
+[Instant queries](https://prometheus.io/docs/prometheus/latest/querying/api/#instant-queries) are quicker to execute and
+it often easier to understand their results
+The returns may exceed gRPC payloads when run as a range query.
+
+### Parameters
+
+The `compare` function has four parameters:
+
+1. Required. The first parameter is a spanset filter for choosing the subset of spans. This filter is executed against
+   the incoming spans. If it matches, then the span is considered to be part of the selection. Otherwise, it is part of
+   the baseline. Common filters are expected to be things like `{span:status=error}` (what is different about errors?) or
+   `{span:duration>1s}` (what is different about slow spans?)
+
+2. Optional. The second parameter is the top `N` values to return per attribute. If an attribute exceeds this limit in
+   either the selection group or baseline group, then only the top `N` values (based on frequency) are returned, and an
+   error indicator for the attribute is included output (see below). Must be an integer between 1 and 1000. Defaults to `10`.
+
+3. Optional. Start and End timestamps in Unix nanoseconds, which can be used to constrain the selection window by time,
+   in addition to the filter. For example, the overall query could cover the past hour, and the selection window only a
+   5 minute time period in which there was an anomaly. These timestamps must both be given, or neither.
+
+### Output
+
+The outputs are flat time-series for each attribute/value found in the spans.
+
+Each series has a label `__meta_type` which denotes which group it is in, either `selection` or `baseline`.
+
+Example output series:
+
+```
+{ __meta_type="baseline", resource.cluster="prod" } 123
+{ __meta_type="baseline", resource.cluster="qa" } 124
+{ __meta_type="selection", resource.cluster="prod" } 456   <--- significant difference detected
+{ __meta_type="selection", resource.cluster="qa" } 125
+{ __meta_type="selection", resource.cluster="dev"} 126  <--- cluster=dev was found in the highlighted spans but not in the baseline
+```
+
+When an attribute reaches the topN limit, there will also be present an error indicator.
+This example means the attribute `resource.cluster` had too many values.
+
+```
+{ __meta_error="__too_many_values__", resource.cluster=<nil> }
+```

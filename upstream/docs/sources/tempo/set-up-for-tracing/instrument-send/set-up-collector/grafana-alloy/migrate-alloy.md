@@ -1,0 +1,21 @@
+---
+title: Migrate to Alloy
+description: Provides links to documentation to migrate to Grafana Alloy.
+weight: 100
+aliases:
+  - ../../../../configuration/grafana-alloy/migrate-alloy/ # /docs/tempo/latest/configuration/grafana-alloy/migrate-alloy/
+---
+
+# Migrate to Alloy
+
+Grafana Labs has provided tools and migration documentation to assist you in migrating to Grafana Alloy.
+
+Read more about why we recommend migrating to [Grafana Alloy](https://grafana.com/blog/2024/04/09/grafana-alloy-opentelemetry-collector-with-prometheus-pipelines/).
+
+This section provides links to documentation for how to migrate to Alloy.
+
+- [Migrate from OpenTelemetry Collector](https://grafana.com/docs/alloy/<ALLOY_VERSION>/tasks/migrate/from-otelcol/)
+
+- [Migrate from Prometheus](https://grafana.com/docs/alloy/<ALLOY_VERSION>/tasks/migrate/from-prometheus/)
+
+- [Migrate from Promtail](https://grafana.com/docs/alloy/<ALLOY_VERSION>/tasks/migrate/from-promtail/)

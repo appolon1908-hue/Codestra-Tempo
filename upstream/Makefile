@@ -1,0 +1,505 @@
+# Adapted from https://www.thapaliya.com/en/writings/well-documented-makefiles/
+.PHONY: help
+help:  ## Display this help
+	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make \033[36m<target>\033[0m\n"} /^[[:alnum:]_-]+:.*##/ { printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2 } /^##@/ { printf "\n\033[1m%s\033[0m\n", substr($$0, 5) } ' $(MAKEFILE_LIST)
+
+.DEFAULT_GOAL:=help
+
+# Version number, read from the VERSION file at the repo root
+VERSION=$(shell ./tools/version-tag.sh)
+
+GIT_REVISION := $(shell git rev-parse --short HEAD)
+GIT_BRANCH := $(shell git rev-parse --abbrev-ref HEAD)
+
+GOOS ?= $(shell go env GOOS)
+GOARCH ?= $(shell go env GOARCH)
+
+GOPATH := $(shell go env GOPATH)
+GORELEASER := $(GOPATH)/bin/goreleaser
+
+# Build Images
+LOKI_BUILD_IMAGE ?= grafana/loki-build-image:0.35.0
+# https://hub.docker.com/repository/docker/grafana/tempo-ci-tools/
+# built by: .github/workflows/docker-ci-tools.yml
+TEMPO_CI_TOOLS_IMAGE ?= grafana/tempo-ci-tools:main-3f54f1c-20260716-212549
+DOCS_IMAGE ?= grafana/docs-base:latest
+
+# More exclusions can be added similar with: -not -path './testbed/*'
+ALL_SRC := $(shell find . -name '*.go' \
+								-not -path './tools*/*' \
+								-not -path './vendor*/*' \
+								-not -path './integration/*' \
+                                -type f | sort)
+
+# ALL_SRC but without pkg and tempodb packages
+OTHERS_SRC := $(shell find . -name '*.go' \
+								-not -path './tools*/*' \
+								-not -path './vendor*/*' \
+								-not -path './integration/*' \
+								-not -path './pkg*/*' \
+								-not -path './tempodb*/*' \
+                                -type f | sort)
+
+# All source code and documents. Used in spell check.
+ALL_DOC := $(shell find . \( -name "*.md" -o -name "*.yaml" \) \
+                                -type f | sort)
+
+# ALL_PKGS is used with 'go cover'
+ALL_PKGS := $(shell go list $(sort $(dir $(ALL_SRC))))
+
+LD_FLAGS=-X main.Branch=$(GIT_BRANCH) -X main.Revision=$(GIT_REVISION) -X main.Version=$(VERSION)
+ifeq ($(BUILD_DEBUG),)
+	LD_FLAGS+= -w
+endif
+
+GO_OPT= -mod vendor -ldflags "$(LD_FLAGS)"
+ifeq ($(BUILD_DEBUG), 1)
+	GO_OPT+= -gcflags="all=-N -l"
+endif
+
+GO_ENV=CGO_ENABLED=0
+ifeq ($(GOARCH),amd64)
+	GO_ENV+= GOAMD64=v2
+endif
+ifeq ($(GOARCH),arm64)
+	GO_ENV+= GOARM64=v8.0
+endif
+
+GOTEST_OPT?= -race -timeout 25m -count=1 -v
+GOTEST_OPT_WITH_COVERAGE = $(GOTEST_OPT) -cover
+GOTEST=gotestsum --format=testname --
+COVERAGE_DIR?= .coverage
+LINT=golangci-lint
+
+UNAME := $(shell uname -s)
+ifeq ($(UNAME), Darwin)
+    SED_OPTS := ''
+endif
+
+FILES_TO_FMT=$(shell find . -type d \( -path ./vendor -o -path ./tools/vendor -o -path ./opentelemetry-proto -o -path ./vendor-fix -o -path ./.claude \) -prune -o -name '*.go' -not -name "*.pb.go" -not -name '*.y.go' -not -name '*.gen.go' -print)
+FILES_TO_JSONNETFMT=$(shell find ./operations/jsonnet ./operations/tempo-mixin ./example -type f \( -name '*.libsonnet' -o -name '*.jsonnet' \) -not -path "*/vendor/*" -print)
+
+##@ Building
+.PHONY: tempo 	
+tempo: ## Build tempo
+	$(GO_ENV) go build $(GO_OPT) -o ./bin/$(GOOS)/tempo-$(GOARCH) $(BUILD_INFO) ./cmd/tempo
+
+.PHONY: tempo-query
+tempo-query: ## Build tempo-query
+	$(GO_ENV) go build $(GO_OPT) -o ./bin/$(GOOS)/tempo-query-$(GOARCH) $(BUILD_INFO) ./cmd/tempo-query
+
+.PHONY: tempo-cli
+tempo-cli: ## Build tempo-cli
+	$(GO_ENV) go build $(GO_OPT) -o ./bin/$(GOOS)/tempo-cli-$(GOARCH) $(BUILD_INFO) ./cmd/tempo-cli
+
+.PHONY: tempo-vulture  ## Build tempo-vulture
+tempo-vulture:
+	$(GO_ENV) go build $(GO_OPT) -o ./bin/$(GOOS)/tempo-vulture-$(GOARCH) $(BUILD_INFO) ./cmd/tempo-vulture
+
+# tempo-v2.yaml and the nomad example are excluded on purpose - v2 targets an old release, nomad's README already flags it as unmaintained for 3.x.
+CONFIGS_TO_VERIFY = tools/packaging/tempo.yaml \
+	example/docker-compose/debug/tempo.yaml \
+	example/docker-compose/distributed/tempo.yaml \
+	example/docker-compose/multitenant/tempo.yaml \
+	example/docker-compose/single-binary/tempo.yaml \
+	example/docker-compose/migrate-to-3/tempo-v3.yaml
+
+.PHONY: check-configs
+check-configs: tempo ## Verify the packaged and example configs parse against the built binary
+	@fail=0; \
+	for f in $(CONFIGS_TO_VERIFY); do \
+		if ./bin/$(GOOS)/tempo-$(GOARCH) -config.file=$$f -config.verify=true -config.verify-errors-only=true; then \
+			echo "OK: $$f"; \
+		else \
+			echo "INVALID CONFIG: $$f"; \
+			fail=1; \
+		fi; \
+	done; \
+	exit $$fail
+
+.PHONY: exe  ## Build exe
+exe:
+	GOOS=linux make $(COMPONENT)
+
+.PHONY: exe-debug  ## Build exe-debug
+exe-debug:
+	BUILD_DEBUG=1 GOOS=linux make $(COMPONENT)
+
+##@ Unit Tests
+
+.PHONY: test
+test: ## Run tests
+	$(GOTEST) $(GOTEST_OPT) $(ALL_PKGS)
+
+.PHONY: benchmark
+benchmark: tools ## Run benchmarks
+	$(GOTEST) -bench=. -run=notests $(ALL_PKGS)
+
+# Not used in CI, tests are split in pkg, tempodb, tempodb-wal and others in CI jobs
+.PHONY: test-with-cover
+test-with-cover: tools ## Run tests with code coverage
+	mkdir -p $(COVERAGE_DIR)
+	$(GOTEST) $(GOTEST_OPT) -coverprofile=$(COVERAGE_DIR)/all.out $(ALL_PKGS)
+
+# tests in pkg
+.PHONY: test-with-cover-pkg
+test-with-cover-pkg: tools  ## Run Tempo packages' tests with code coverage
+	mkdir -p $(COVERAGE_DIR)
+	$(GOTEST) $(GOTEST_OPT) -coverprofile=$(COVERAGE_DIR)/pkg.out $(shell go list $(sort $(dir $(shell find . -name '*.go' -path './pkg*/*' -type f | sort))))
+
+# tests in tempodb (excluding tempodb/wal)
+.PHONY: test-with-cover-tempodb
+test-with-cover-tempodb: tools ## Run tempodb tests with code coverage
+	mkdir -p $(COVERAGE_DIR)
+	GOMEMLIMIT=6GiB $(GOTEST) $(GOTEST_OPT) -coverprofile=$(COVERAGE_DIR)/tempodb.out $(shell go list $(sort $(dir $(shell find . -name '*.go'  -not -path './tempodb/wal*/*' -path './tempodb*/*' -type f | sort))))
+
+# tests in tempodb/wal
+.PHONY: test-with-cover-tempodb-wal
+test-with-cover-tempodb-wal: tools  ## Test tempodb/wal with code coverage
+	mkdir -p $(COVERAGE_DIR)
+	$(GOTEST) $(GOTEST_OPT) -coverprofile=$(COVERAGE_DIR)/tempodb-wal.out $(shell go list $(sort $(dir $(shell find . -name '*.go' -path './tempodb/wal*/*' -type f | sort))))
+
+# all other tests (excluding pkg & tempodb)
+.PHONY: test-with-cover-others
+test-with-cover-others: tools ## Run other tests with code coverage
+	mkdir -p $(COVERAGE_DIR)
+	$(GOTEST) $(GOTEST_OPT) -coverprofile=$(COVERAGE_DIR)/others.out $(shell go list $(sort $(dir $(OTHERS_SRC))))
+
+##@ End to End Tests
+
+# runs e2e tests in the top level integration/e2e directory
+.PHONY: test-e2e
+test-e2e: tools docker-tempo docker-tempo-query test-e2e-operations test-e2e-api test-e2e-limits test-e2e-metrics-generator test-e2e-storage test-e2e-util ## Run all e2e tests
+	@echo "All e2e tests completed"
+
+# runs only operations e2e tests
+.PHONY: test-e2e-operations
+test-e2e-operations: tools docker-tempo docker-tempo-query ## Run operations e2e tests
+	$(GOTEST) -v $(GOTEST_OPT) ./integration/operations
+
+# runs only api e2e tests
+.PHONY: test-e2e-api
+test-e2e-api: tools docker-tempo docker-tempo-query ## Run api e2e tests
+	$(GOTEST) -v $(GOTEST_OPT) ./integration/api
+
+## runs only poller integration tests
+.PHONY: test-e2e-limits
+test-e2e-limits: tools tools docker-tempo ## Run limits e2e tests
+	$(GOTEST) -v $(GOTEST_OPT) ./integration/limits
+
+# runs only metrics-generator integration tests
+.PHONY: test-e2e-metrics-generator
+test-e2e-metrics-generator: tools docker-tempo ## Run metrics-generator e2e tests
+	$(GOTEST) -v $(GOTEST_OPT) ./integration/metrics-generator
+
+# runs only ingest integration tests
+.PHONY: test-e2e-storage
+test-e2e-storage: tools docker-tempo ## Run storage e2e tests
+	$(GOTEST) -v $(GOTEST_OPT) ./integration/storage
+
+# runs only ingest integration tests
+.PHONY: test-e2e-util
+test-e2e-util: tools docker-tempo ## Run unit tests on the e2e test harness
+	$(GOTEST) -v $(GOTEST_OPT) ./integration/util
+
+# test-all use a docker image so build it first to make sure we're up to date
+.PHONY: test-all
+test-all: test-with-cover test-e2e ## Run all tests
+
+# e2e test dirs are created by the host test process but their contents are written by
+# Tempo containers running as UID 10001. Clean up in two steps: first empty the contents
+# as UID 10001, then remove the now-empty dirs as the host user.
+.PHONY: test-e2e-clean
+test-e2e-clean: ## Remove leftover e2e test directories owned by Docker container UIDs
+	docker run --rm -u 10001 \
+		-v "$(shell pwd)/integration:/integration:z" \
+		alpine find /integration -maxdepth 3 -name 'e2e_integration_test*' -type d \
+		  -exec sh -c 'find "$$1" -mindepth 1 -delete' _ {} \;
+	find $(shell pwd)/integration -maxdepth 3 -name 'e2e_integration_test*' -type d -prune -exec rm -rf '{}' +
+
+##@ Linters/Formatters
+
+.PHONY: fmt check-fmt
+fmt: tools-image ## Format codebase with gofumpt and goimports
+	@$(TOOLS_CMD) gofumpt -w $(FILES_TO_FMT)
+	@$(TOOLS_CMD) goimports -w $(FILES_TO_FMT)
+
+check-fmt: fmt
+	@git diff --exit-code -- $(FILES_TO_FMT)
+
+.PHONY: jsonnetfmt check-jsonnetfmt ## Check jsonnetfmt
+jsonnetfmt: tools-image ## Format jsonnet codebase with jsonnetfmt
+	@$(TOOLS_CMD) jsonnetfmt -i $(FILES_TO_JSONNETFMT)
+
+check-jsonnetfmt: jsonnetfmt
+	@git diff --exit-code -- $(FILES_TO_JSONNETFMT)
+
+.PHONY: lint
+lint: ## Lint codebase with golangci-lint
+ifneq ($(base),)
+	$(LINT_CMD) $(LINT) run --config .golangci.yml --new-from-rev=$(base)
+else
+	$(LINT_CMD) $(LINT) run --config .golangci.yml
+endif
+
+##@ Code Coverage
+
+.PHONY: coverage-clean
+coverage-clean: ## Clean coverage files
+	rm -rf $(COVERAGE_DIR)
+
+##@ Docker Images
+
+.PHONY: docker-component 
+docker-component: check-component exe # not intended to be used directly
+	docker build -t grafana/$(COMPONENT) --build-arg=TARGETARCH=$(GOARCH) -f ./cmd/$(COMPONENT)/Dockerfile .
+	docker tag grafana/$(COMPONENT) $(COMPONENT)
+
+.PHONY: docker-component-multi
+docker-component-multi: check-component # not intended to be used directly
+	GOOS=linux GOARCH=amd64 make $(COMPONENT)
+	GOOS=linux GOARCH=arm64 make $(COMPONENT)
+	docker buildx build -t grafana/$(COMPONENT) --platform linux/amd64,linux/arm64 --output type=docker -f ./cmd/$(COMPONENT)/Dockerfile .
+
+.PHONY: docker-component-debug
+docker-component-debug: check-component exe-debug 
+	docker build -t grafana/$(COMPONENT)-debug --build-arg=TARGETARCH=$(GOARCH) -f ./cmd/$(COMPONENT)/Dockerfile_debug .
+	docker tag grafana/$(COMPONENT)-debug $(COMPONENT)-debug
+
+.PHONY: docker-tempo 
+docker-tempo: ## Build tempo docker image
+	COMPONENT=tempo make docker-component
+
+.PHONY: docker-tempo-multi
+docker-tempo-multi: ## Build multiarch image locally, requires containerd image store
+	COMPONENT=tempo make docker-component-multi
+
+docker-tempo-debug: ## Build tempo debug docker image
+	COMPONENT=tempo make docker-component-debug
+
+.PHONY: docker-cli
+docker-tempo-cli: ## Build tempo cli docker image
+	COMPONENT=tempo-cli make docker-component
+
+.PHONY: docker-tempo-query
+docker-tempo-query: ## Build tempo query docker image
+	COMPONENT=tempo-query make docker-component
+
+.PHONY: docker-tempo-vulture
+docker-tempo-vulture: ## Build tempo vulture docker image
+	COMPONENT=tempo-vulture make docker-component
+
+.PHONY: docker-tempo-vulture-multi
+docker-tempo-vulture-multi: ## Build tempo vulture docker image
+	COMPONENT=tempo-vulture make docker-component-multi
+
+.PHONY: docker-images ## Build all docker images
+docker-images: docker-tempo docker-tempo-query docker-tempo-vulture
+
+.PHONY: check-component
+check-component:
+ifndef COMPONENT
+	$(error COMPONENT variable was not defined)
+endif
+
+##@ Code Generation
+
+PROTO_INTERMEDIATE_DIR = pkg/.patched-proto
+BUF = docker run --rm -u ${shell id -u} -v${PWD}:/tempo -w/tempo -e HOME=/tempo --entrypoint /usr/local/bin/buf ${TEMPO_CI_TOOLS_IMAGE}
+
+.PHONY: gen-proto
+gen-proto:  ## Generate proto files
+	@echo --
+	@echo -- Deleting existing
+	@echo --
+	rm -rf opentelemetry-proto
+	rm -rf $(PROTO_INTERMEDIATE_DIR)
+	find pkg/tempopb -name *.pb.go | xargs -L 1 -I rm
+	# Here we avoid removing our tempo.proto and our frontend.proto due to reliance on the gogoproto bits.
+	find pkg/tempopb -name *.proto | grep -v tempo.proto | grep -v frontend.proto | grep -v backendwork.proto | xargs -L 1 -I rm
+
+	@echo --
+	@echo -- Copying to $(PROTO_INTERMEDIATE_DIR)
+	@echo --
+	git submodule update --init
+	mkdir -p $(PROTO_INTERMEDIATE_DIR)
+	cp -R opentelemetry-proto/opentelemetry/proto/* $(PROTO_INTERMEDIATE_DIR)
+
+	@echo --
+	@echo -- Editing proto
+	@echo --
+
+	@# Update package and types from opentelemetry.proto.* -> tempopb.*
+	@# giving final types like "tempopb.common.v1.InstrumentationLibrary" which
+	@# will not conflict with other usages of opentelemetry proto in downstream apps.
+	find $(PROTO_INTERMEDIATE_DIR) -name "*.proto" | xargs -L 1 sed -i $(SED_OPTS) 's+ opentelemetry.proto+ tempopb+g'
+
+	@# Update go_package
+	find $(PROTO_INTERMEDIATE_DIR) -name "*.proto" | xargs -L 1 sed -i $(SED_OPTS) 's+go.opentelemetry.io/proto/otlp+github.com/grafana/tempo/pkg/tempopb+g'
+
+	@# Update import paths
+	find $(PROTO_INTERMEDIATE_DIR) -name "*.proto" | xargs -L 1 sed -i $(SED_OPTS) 's+import "opentelemetry/proto/+import "+g'
+
+	@echo --
+	@echo -- Gen proto --
+	@echo --
+	@# Generate patched OpenTelemetry protos (output to pkg/tempopb/)
+	$(BUF) generate --config buf/buf.gen-config.yaml --template buf/buf.gen.otel.yaml --path $(PROTO_INTERMEDIATE_DIR)/common/v1/common.proto
+	$(BUF) generate --config buf/buf.gen-config.yaml --template buf/buf.gen.otel.yaml --path $(PROTO_INTERMEDIATE_DIR)/resource/v1/resource.proto
+	$(BUF) generate --config buf/buf.gen-config.yaml --template buf/buf.gen.otel.yaml --path $(PROTO_INTERMEDIATE_DIR)/trace/v1/trace.proto
+
+	@# Generate Tempo protos
+	$(BUF) generate --config buf/buf.gen-config.yaml --template buf/buf.gen.tempopb.yaml --path pkg/tempopb/tempo.proto
+	$(BUF) generate --config buf/buf.gen-config.yaml --template buf/buf.gen.tempopb.yaml --path pkg/tempopb/backendwork.proto
+
+	@# Generate backend proto (uses go_package for output path)
+	$(BUF) generate --config buf/buf.gen-config.yaml --template buf/buf.gen.backend.yaml --path tempodb/backend/v1/v1.proto
+
+	@# Generate frontend proto
+	$(BUF) generate --config buf/buf.gen-config.yaml --template buf/buf.gen.frontend.yaml --path modules/frontend/v1/frontendv1pb/frontend.proto
+
+	rm -rf $(PROTO_INTERMEDIATE_DIR)
+
+.PHONY: gen-traceql 
+gen-traceql: tools-image ## Generate traceql
+	$(TOOLS_CMD) make gen-traceql-local
+
+.PHONY: gen-traceql-local
+gen-traceql-local: ## Generate traceq local
+	goyacc -l -o pkg/traceql/expr.y.go pkg/traceql/expr.y && rm -f y.output
+
+.PHONY: gen-parquet-query
+gen-parquet-query:  ## Generate Parquet query 
+	go run ./pkg/parquetquerygen/predicates.go > ./pkg/parquetquery/predicates.gen.go && go fmt ./pkg/parquetquery/predicates.gen.go
+
+##@ Tempo tools
+### Check vendored and generated files are up to date
+.PHONY: vendor-check
+vendor-check: gen-proto update-mod gen-traceql gen-parquet-query ## Keep up to date vendorized files
+	git diff --exit-code -- **/go.sum **/go.mod vendor/ pkg/tempopb/ pkg/traceql/
+
+
+### Tidy dependencies for tempo modules
+.PHONY: update-mod 
+update-mod: tools-update-mod ## Update module
+	go mod vendor
+	go mod tidy -e
+
+
+### Release (intended to be used in the .github/workflows/release.yml)
+$(GORELEASER):
+	go install github.com/goreleaser/goreleaser/v2@v2.16.0
+
+.PHONY: release
+release: $(GORELEASER)  ## Release 
+	$(GORELEASER) release --clean
+
+.PHONY: release-snapshot
+release-snapshot: $(GORELEASER) ## Release snapshot
+	$(GORELEASER) release --skip=validate --clean --snapshot
+
+##@ Docs
+.PHONY: docs
+docs: ## Generate docs
+	docker pull ${DOCS_IMAGE}
+	docker run -v ${PWD}/docs/sources/tempo:/hugo/content/docs/tempo/latest:z -p 3002:3002 --rm $(DOCS_IMAGE) /bin/bash -c 'mkdir -p content/docs/grafana/latest/ && touch content/docs/grafana/latest/menu.yaml && make server'
+
+.PHONY: docs-test ## Generate docs tests
+docs-test:
+	docker pull ${DOCS_IMAGE}
+	docker run -v ${PWD}/docs/sources/tempo:/hugo/content/docs/tempo/latest:z -p 3002:3002 --rm $(DOCS_IMAGE) /bin/bash -c 'mkdir -p content/docs/grafana/latest/ && touch content/docs/grafana/latest/menu.yaml && make prod'
+
+.PHONY: generate-manifest
+generate-manifest:  ## Generate manifest.md file
+	GO111MODULE=on CGO_ENABLED=0 go run -v pkg/docsgen/generate_manifest.go
+
+##@ Release
+
+TEMPO_IMAGE_TAG ?=
+.PHONY: bump-tempo-image-tag
+bump-tempo-image-tag: ## Bump grafana/tempo image tag in docker-compose and jsonnet files. Usage: make bump-tempo-image-tag TEMPO_IMAGE_TAG=2.10.2
+	@test -n "$(TEMPO_IMAGE_TAG)" || (echo "ERROR: TEMPO_IMAGE_TAG is required. Usage: make bump-tempo-image-tag TEMPO_IMAGE_TAG=<tag>"; exit 1)
+	@echo "$(TEMPO_IMAGE_TAG)" | grep -qE '^(latest|[0-9]+\.[0-9]+\.[0-9]+)$$' || (echo "ERROR: TEMPO_IMAGE_TAG must be 'latest' or a version like '2.10.2', got: $(TEMPO_IMAGE_TAG)"; exit 1)
+	@echo "Replacing grafana/tempo:<any> -> grafana/tempo:$(TEMPO_IMAGE_TAG)"
+	@find . \
+		-not -path './.claude/*' \
+		-not -path './.git/*' \
+		-not -path './vendor/*' \
+		-not -path './.worktrees/*' \
+		\( -name "*.yaml" -o -name "*.libsonnet" -o -name "*.jsonnet" -o -name "*.md" \) \
+		-print0 \
+		| xargs -0 grep -l "grafana/tempo:" \
+		| tr '\n' '\0' \
+		| xargs -0 -I{} sed -i $(SED_OPTS) -E "s#grafana/tempo:(latest|[0-9]+\.[0-9]+\.[0-9]+)#grafana/tempo:$(TEMPO_IMAGE_TAG)#g" {}
+	@echo "Done. Re-run 'make jsonnet' to regenerate compiled jsonnet if needed."
+
+##@ jsonnet
+.PHONY: jsonnet jsonnet-check jsonnet-test
+jsonnet: tools-image ## Generate jsonnet
+	$(TOOLS_CMD) make -C operations/jsonnet-compiled gen
+
+jsonnet-check: tools-image ## Check jsonnet
+	$(TOOLS_CMD) make -C operations/jsonnet-compiled check
+
+jsonnet-test: tools-image ## Test jsonnet
+	$(TOOLS_CMD) make -C operations/jsonnet/microservices test
+
+### tempo-mixin
+.PHONY: jsonnetfmt tempo-mixin tempo-mixin-check
+tempo-mixin: tools-image
+	$(TOOLS_CMD) make -C operations/tempo-mixin all
+
+tempo-mixin-check: tools-image
+	$(TOOLS_CMD) make -C operations/tempo-mixin check
+
+##@ Changelog
+
+# chloggen is built from the tools module and run from the repo root so it can
+# find .chloggen/ and CHANGELOG.md. A .chloggen/config.yaml is used only if it
+# exists. chlog-new defaults the entry filename to the current branch; override
+# with FILENAME=... . Pass VERSION=vX.Y.Z to chlog-update.
+CHLOGGEN ?= $(CURDIR)/bin/chloggen
+CHLOGGEN_CONFIG := .chloggen/config.yaml
+CHLOGGEN_CONFIG_ARG := $(if $(wildcard $(CHLOGGEN_CONFIG)),--config $(CHLOGGEN_CONFIG),)
+CHLOG_BRANCH := $(shell git rev-parse --abbrev-ref HEAD 2>/dev/null)
+CHLOG_FILENAME := $(if $(FILENAME),$(FILENAME),$(CHLOG_BRANCH))
+CHLOG_EDITOR ?= $${VISUAL:-$${EDITOR:-vi}}
+CHLOG_EDIT ?= 1
+
+.PHONY: $(CHLOGGEN)
+$(CHLOGGEN):
+	cd $(CURDIR)/tools/chloggen && go build -o $(CHLOGGEN) .
+
+.PHONY: chlog-new
+chlog-new: $(CHLOGGEN) ## Create a new changelog entry under .chloggen/ (defaults to branch name; override with FILENAME=...)
+	@if [ -z "$(CHLOG_FILENAME)" ] || [ "$(CHLOG_FILENAME)" = "HEAD" ] || \
+	    [ "$(CHLOG_FILENAME)" = "main" ] || [ "$(CHLOG_FILENAME)" = "master" ]; then \
+	  echo "Cannot default the changelog filename from branch '$(CHLOG_BRANCH)'; pass FILENAME=<name>."; \
+	  exit 1; \
+	fi
+	@output="$$( $(CHLOGGEN) new $(CHLOGGEN_CONFIG_ARG) --filename "$(CHLOG_FILENAME)" )"; \
+	status=$$?; \
+	[ -z "$$output" ] || printf '%s\n' "$$output"; \
+	if [ $$status -ne 0 ]; then exit $$status; fi; \
+	entry="$$(printf '%s\n' "$$output" | awk '/^Changelog entry template copied to: /{sub(/^Changelog entry template copied to: /, ""); print; exit}')"; \
+	if [ -z "$$entry" ]; then echo "Could not determine changelog entry path." >&2; exit 1; fi; \
+	if [ "$(CHLOG_EDIT)" != "0" ] && [ -t 0 ] && [ -t 1 ]; then \
+	  $(CHLOG_EDITOR) "$$entry"; \
+	else \
+	  echo "Edit $$entry manually."; \
+	fi
+
+.PHONY: chlog-validate
+chlog-validate: $(CHLOGGEN) ## Validate the pending changelog entries
+	$(CHLOGGEN) validate $(CHLOGGEN_CONFIG_ARG)
+
+.PHONY: chlog-preview
+chlog-preview: $(CHLOGGEN) ## Render the pending changelog entries to stdout
+	$(CHLOGGEN) update $(CHLOGGEN_CONFIG_ARG) --dry
+
+.PHONY: chlog-update
+chlog-update: $(CHLOGGEN) ## Collate pending entries into CHANGELOG.md (VERSION=vX.Y.Z)
+	$(CHLOGGEN) update $(CHLOGGEN_CONFIG_ARG) --version "$(VERSION)"
+
+# Import fragments
+include build/tools.mk

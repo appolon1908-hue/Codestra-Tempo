@@ -1,0 +1,870 @@
+package overrides
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/grafana/dskit/services"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/common/config"
+	"github.com/prometheus/common/model"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.yaml.in/yaml/v2"
+
+	"github.com/grafana/tempo/pkg/sharedconfig"
+	"github.com/grafana/tempo/tempodb/backend"
+)
+
+func TestRuntimeConfigOverrides_loadPerTenantOverrides(t *testing.T) {
+	validator := &mockValidator{}
+
+	loader := loadPerTenantOverrides(validator, ConfigTypeNew, false, false)
+
+	perTenantOverrides := perTenantOverrides{
+		TenantLimits: map[string]*Overrides{
+			"foo": {Ingestion: IngestionOverrides{TenantShardSize: 6}},
+			"bar": {Ingestion: IngestionOverrides{TenantShardSize: 1}},
+			"bzz": {Ingestion: IngestionOverrides{TenantShardSize: 3}},
+		},
+	}
+	overridesBytes, err := yaml.Marshal(&perTenantOverrides)
+	assert.NoError(t, err)
+
+	// load overrides - validator should pass
+	_, err = loader(bytes.NewReader(overridesBytes))
+	assert.NoError(t, err)
+
+	// load overrides - validator should reject bar
+	validator.f = func(overrides *Overrides) error {
+		if overrides.Ingestion.TenantShardSize == 1 {
+			return errors.New("no")
+		}
+		return nil
+	}
+
+	_, err = loader(bytes.NewReader(overridesBytes))
+	assert.ErrorContains(t, err, "validating overrides for bar failed: no")
+}
+
+func TestRuntimeConfigOverrides(t *testing.T) {
+	tests := []struct {
+		name                        string
+		defaultLimits               Overrides
+		perTenantOverrides          *perTenantOverrides
+		expectedMaxLocalTraces      map[string]int
+		expectedMaxGlobalTraces     map[string]int
+		expectedMaxBytesPerTrace    map[string]int
+		expectedIngestionRateSpans  map[string]int
+		expectedIngestionBurstSpans map[string]int
+		expectedMaxSearchDuration   map[string]int
+	}{
+		{
+			name: "limits only",
+			defaultLimits: Overrides{
+				Ingestion: IngestionOverrides{
+					MaxGlobalTracesPerUser: 1,
+					MaxLocalTracesPerUser:  2,
+					BurstSizeBytes:         4,
+					RateLimitBytes:         5,
+				},
+				Global: GlobalOverrides{
+					MaxBytesPerTrace: 3,
+				},
+			},
+			expectedMaxGlobalTraces:     map[string]int{"user1": 1, "user2": 1},
+			expectedMaxLocalTraces:      map[string]int{"user1": 2, "user2": 2},
+			expectedMaxBytesPerTrace:    map[string]int{"user1": 3, "user2": 3},
+			expectedIngestionBurstSpans: map[string]int{"user1": 4, "user2": 4},
+			expectedIngestionRateSpans:  map[string]int{"user1": 5, "user2": 5},
+			expectedMaxSearchDuration:   map[string]int{"user1": 0, "user2": 0},
+		},
+		{
+			name: "basic Overrides",
+			defaultLimits: Overrides{
+				Ingestion: IngestionOverrides{
+					MaxGlobalTracesPerUser: 1,
+					MaxLocalTracesPerUser:  2,
+					BurstSizeBytes:         4,
+					RateLimitBytes:         5,
+				},
+				Global: GlobalOverrides{
+					MaxBytesPerTrace: 3,
+				},
+			},
+			perTenantOverrides: &perTenantOverrides{
+				TenantLimits: map[string]*Overrides{
+					"user1": {
+						Ingestion: IngestionOverrides{
+							MaxGlobalTracesPerUser: 6,
+							MaxLocalTracesPerUser:  7,
+							BurstSizeBytes:         9,
+							RateLimitBytes:         10,
+						},
+						Global: GlobalOverrides{
+							MaxBytesPerTrace: 8,
+						},
+						Read: ReadOverrides{
+							MaxSearchDuration: model.Duration(11 * time.Second),
+						},
+					},
+				},
+			},
+			expectedMaxGlobalTraces:     map[string]int{"user1": 6, "user2": 1},
+			expectedMaxLocalTraces:      map[string]int{"user1": 7, "user2": 2},
+			expectedMaxBytesPerTrace:    map[string]int{"user1": 8, "user2": 3},
+			expectedIngestionBurstSpans: map[string]int{"user1": 9, "user2": 4},
+			expectedIngestionRateSpans:  map[string]int{"user1": 10, "user2": 5},
+			expectedMaxSearchDuration:   map[string]int{"user1": int(11 * time.Second), "user2": 0},
+		},
+		{
+			name: "wildcard override",
+			defaultLimits: Overrides{
+				Ingestion: IngestionOverrides{
+					MaxGlobalTracesPerUser: 1,
+					MaxLocalTracesPerUser:  2,
+					BurstSizeBytes:         4,
+					RateLimitBytes:         5,
+				},
+				Global: GlobalOverrides{
+					MaxBytesPerTrace: 3,
+				},
+			},
+			perTenantOverrides: &perTenantOverrides{
+				TenantLimits: map[string]*Overrides{
+					"user1": {
+						Ingestion: IngestionOverrides{
+							MaxGlobalTracesPerUser: 6,
+							MaxLocalTracesPerUser:  7,
+							BurstSizeBytes:         9,
+							RateLimitBytes:         10,
+						},
+						Global: GlobalOverrides{
+							MaxBytesPerTrace: 8,
+						},
+					},
+					"*": {
+						Ingestion: IngestionOverrides{
+							MaxGlobalTracesPerUser: 11,
+							MaxLocalTracesPerUser:  12,
+							BurstSizeBytes:         14,
+							RateLimitBytes:         15,
+						},
+						Global: GlobalOverrides{
+							MaxBytesPerTrace: 13,
+						},
+						Read: ReadOverrides{
+							MaxSearchDuration: model.Duration(16 * time.Second),
+						},
+						CostAttribution: CostAttributionOverrides{Dimensions: map[string]string{"foo": "bar"}},
+					},
+				},
+			},
+			expectedMaxGlobalTraces:     map[string]int{"user1": 6, "user2": 11},
+			expectedMaxLocalTraces:      map[string]int{"user1": 7, "user2": 12},
+			expectedMaxBytesPerTrace:    map[string]int{"user1": 8, "user2": 13},
+			expectedIngestionBurstSpans: map[string]int{"user1": 9, "user2": 14},
+			expectedIngestionRateSpans:  map[string]int{"user1": 10, "user2": 15},
+			expectedMaxSearchDuration:   map[string]int{"user1": 0, "user2": int(16 * time.Second)},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			overrides, cleanup := createAndInitializeRuntimeOverridesManager(t, tt.defaultLimits, toYamlBytes(t, tt.perTenantOverrides))
+			defer cleanup()
+
+			for user, expectedVal := range tt.expectedMaxLocalTraces {
+				assert.Equal(t, expectedVal, overrides.MaxLocalTracesPerUser(user))
+			}
+
+			for user, expectedVal := range tt.expectedMaxGlobalTraces {
+				assert.Equal(t, expectedVal, overrides.MaxGlobalTracesPerUser(user))
+			}
+
+			for user, expectedVal := range tt.expectedIngestionBurstSpans {
+				assert.Equal(t, expectedVal, overrides.IngestionBurstSizeBytes(user))
+			}
+
+			for user, expectedVal := range tt.expectedIngestionRateSpans {
+				assert.Equal(t, float64(expectedVal), overrides.IngestionRateLimitBytes(user))
+			}
+
+			for user, expectedVal := range tt.expectedMaxSearchDuration {
+				assert.Equal(t, time.Duration(expectedVal), overrides.MaxSearchDuration(user))
+			}
+		})
+
+		t.Run(fmt.Sprintf("%s (legacy)", tt.name), func(t *testing.T) {
+			cfg := Config{
+				Defaults:              tt.defaultLimits,
+				EnableLegacyOverrides: true, // need to enable it to test
+			}
+
+			if tt.perTenantOverrides != nil {
+				overridesFile := filepath.Join(t.TempDir(), "Overrides.yaml")
+
+				legacyOverrides := &perTenantLegacyOverrides{}
+				legacyOverrides.TenantLimits = make(map[string]*LegacyOverrides)
+				for tenantID, limits := range tt.perTenantOverrides.TenantLimits {
+					legacyLimits := limits.toLegacy()
+					legacyOverrides.TenantLimits[tenantID] = &legacyLimits
+				}
+				buff, err := yaml.Marshal(legacyOverrides)
+				require.NoError(t, err)
+
+				err = os.WriteFile(overridesFile, buff, 0o700)
+				require.NoError(t, err)
+
+				cfg.PerTenantOverrideConfig = overridesFile
+				cfg.PerTenantOverridePeriod = model.Duration(time.Hour)
+			}
+
+			prometheus.DefaultRegisterer = prometheus.NewRegistry() // have to overwrite the registry or test panics with multiple metric reg
+			overrides, err := newRuntimeConfigOverrides(cfg, &mockValidator{}, prometheus.DefaultRegisterer)
+			require.NoError(t, err)
+			err = services.StartAndAwaitRunning(context.TODO(), overrides)
+			require.NoError(t, err)
+
+			for user, expectedVal := range tt.expectedMaxLocalTraces {
+				assert.Equal(t, expectedVal, overrides.MaxLocalTracesPerUser(user))
+			}
+
+			for user, expectedVal := range tt.expectedMaxGlobalTraces {
+				assert.Equal(t, expectedVal, overrides.MaxGlobalTracesPerUser(user))
+			}
+
+			for user, expectedVal := range tt.expectedIngestionBurstSpans {
+				assert.Equal(t, expectedVal, overrides.IngestionBurstSizeBytes(user))
+			}
+
+			for user, expectedVal := range tt.expectedIngestionRateSpans {
+				assert.Equal(t, float64(expectedVal), overrides.IngestionRateLimitBytes(user))
+			}
+
+			for user, expectedVal := range tt.expectedMaxSearchDuration {
+				assert.Equal(t, time.Duration(expectedVal), overrides.MaxSearchDuration(user))
+			}
+
+			err = services.StopAndAwaitTerminated(context.TODO(), overrides)
+			require.NoError(t, err)
+		})
+	}
+}
+
+func TestMetricsGeneratorOverrides(t *testing.T) {
+	tests := []struct {
+		name                                 string
+		defaultLimits                        Overrides
+		perTenantOverrides                   *perTenantOverrides
+		expectedEnableTargetInfo             map[string]bool
+		expectedDimensionMappings            map[string][]sharedconfig.DimensionMappings
+		expectedTargetInfoExcludedDimensions map[string][]string
+		expectedEnableInstanceLabel          map[string]bool
+	}{
+		{
+			name: "limits only",
+			defaultLimits: Overrides{
+				MetricsGenerator: MetricsGeneratorOverrides{
+					Processor: ProcessorOverrides{
+						SpanMetrics: SpanMetricsOverrides{
+							EnableTargetInfo: boolPtr(true),
+							DimensionMappings: []sharedconfig.DimensionMappings{
+								{
+									Name:        "test-name",
+									SourceLabel: []string{"service.name"},
+									Join:        "/",
+								},
+							},
+							EnableInstanceLabel: boolPtr(false),
+						},
+					},
+				},
+			},
+			expectedEnableTargetInfo: map[string]bool{"user1": true, "user2": true},
+			expectedDimensionMappings: map[string][]sharedconfig.DimensionMappings{
+				"user1": {
+					{
+						Name:        "test-name",
+						SourceLabel: []string{"service.name"},
+						Join:        "/",
+					},
+				},
+				"user2": {
+					{
+						Name:        "test-name",
+						SourceLabel: []string{"service.name"},
+						Join:        "/",
+					},
+				},
+			},
+			expectedEnableInstanceLabel: map[string]bool{"user1": false, "user2": false},
+		},
+		{
+			name:          "basic Overrides",
+			defaultLimits: Overrides{},
+			perTenantOverrides: &perTenantOverrides{
+				TenantLimits: map[string]*Overrides{
+					"user1": {
+						MetricsGenerator: MetricsGeneratorOverrides{
+							Processor: ProcessorOverrides{
+								SpanMetrics: SpanMetricsOverrides{
+									EnableTargetInfo: boolPtr(true),
+									DimensionMappings: []sharedconfig.DimensionMappings{
+										{
+											Name:        "test-name",
+											SourceLabel: []string{"service.name"},
+											Join:        "/",
+										},
+									},
+									EnableInstanceLabel: boolPtr(false),
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedEnableTargetInfo: map[string]bool{"user1": true, "user2": false},
+			expectedDimensionMappings: map[string][]sharedconfig.DimensionMappings{
+				"user1": {
+					{
+						Name:        "test-name",
+						SourceLabel: []string{"service.name"},
+						Join:        "/",
+					},
+				},
+				"user2": nil,
+			},
+			expectedEnableInstanceLabel: map[string]bool{"user1": false, "user2": true},
+		},
+		{
+			name: "wildcard override",
+			defaultLimits: Overrides{
+				MetricsGenerator: MetricsGeneratorOverrides{
+					Processor: ProcessorOverrides{
+						SpanMetrics: SpanMetricsOverrides{
+							EnableTargetInfo: boolPtr(false),
+							DimensionMappings: []sharedconfig.DimensionMappings{
+								{
+									Name:        "test-name",
+									SourceLabel: []string{"service.name"},
+									Join:        "/",
+								},
+							},
+						},
+					},
+				},
+			},
+			perTenantOverrides: &perTenantOverrides{
+				TenantLimits: map[string]*Overrides{
+					"user1": {
+						MetricsGenerator: MetricsGeneratorOverrides{
+							Processor: ProcessorOverrides{
+								SpanMetrics: SpanMetricsOverrides{
+									EnableTargetInfo: boolPtr(true),
+									DimensionMappings: []sharedconfig.DimensionMappings{
+										{
+											Name:        "another-name",
+											SourceLabel: []string{"service.namespace"},
+											Join:        "/",
+										},
+									},
+									TargetInfoExcludedDimensions: []string{"some-label"},
+								},
+							},
+						},
+					},
+					"*": {
+						MetricsGenerator: MetricsGeneratorOverrides{
+							Processor: ProcessorOverrides{
+								SpanMetrics: SpanMetricsOverrides{
+									EnableTargetInfo: boolPtr(false),
+									DimensionMappings: []sharedconfig.DimensionMappings{
+										{
+											Name:        "id-name",
+											SourceLabel: []string{"service.instance.id"},
+											Join:        "/",
+										},
+										{
+											Name:        "job",
+											SourceLabel: []string{"service.namespace", "service.name"},
+											Join:        "/",
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedEnableTargetInfo: map[string]bool{"user1": true, "user2": false},
+			expectedDimensionMappings: map[string][]sharedconfig.DimensionMappings{
+				"user1": {
+					{
+						Name:        "another-name",
+						SourceLabel: []string{"service.namespace"},
+						Join:        "/",
+					},
+				},
+				"user2": {
+					{
+						Name:        "id-name",
+						SourceLabel: []string{"service.instance.id"},
+						Join:        "/",
+					},
+					{
+						Name:        "job",
+						SourceLabel: []string{"service.namespace", "service.name"},
+						Join:        "/",
+					},
+				},
+			},
+			expectedTargetInfoExcludedDimensions: map[string][]string{
+				"user1": {"some-label"},
+			},
+			expectedEnableInstanceLabel: map[string]bool{"user1": true, "user2": true},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			overrides, cleanup := createAndInitializeRuntimeOverridesManager(t, tt.defaultLimits, toYamlBytes(t, tt.perTenantOverrides))
+			defer cleanup()
+
+			for user, expectedVal := range tt.expectedEnableTargetInfo {
+				enableTargetInfoValue, _ := overrides.MetricsGeneratorProcessorSpanMetricsEnableTargetInfo(user)
+				assert.Equal(t, expectedVal, enableTargetInfoValue)
+			}
+
+			for user, expectedVal := range tt.expectedDimensionMappings {
+				assert.Equal(t, expectedVal, overrides.MetricsGeneratorProcessorSpanMetricsDimensionMappings(user))
+			}
+
+			for user, expectedVal := range tt.expectedTargetInfoExcludedDimensions {
+				assert.Equal(t, expectedVal, overrides.MetricsGeneratorProcessorSpanMetricsTargetInfoExcludedDimensions(user))
+			}
+
+			for user, expectedVal := range tt.expectedEnableInstanceLabel {
+				EnableInstanceLabelValue, _ := overrides.MetricsGeneratorProcessorSpanMetricsEnableInstanceLabel(user)
+				assert.Equal(t, expectedVal, EnableInstanceLabelValue)
+			}
+
+			err := services.StopAndAwaitTerminated(context.TODO(), overrides)
+			require.NoError(t, err)
+		})
+	}
+}
+
+func TestTempoDBOverrides(t *testing.T) {
+	tests := []struct {
+		name                     string
+		defaultLimits            Overrides
+		perTenantOverrides       string
+		expectedDedicatedColumns map[string]backend.DedicatedColumns
+	}{
+		{
+			name: "limits",
+			defaultLimits: Overrides{
+				Storage: StorageOverrides{
+					DedicatedColumns: backend.DedicatedColumns{
+						{Scope: "resource", Name: "namespace", Type: "string"},
+					},
+				},
+			},
+			expectedDedicatedColumns: map[string]backend.DedicatedColumns{
+				"user1": {{Scope: "resource", Name: "namespace", Type: "string"}},
+				"user2": {{Scope: "resource", Name: "namespace", Type: "string"}},
+			},
+		},
+		{
+			name: "basic overrides",
+			defaultLimits: Overrides{
+				Storage: StorageOverrides{
+					DedicatedColumns: backend.DedicatedColumns{
+						{Scope: "resource", Name: "namespace", Type: "string"},
+					},
+				},
+			},
+			perTenantOverrides: `
+overrides:
+  user2:
+    storage:
+      parquet_dedicated_columns:
+        - scope: "span"
+          name: "http.status"
+          type: "int"
+`,
+			expectedDedicatedColumns: map[string]backend.DedicatedColumns{
+				"user1": {{Scope: "resource", Name: "namespace", Type: "string"}},
+				"user2": {{Scope: "span", Name: "http.status", Type: "int"}},
+			},
+		},
+		{
+			name: "empty dedicated columns override global cfg",
+			defaultLimits: Overrides{
+				Storage: StorageOverrides{
+					DedicatedColumns: backend.DedicatedColumns{
+						{Scope: "resource", Name: "namespace", Type: "string"},
+					},
+				},
+			},
+			perTenantOverrides: `
+overrides:
+  user1:
+  user2:
+    storage:
+      parquet_dedicated_columns: []
+`,
+			expectedDedicatedColumns: map[string]backend.DedicatedColumns{
+				"user1": {{Scope: "resource", Name: "namespace", Type: "string"}},
+				"user2": {},
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			overrides, cleanup := createAndInitializeRuntimeOverridesManager(t, tc.defaultLimits, []byte(tc.perTenantOverrides))
+			defer cleanup()
+
+			for user, expected := range tc.expectedDedicatedColumns {
+				assert.Equal(t, expected, overrides.DedicatedColumns(user))
+			}
+		})
+	}
+}
+
+func TestRemoteWriteHeaders(t *testing.T) {
+	cfg := Config{
+		Defaults: Overrides{
+			MetricsGenerator: MetricsGeneratorOverrides{
+				RemoteWriteHeaders: map[string]config.Secret{
+					"Authorization": "Bearer secret-token",
+				},
+			},
+		},
+	}
+
+	overrides, err := newRuntimeConfigOverrides(cfg, &mockValidator{}, prometheus.NewRegistry())
+	require.NoError(t, err)
+	require.NoError(t, services.StartAndAwaitRunning(context.TODO(), overrides))
+
+	buff := bytes.NewBuffer(nil)
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	require.NoError(t, overrides.WriteStatusRuntimeConfig(buff, req))
+
+	// Verify the YAML output can be unmarshalled back
+	var runtimeConfig struct {
+		Defaults           Overrides          `yaml:"defaults"`
+		PerTenantOverrides perTenantOverrides `yaml:",inline"`
+	}
+	require.NoError(t, yaml.UnmarshalStrict(buff.Bytes(), &runtimeConfig))
+
+	assert.Equal(t, "<secret>", string(runtimeConfig.Defaults.MetricsGenerator.RemoteWriteHeaders["Authorization"]))
+
+	fmt.Println(buff.String())
+}
+
+func TestExpandEnvOverrides(t *testing.T) {
+	const envVar = "TOKEN"
+	cfg := Config{
+		Defaults: Overrides{
+			MetricsGenerator: MetricsGeneratorOverrides{
+				RemoteWriteHeaders: map[string]config.Secret{
+					"Authorization": "Bearer token",
+				},
+			},
+		},
+		ExpandEnv: true,
+	}
+	// Set the ORG_ID env var
+	require.NoError(t, os.Setenv(envVar, "super-secret-token"))
+	t.Cleanup(func() {
+		require.NoError(t, os.Unsetenv(envVar))
+	})
+
+	perTenantOverrides := fmt.Sprintf(`
+overrides:
+  user1:
+    metrics_generator:
+      remote_write_headers:
+        Authorization: Bearer ${%s}
+`, envVar)
+
+	overridesFile := filepath.Join(t.TempDir(), "Overrides.yaml")
+
+	require.NoError(t, os.WriteFile(overridesFile, []byte(perTenantOverrides), 0o700))
+
+	cfg.PerTenantOverrideConfig = overridesFile
+	cfg.PerTenantOverridePeriod = model.Duration(time.Hour)
+
+	overrides, err := newRuntimeConfigOverrides(cfg, &mockValidator{}, prometheus.NewRegistry())
+	require.NoError(t, err)
+	require.NoError(t, services.StartAndAwaitRunning(context.TODO(), overrides))
+
+	expectedRemoteWriteHeaders := map[string]map[string]string{
+		"user1": {"Authorization": "Bearer super-secret-token"},
+		"user2": {"Authorization": "Bearer token"},
+	}
+	for user, expected := range expectedRemoteWriteHeaders {
+		assert.Equal(t, expected, overrides.MetricsGeneratorRemoteWriteHeaders(user))
+	}
+
+	require.NoError(t, services.StopAndAwaitTerminated(context.Background(), overrides))
+}
+
+func TestNativeHistogramOverrides(t *testing.T) {
+	tests := []struct {
+		name                            string
+		defaultLimits                   Overrides
+		perTenantOverrides              *perTenantOverrides
+		nativeHistogramBucketFactor     float64
+		nativeHistogramMaxBucketNumber  uint32
+		nativeHistogramMinResetDuration time.Duration
+	}{
+		{
+			name: "defaults only",
+			defaultLimits: Overrides{
+				MetricsGenerator: MetricsGeneratorOverrides{
+					NativeHistogramBucketFactor:     1.5,
+					NativeHistogramMaxBucketNumber:  20,
+					NativeHistogramMinResetDuration: 5 * time.Minute,
+				},
+			},
+			nativeHistogramBucketFactor:     1.5,
+			nativeHistogramMaxBucketNumber:  20,
+			nativeHistogramMinResetDuration: 5 * time.Minute,
+		},
+		{
+			name: "defaults only",
+			defaultLimits: Overrides{
+				MetricsGenerator: MetricsGeneratorOverrides{
+					NativeHistogramBucketFactor:     1.5,
+					NativeHistogramMaxBucketNumber:  20,
+					NativeHistogramMinResetDuration: 5 * time.Minute,
+				},
+			},
+			perTenantOverrides: &perTenantOverrides{
+				TenantLimits: map[string]*Overrides{
+					"user1": {
+						MetricsGenerator: MetricsGeneratorOverrides{
+							NativeHistogramBucketFactor:     2.0,
+							NativeHistogramMaxBucketNumber:  30,
+							NativeHistogramMinResetDuration: 10 * time.Minute,
+						},
+					},
+				},
+			},
+			nativeHistogramBucketFactor:     2.0,
+			nativeHistogramMaxBucketNumber:  30,
+			nativeHistogramMinResetDuration: 10 * time.Minute,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			overrides, cleanup := createAndInitializeRuntimeOverridesManager(t, tt.defaultLimits, toYamlBytes(t, tt.perTenantOverrides))
+			defer cleanup()
+
+			assert.Equal(t, tt.nativeHistogramBucketFactor, overrides.MetricsGeneratorNativeHistogramBucketFactor("user1"))
+			assert.Equal(t, tt.nativeHistogramMaxBucketNumber, overrides.MetricsGeneratorNativeHistogramMaxBucketNumber("user1"))
+			assert.Equal(t, tt.nativeHistogramMinResetDuration, overrides.MetricsGeneratorNativeHistogramMinResetDuration("user1"))
+
+			err := services.StopAndAwaitTerminated(context.TODO(), overrides)
+			require.NoError(t, err)
+		})
+	}
+}
+
+func TestIngestionRetryInfoEnabled(t *testing.T) {
+	tests := []struct {
+		name               string
+		defaultLimits      Overrides
+		perTenantOverrides *perTenantOverrides
+		expected           bool
+	}{
+		{
+			name: "no tenant override: cluster default wins",
+			defaultLimits: Overrides{
+				Ingestion: IngestionOverrides{RetryInfoEnabled: new(true)},
+			},
+			expected: true,
+		},
+		{
+			name: "tenant override explicitly disables it",
+			defaultLimits: Overrides{
+				Ingestion: IngestionOverrides{RetryInfoEnabled: new(true)},
+			},
+			perTenantOverrides: &perTenantOverrides{
+				TenantLimits: map[string]*Overrides{
+					"user1": {Ingestion: IngestionOverrides{RetryInfoEnabled: new(false)}},
+				},
+			},
+			expected: false,
+		},
+		{
+			name: "tenant override exists but doesn't mention retry info: falls back to cluster default",
+			defaultLimits: Overrides{
+				Ingestion: IngestionOverrides{RetryInfoEnabled: new(true)},
+			},
+			perTenantOverrides: &perTenantOverrides{
+				TenantLimits: map[string]*Overrides{
+					"user1": {Ingestion: IngestionOverrides{RateLimitBytes: 600_000_000}},
+				},
+			},
+			expected: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// A nil perTenantOverrides marshals to a literal "null" document; writing that as
+			// the runtime overrides file makes the loader decode a nil *perTenantOverrides and
+			// panic. Pass a nil []byte instead so no runtime overrides file is created at all.
+			var perTenantBytes []byte
+			if tt.perTenantOverrides != nil {
+				perTenantBytes = toYamlBytes(t, tt.perTenantOverrides)
+			}
+			overrides, cleanup := createAndInitializeRuntimeOverridesManager(t, tt.defaultLimits, perTenantBytes)
+			defer cleanup()
+
+			assert.Equal(t, tt.expected, overrides.IngestionRetryInfoEnabled("user1"))
+
+			err := services.StopAndAwaitTerminated(context.TODO(), overrides)
+			require.NoError(t, err)
+		})
+	}
+}
+
+func TestMetricsGeneratorMaxCardinalityPerLabel(t *testing.T) {
+	tests := []struct {
+		name               string
+		defaultLimits      Overrides
+		perTenantOverrides *perTenantOverrides
+		expected           map[string]uint64
+	}{
+		{
+			name: "default enabled, no tenant override",
+			defaultLimits: Overrides{
+				MetricsGenerator: MetricsGeneratorOverrides{
+					MaxCardinalityPerLabel: 100,
+				},
+			},
+			expected: map[string]uint64{"user1": 100, "user2": 100},
+		},
+		{
+			name:          "default disabled, tenant enables",
+			defaultLimits: Overrides{},
+			perTenantOverrides: &perTenantOverrides{
+				TenantLimits: map[string]*Overrides{
+					"user1": {
+						MetricsGenerator: MetricsGeneratorOverrides{
+							MaxCardinalityPerLabel: 50,
+						},
+					},
+				},
+			},
+			expected: map[string]uint64{"user1": 50, "user2": 0},
+		},
+		{
+			name: "default enabled, tenant disables with 0",
+			defaultLimits: Overrides{
+				MetricsGenerator: MetricsGeneratorOverrides{
+					MaxCardinalityPerLabel: 100,
+				},
+			},
+			perTenantOverrides: &perTenantOverrides{
+				TenantLimits: map[string]*Overrides{
+					"user1": {
+						MetricsGenerator: MetricsGeneratorOverrides{
+							MaxCardinalityPerLabel: 0,
+						},
+					},
+				},
+			},
+			expected: map[string]uint64{"user1": 0, "user2": 100},
+		},
+		{
+			name: "default enabled, tenant overrides with higher value",
+			defaultLimits: Overrides{
+				MetricsGenerator: MetricsGeneratorOverrides{
+					MaxCardinalityPerLabel: 100,
+				},
+			},
+			perTenantOverrides: &perTenantOverrides{
+				TenantLimits: map[string]*Overrides{
+					"user1": {
+						MetricsGenerator: MetricsGeneratorOverrides{
+							MaxCardinalityPerLabel: 500,
+						},
+					},
+				},
+			},
+			expected: map[string]uint64{"user1": 500, "user2": 100},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			overrides, cleanup := createAndInitializeRuntimeOverridesManager(t, tt.defaultLimits, toYamlBytes(t, tt.perTenantOverrides))
+			defer cleanup()
+
+			for user, expected := range tt.expected {
+				require.Equal(t, expected, overrides.MetricsGeneratorMaxCardinalityPerLabel(user), "user: %s", user)
+			}
+		})
+	}
+}
+
+func createAndInitializeRuntimeOverridesManager(t *testing.T, defaultLimits Overrides, perTenantOverrides []byte) (Service, func()) {
+	cfg := Config{
+		Defaults: defaultLimits,
+	}
+
+	if perTenantOverrides != nil {
+		overridesFile := filepath.Join(t.TempDir(), "Overrides.yaml")
+
+		err := os.WriteFile(overridesFile, perTenantOverrides, 0o700)
+		require.NoError(t, err)
+
+		cfg.PerTenantOverrideConfig = overridesFile
+		cfg.PerTenantOverridePeriod = model.Duration(time.Hour)
+	}
+
+	prometheus.DefaultRegisterer = prometheus.NewRegistry() // have to overwrite the registry or test panics with multiple metric reg
+	overrides, err := newRuntimeConfigOverrides(cfg, &mockValidator{}, prometheus.DefaultRegisterer)
+	require.NoError(t, err)
+
+	err = services.StartAndAwaitRunning(context.TODO(), overrides)
+	require.NoError(t, err)
+
+	return overrides, func() {
+		err := services.StopAndAwaitTerminated(context.TODO(), overrides)
+		require.NoError(t, err)
+	}
+}
+
+func toYamlBytes(t *testing.T, perTenantOverrides *perTenantOverrides) []byte {
+	buff, err := yaml.Marshal(perTenantOverrides)
+	require.NoError(t, err)
+	return buff
+}
+
+type mockValidator struct {
+	f func(*Overrides) error
+}
+
+func (m mockValidator) Validate(config *Overrides) (warnings []error, err error) {
+	if m.f != nil {
+		return nil, m.f(config)
+	}
+	return nil, nil
+}

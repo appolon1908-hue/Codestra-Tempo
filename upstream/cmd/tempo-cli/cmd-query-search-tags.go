@@ -1,0 +1,121 @@
+package main
+
+import (
+	"context"
+	"errors"
+	"io"
+	"path"
+
+	"github.com/grafana/dskit/user"
+	"google.golang.org/grpc"
+
+	"github.com/grafana/tempo/pkg/httpclient"
+	"github.com/grafana/tempo/pkg/tempopb"
+)
+
+type querySearchTagsCmd struct {
+	HostPort string `arg:"" help:"tempo host and port. scheme and path will be provided based on query type. e.g. localhost:3200"`
+	Start    string `arg:"" optional:"" help:"start time in RFC3339 (e.g. 2006-01-02T15:04:05Z07:00) or relative (e.g. now-1h) format"`
+	End      string `arg:"" optional:"" help:"end time in RFC3339 (e.g. 2006-01-02T15:04:05Z07:00) or relative (e.g. now) format"`
+
+	OrgID      string   `help:"optional orgID"`
+	Headers    []string `help:"extra headers in key=value format, sent as gRPC metadata when using --use-grpc" name:"header"`
+	UseGRPC    bool     `help:"stream search results over GRPC"`
+	PathPrefix string   `help:"string to prefix all http paths with"`
+	Secure     bool     `help:"use https or grpc with TLS"`
+}
+
+func (cmd *querySearchTagsCmd) Run(_ *globalOptions) error {
+	var start, end int64
+
+	if cmd.Start != "" {
+		startDate, err := parseTime(cmd.Start)
+		if err != nil {
+			return err
+		}
+		start = startDate.Unix()
+	}
+
+	if cmd.End != "" {
+		endDate, err := parseTime(cmd.End)
+		if err != nil {
+			return err
+		}
+		end = endDate.Unix()
+	}
+
+	if cmd.UseGRPC {
+		return cmd.searchGRPC(start, end)
+	}
+	return cmd.searchHTTP(start, end)
+}
+
+// nolint: goconst // goconst wants us to make http:// a const
+func (cmd *querySearchTagsCmd) searchHTTP(start, end int64) error {
+	if cmd.PathPrefix != "" {
+		cmd.HostPort = path.Join(cmd.HostPort, cmd.PathPrefix)
+	}
+	client := httpclient.New(httpScheme(cmd.Secure)+"://"+cmd.HostPort, cmd.OrgID)
+	applyHeaders(client, cmd.Headers)
+
+	var tags *tempopb.SearchTagsV2Response
+	var err error
+	if start != 0 || end != 0 {
+		tags, err = client.SearchTagsV2WithRange("", "", start, end)
+	} else {
+		tags, err = client.SearchTagsV2()
+	}
+
+	if err != nil {
+		return err
+	}
+
+	return printAsJSON(tags)
+}
+
+func (cmd *querySearchTagsCmd) searchGRPC(start, end int64) error {
+	ctx := user.InjectOrgID(context.Background(), cmd.OrgID)
+	ctx, err := user.InjectIntoGRPCRequest(ctx)
+	if err != nil {
+		return err
+	}
+	ctx = applyHeadersGRPC(ctx, cmd.Headers)
+
+	creds, err := grpcTransportCredentials(cmd.Secure)
+	if err != nil {
+		return err
+	}
+
+	clientConn, err := grpc.NewClient(cmd.HostPort, creds)
+	if err != nil {
+		return err
+	}
+
+	client := tempopb.NewStreamingQuerierClient(clientConn)
+
+	tagsRequest := &tempopb.SearchTagsRequest{
+		Start: uint32(start),
+		End:   uint32(end),
+	}
+
+	resp, err := client.SearchTagsV2(ctx, tagsRequest)
+	if err != nil {
+		return err
+	}
+
+	for {
+		searchResp, err := resp.Recv()
+		if searchResp != nil {
+			err = printAsJSON(searchResp)
+			if err != nil {
+				return err
+			}
+		}
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+	}
+}

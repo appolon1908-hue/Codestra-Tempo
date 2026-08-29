@@ -1,0 +1,802 @@
+package overrides
+
+import (
+	"context"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/grafana/dskit/services"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/common/model"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.yaml.in/yaml/v2"
+
+	"github.com/grafana/tempo/modules/overrides/histograms"
+	userconfigurableoverrides "github.com/grafana/tempo/modules/overrides/userconfigurable/client"
+	tempo_api "github.com/grafana/tempo/pkg/api"
+	"github.com/grafana/tempo/pkg/sharedconfig"
+	filterconfig "github.com/grafana/tempo/pkg/spanfilter/config"
+	"github.com/grafana/tempo/pkg/util/listtomap"
+	"github.com/grafana/tempo/tempodb/backend"
+	"github.com/grafana/tempo/tempodb/backend/local"
+)
+
+const (
+	tenant1 = "tenant-1"
+	tenant2 = "tenant-2"
+)
+
+func TestUserConfigOverridesManager(t *testing.T) {
+	defaultLimits := Overrides{
+		Global: GlobalOverrides{
+			MaxBytesPerTrace: 1024,
+		},
+		Forwarders: []string{"my-forwarder"},
+	}
+	_, mgr, cleanup := localUserConfigOverrides(t, defaultLimits, nil)
+	defer cleanup()
+
+	// Verify default limits are returned
+	assert.Equal(t, 1024, mgr.MaxBytesPerTrace(tenant1))
+	assert.Equal(t, []string{"my-forwarder"}, mgr.Forwarders(tenant1))
+	assert.Equal(t, 1024, mgr.MaxBytesPerTrace(tenant2))
+	assert.Equal(t, []string{"my-forwarder"}, mgr.Forwarders(tenant2))
+
+	// Update limits for tenant-1
+	userConfigurableLimits := &userconfigurableoverrides.Limits{
+		Forwarders: &[]string{"my-other-forwarder"},
+	}
+	_, err := mgr.client.Set(context.Background(), tenant2, userConfigurableLimits, backend.VersionNew)
+	assert.NoError(t, err)
+
+	assert.NoError(t, mgr.reloadAllTenantLimits(context.Background()))
+
+	// Verify updated limits are returned
+	assert.Equal(t, 1024, mgr.MaxBytesPerTrace(tenant1))
+	assert.Equal(t, []string{"my-forwarder"}, mgr.Forwarders(tenant1))
+	assert.Equal(t, 1024, mgr.MaxBytesPerTrace(tenant2))
+	assert.Equal(t, []string{"my-other-forwarder"}, mgr.Forwarders(tenant2))
+
+	// Delete limits for tenant-1
+	err = mgr.client.Delete(context.Background(), tenant2, backend.VersionNew)
+	assert.NoError(t, err)
+
+	assert.NoError(t, mgr.reloadAllTenantLimits(context.Background()))
+
+	// Verify default limits are returned again
+	assert.Equal(t, 1024, mgr.MaxBytesPerTrace(tenant1))
+	assert.Equal(t, []string{"my-forwarder"}, mgr.Forwarders(tenant1))
+	assert.Equal(t, 1024, mgr.MaxBytesPerTrace(tenant2))
+	assert.Equal(t, []string{"my-forwarder"}, mgr.Forwarders(tenant2))
+}
+
+func TestUserConfigOverridesManager_allFields(t *testing.T) {
+	defaultLimits := Overrides{}
+	_, mgr, cleanup := localUserConfigOverrides(t, defaultLimits, nil)
+	defer cleanup()
+
+	assert.Empty(t, mgr.Forwarders(tenant1))
+	assert.Empty(t, mgr.MetricsGeneratorProcessors(tenant1))
+	assert.Equal(t, false, mgr.MetricsGeneratorDisableCollection(tenant1))
+	assert.Empty(t, mgr.MetricsGeneratorGenerateNativeHistograms(tenant1))
+	assert.Empty(t, mgr.MetricsGeneratorMaxActiveSeries(tenant1))
+	assert.Equal(t, 0*time.Second, mgr.MetricsGeneratorCollectionInterval(tenant1))
+	assert.Equal(t, time.Duration(0), mgr.MetricsGeneratorIngestionSlack(tenant1))
+	assert.Empty(t, mgr.MetricsGeneratorProcessorServiceGraphsDimensions(tenant1))
+	assert.Empty(t, false, mgr.MetricsGeneratorProcessorServiceGraphsEnableClientServerPrefix(tenant1))
+	assert.Empty(t, mgr.MetricsGeneratorProcessorServiceGraphsPeerAttributes(tenant1))
+	assert.Empty(t, mgr.MetricsGeneratorProcessorServiceGraphsFilterPolicies(tenant1))
+	assert.Empty(t, mgr.MetricsGeneratorProcessorServiceGraphsHistogramBuckets(tenant1))
+	assert.Empty(t, mgr.MetricsGeneratorProcessorSpanMetricsDimensions(tenant1))
+	enableTargetInfoValue, enableTargetInfoIsSet := mgr.MetricsGeneratorProcessorSpanMetricsEnableTargetInfo(tenant1)
+	assert.Equal(t, false, enableTargetInfoValue)
+	assert.Equal(t, false, enableTargetInfoIsSet)
+	assert.Empty(t, mgr.MetricsGeneratorProcessorSpanMetricsFilterPolicies(tenant1))
+	assert.Empty(t, mgr.MetricsGeneratorProcessorSpanMetricsHistogramBuckets(tenant1))
+	assert.Empty(t, mgr.MetricsGeneratorProcessorSpanMetricsTargetInfoExcludedDimensions(tenant1))
+	EnableInstanceLabel, EnableInstanceLabelIsSet := mgr.MetricsGeneratorProcessorSpanMetricsEnableInstanceLabel(tenant1)
+	assert.Equal(t, true, EnableInstanceLabel)
+	assert.Equal(t, false, EnableInstanceLabelIsSet)
+	assert.Empty(t, mgr.MetricsGeneratorProcessorServiceGraphsSpanMultiplierKey(tenant1))
+	assert.Empty(t, mgr.MetricsGeneratorProcessorSpanMetricsSpanMultiplierKey(tenant1))
+
+	// Inject user-configurable overrides
+	mgr.tenantLimits[tenant1] = &userconfigurableoverrides.Limits{
+		Forwarders: &[]string{"my-forwarder"},
+		MetricsGenerator: userconfigurableoverrides.LimitsMetricsGenerator{
+			Processors:                      &listtomap.ListToMap{"service-graphs": {}},
+			DisableCollection:               boolPtr(true),
+			CollectionInterval:              &userconfigurableoverrides.Duration{Duration: 60 * time.Second},
+			TraceIDLabelName:                strPtr("trace_id"),
+			IngestionSlack:                  &userconfigurableoverrides.Duration{Duration: 45 * time.Second},
+			GenerateNativeHistograms:        (*histograms.HistogramMethod)(strPtr("native")),
+			NativeHistogramMaxBucketNumber:  func(u uint32) *uint32 { return &u }(101),
+			NativeHistogramBucketFactor:     func(f float64) *float64 { return &f }(1.4),
+			NativeHistogramMinResetDuration: &userconfigurableoverrides.Duration{Duration: 5 * time.Minute},
+			Processor: userconfigurableoverrides.LimitsMetricsGeneratorProcessor{
+				ServiceGraphs: userconfigurableoverrides.LimitsMetricsGeneratorProcessorServiceGraphs{
+					Dimensions:               &[]string{"sg-dimension"},
+					EnableClientServerPrefix: boolPtr(true),
+					EnableVirtualNodeLabel:   boolPtr(true),
+					PeerAttributes:           &[]string{"attribute"},
+					FilterPolicies: &[]filterconfig.FilterPolicy{
+						{
+							Exclude: &filterconfig.PolicyMatch{
+								MatchType: filterconfig.Strict,
+								Attributes: []filterconfig.MatchPolicyAttribute{
+									{
+										Key:   "resource.service.name",
+										Value: "mythical-requester",
+									},
+								},
+							},
+						},
+					},
+					HistogramBuckets:  &[]float64{1, 2, 3, 4, 5},
+					SpanMultiplierKey: strPtr("custom_key"),
+				},
+				SpanMetrics: userconfigurableoverrides.LimitsMetricsGeneratorProcessorSpanMetrics{
+					Dimensions:          &[]string{"sm-dimension"},
+					IntrinsicDimensions: mapBoolPtr(map[string]bool{"service": true, "span_name": false}),
+					DimensionMappings: &[]sharedconfig.DimensionMappings{{
+						Name:        "svc",
+						SourceLabel: []string{"service"},
+						Join:        "",
+					}},
+					EnableTargetInfo:    boolPtr(true),
+					EnableInstanceLabel: boolPtr(false),
+					FilterPolicies: &[]filterconfig.FilterPolicy{
+						{
+							Include: &filterconfig.PolicyMatch{
+								MatchType: filterconfig.Strict,
+								Attributes: []filterconfig.MatchPolicyAttribute{
+									{
+										Key:   "span.kind",
+										Value: "SPAN_KIND_SERVER",
+									},
+								},
+							},
+							Exclude: &filterconfig.PolicyMatch{
+								MatchType: filterconfig.Strict,
+								Attributes: []filterconfig.MatchPolicyAttribute{
+									{
+										Key:   "span.kind",
+										Value: "SPAN_KIND_CONSUMER",
+									},
+								},
+							},
+						},
+					},
+					HistogramBuckets:             &[]float64{10, 20, 30, 40, 50},
+					TargetInfoExcludedDimensions: &[]string{"some-label"},
+					SpanMultiplierKey:            strPtr("custom_key"),
+				},
+			},
+		},
+	}
+
+	// Verify we can get the updated overrides
+	assert.Equal(t, []string{"my-forwarder"}, mgr.Forwarders(tenant1))
+	assert.Equal(t, map[string]struct{}{"service-graphs": {}}, mgr.MetricsGeneratorProcessors(tenant1))
+	assert.Equal(t, true, mgr.MetricsGeneratorDisableCollection(tenant1))
+	assert.Equal(t, histograms.HistogramMethodNative, mgr.MetricsGeneratorGenerateNativeHistograms(tenant1))
+	assert.Equal(t, uint32(101), mgr.MetricsGeneratorNativeHistogramMaxBucketNumber(tenant1))
+	assert.Equal(t, 1.4, mgr.MetricsGeneratorNativeHistogramBucketFactor(tenant1))
+	assert.Equal(t, 5*time.Minute, mgr.MetricsGeneratorNativeHistogramMinResetDuration(tenant1))
+	assert.Equal(t, []string{"sg-dimension"}, mgr.MetricsGeneratorProcessorServiceGraphsDimensions(tenant1))
+	assert.Equal(t, 60*time.Second, mgr.MetricsGeneratorCollectionInterval(tenant1))
+	assert.Equal(t, "trace_id", mgr.MetricsGeneratorTraceIDLabelName(tenant1))
+	assert.Equal(t, 45*time.Second, mgr.MetricsGeneratorIngestionSlack(tenant1))
+	assert.Equal(t, true, mgr.MetricsGeneratorProcessorServiceGraphsEnableClientServerPrefix(tenant1))
+	enableVirtualNodeLabelValue, enableVirtualNodeLabelIsSet := mgr.MetricsGeneratorProcessorServiceGraphsEnableVirtualNodeLabel(tenant1)
+	assert.Equal(t, true, enableVirtualNodeLabelValue)
+	assert.Equal(t, true, enableVirtualNodeLabelIsSet)
+	assert.Equal(t, []string{"attribute"}, mgr.MetricsGeneratorProcessorServiceGraphsPeerAttributes(tenant1))
+	assert.Equal(t, []float64{1, 2, 3, 4, 5}, mgr.MetricsGeneratorProcessorServiceGraphsHistogramBuckets(tenant1))
+	serviceGraphFilterPolicies := mgr.MetricsGeneratorProcessorServiceGraphsFilterPolicies(tenant1)
+	assert.NotEmpty(t, serviceGraphFilterPolicies)
+	assert.Equal(t, filterconfig.Strict, serviceGraphFilterPolicies[0].Exclude.MatchType)
+	assert.Equal(t, "resource.service.name", serviceGraphFilterPolicies[0].Exclude.Attributes[0].Key)
+	assert.Equal(t, "mythical-requester", serviceGraphFilterPolicies[0].Exclude.Attributes[0].Value)
+	assert.Equal(t, []string{"sm-dimension"}, mgr.MetricsGeneratorProcessorSpanMetricsDimensions(tenant1))
+	assert.Equal(t, map[string]bool{"service": true, "span_name": false}, mgr.MetricsGeneratorProcessorSpanMetricsIntrinsicDimensions(tenant1))
+	assert.Equal(t, []sharedconfig.DimensionMappings{{Name: "svc", SourceLabel: []string{"service"}, Join: ""}}, mgr.MetricsGeneratorProcessorSpanMetricsDimensionMappings(tenant1))
+	enableTargetInfoValue, enableTargetInfoIsSet = mgr.MetricsGeneratorProcessorSpanMetricsEnableTargetInfo(tenant1)
+	assert.Equal(t, true, enableTargetInfoValue)
+	assert.Equal(t, true, enableTargetInfoIsSet)
+	assert.Equal(t, []float64{10, 20, 30, 40, 50}, mgr.MetricsGeneratorProcessorSpanMetricsHistogramBuckets(tenant1))
+	assert.Equal(t, []string{"some-label"}, mgr.MetricsGeneratorProcessorSpanMetricsTargetInfoExcludedDimensions(tenant1))
+	EnableInstanceLabel, EnableInstanceLabelIsSet = mgr.MetricsGeneratorProcessorSpanMetricsEnableInstanceLabel(tenant1)
+	assert.Equal(t, false, EnableInstanceLabel)
+	assert.Equal(t, true, EnableInstanceLabelIsSet)
+
+	filterPolicies := mgr.MetricsGeneratorProcessorSpanMetricsFilterPolicies(tenant1)
+	assert.NotEmpty(t, filterPolicies)
+	assert.Equal(t, filterconfig.Strict, filterPolicies[0].Include.MatchType)
+	assert.Equal(t, filterconfig.Strict, filterPolicies[0].Exclude.MatchType)
+	assert.Equal(t, "span.kind", filterPolicies[0].Include.Attributes[0].Key)
+	assert.Equal(t, "span.kind", filterPolicies[0].Exclude.Attributes[0].Key)
+	assert.Equal(t, "SPAN_KIND_SERVER", filterPolicies[0].Include.Attributes[0].Value)
+	assert.Equal(t, "SPAN_KIND_CONSUMER", filterPolicies[0].Exclude.Attributes[0].Value)
+	assert.Equal(t, "custom_key", mgr.MetricsGeneratorProcessorServiceGraphsSpanMultiplierKey(tenant1))
+	assert.Equal(t, "custom_key", mgr.MetricsGeneratorProcessorSpanMetricsSpanMultiplierKey(tenant1))
+}
+
+func TestUserConfigOverridesManager_MetricsGeneratorSpanNameSanitization(t *testing.T) {
+	defaultLimits := Overrides{
+		MetricsGenerator: MetricsGeneratorOverrides{
+			SpanNameSanitization: "disabled",
+		},
+	}
+	_, mgr, cleanup := localUserConfigOverrides(t, defaultLimits, nil)
+	defer cleanup()
+
+	// Test fallback behavior - tenant without override should return default value
+	assert.Equal(t, "disabled", mgr.MetricsGeneratorSpanNameSanitization(tenant1))
+	assert.Equal(t, "disabled", mgr.MetricsGeneratorSpanNameSanitization(tenant2))
+
+	// Set user-configurable override for tenant1
+	mgr.tenantLimits[tenant1] = &userconfigurableoverrides.Limits{
+		MetricsGenerator: userconfigurableoverrides.LimitsMetricsGenerator{
+			SpanNameSanitization: strPtr("enabled"),
+		},
+	}
+
+	// Test tenant override behavior - tenant1 should return override value
+	assert.Equal(t, "enabled", mgr.MetricsGeneratorSpanNameSanitization(tenant1))
+
+	// Test fallback behavior - tenant2 without override should still return default value
+	assert.Equal(t, "disabled", mgr.MetricsGeneratorSpanNameSanitization(tenant2))
+
+	// Update override for tenant1
+	mgr.tenantLimits[tenant1] = &userconfigurableoverrides.Limits{
+		MetricsGenerator: userconfigurableoverrides.LimitsMetricsGenerator{
+			SpanNameSanitization: strPtr("strict"),
+		},
+	}
+
+	// Test updated override value
+	assert.Equal(t, "strict", mgr.MetricsGeneratorSpanNameSanitization(tenant1))
+
+	// Remove override for tenant1
+	delete(mgr.tenantLimits, tenant1)
+
+	// Test fallback behavior after removal - should return default value again
+	assert.Equal(t, "disabled", mgr.MetricsGeneratorSpanNameSanitization(tenant1))
+}
+
+func TestUserConfigOverridesManager_populateFromBackend(t *testing.T) {
+	defaultLimits := Overrides{
+		Forwarders: []string{"my-forwarder"},
+	}
+	tempDir, mgr, cleanup := localUserConfigOverrides(t, defaultLimits, nil)
+	defer cleanup()
+
+	assert.Equal(t, mgr.Forwarders(tenant1), []string{"my-forwarder"})
+
+	// write directly to backend
+	limits := &userconfigurableoverrides.Limits{
+		Forwarders: &[]string{"my-other-forwarder"},
+	}
+	writeUserConfigurableOverridesToDisk(t, tempDir, tenant1, limits)
+
+	// reload from backend
+	err := mgr.reloadAllTenantLimits(context.Background())
+	assert.NoError(t, err)
+
+	assert.Equal(t, mgr.Forwarders(tenant1), []string{"my-other-forwarder"})
+}
+
+func TestUserConfigOverridesManager_deletedFromBackend(t *testing.T) {
+	defaultLimits := Overrides{
+		Forwarders: []string{"my-forwarder"},
+	}
+	tempDir, mgr, cleanup := localUserConfigOverrides(t, defaultLimits, nil)
+	defer cleanup()
+
+	limits := &userconfigurableoverrides.Limits{
+		Forwarders: &[]string{"my-other-forwarder"},
+	}
+	_, err := mgr.client.Set(context.Background(), tenant1, limits, backend.VersionNew)
+	assert.NoError(t, err)
+
+	assert.NoError(t, mgr.reloadAllTenantLimits(context.Background()))
+
+	assert.Equal(t, mgr.Forwarders(tenant1), []string{"my-other-forwarder"})
+
+	// delete overrides.json directly from the backend
+	deleteUserConfigurableOverridesFromDisk(t, tempDir, tenant1)
+
+	// reload from backend
+	err = mgr.reloadAllTenantLimits(context.Background())
+	assert.NoError(t, err)
+
+	assert.Equal(t, mgr.Forwarders("foo"), []string{"my-forwarder"})
+}
+
+func TestUserConfigOverridesManager_backendUnavailable(t *testing.T) {
+	defaultLimits := Overrides{
+		Forwarders: []string{"my-forwarder"},
+	}
+	_, mgr, cleanup := localUserConfigOverrides(t, defaultLimits, nil)
+	defer cleanup()
+
+	limits := &userconfigurableoverrides.Limits{
+		Forwarders: &[]string{"my-other-forwarder"},
+	}
+	_, err := mgr.client.Set(context.Background(), tenant1, limits, backend.VersionNew)
+	assert.NoError(t, err)
+
+	assert.NoError(t, mgr.reloadAllTenantLimits(context.Background()))
+
+	// replace reader by this uncooperative fella
+	mgr.client = &badClient{}
+
+	// reloading fails
+	assert.Error(t, mgr.reloadAllTenantLimits(context.Background()))
+
+	// but overrides should be cached
+	assert.Equal(t, []string{"my-other-forwarder"}, mgr.Forwarders(tenant1))
+}
+
+func TestUserConfigOverridesManager_WriteStatusRuntimeConfig(t *testing.T) {
+	bl := Overrides{Forwarders: []string{"my-forwarder"}}
+	_, configurableOverrides, cleanup := localUserConfigOverrides(t, bl, nil)
+	defer cleanup()
+
+	// set user config limits
+	configurableOverrides.tenantLimits["test"] = &userconfigurableoverrides.Limits{
+		Forwarders: &[]string{"my-other-forwarder"},
+	}
+
+	tests := []struct {
+		name      string
+		overrides Service
+		req       *http.Request
+	}{
+		{
+			name:      "UserConfigOverrides with ucl",
+			overrides: configurableOverrides,
+			req:       httptest.NewRequest("GET", "/", nil),
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			err := tc.overrides.WriteStatusRuntimeConfig(w, tc.req)
+			require.NoError(t, err)
+
+			data := w.Body.String()
+			require.Contains(t, data, "user_configurable_overrides")
+			require.Contains(t, data, "my-other-forwarder")
+
+			// Verify the YAML output can be unmarshalled back
+			var config map[string]interface{}
+			require.NoError(t, yaml.UnmarshalStrict(w.Body.Bytes(), &config))
+
+			require.Contains(t, config, "defaults")
+			require.Contains(t, config, "overrides")
+
+			res := w.Result()
+			require.Equal(t, "text/plain; charset=utf-8", res.Header.Get(tempo_api.HeaderContentType))
+			require.Equal(t, 200, res.StatusCode)
+		})
+	}
+}
+
+func localUserConfigOverrides(t *testing.T, baseLimits Overrides, perTenantOverrides []byte) (string, *userConfigurableOverridesManager, func()) {
+	path := t.TempDir()
+
+	cfg := &UserConfigurableOverridesConfig{
+		Enabled: true,
+		Client: userconfigurableoverrides.Config{
+			Backend: backend.Local,
+			Local:   &local.Config{Path: path},
+		},
+		PollInterval: time.Second,
+	}
+
+	baseCfg := Config{
+		Defaults: baseLimits,
+	}
+
+	if perTenantOverrides != nil {
+		overridesFile := filepath.Join(t.TempDir(), "Overrides.yaml")
+
+		err := os.WriteFile(overridesFile, perTenantOverrides, 0o700)
+		require.NoError(t, err)
+
+		baseCfg.PerTenantOverrideConfig = overridesFile
+		baseCfg.PerTenantOverridePeriod = model.Duration(time.Hour)
+	}
+
+	baseOverrides, err := NewOverrides(baseCfg, &mockValidator{}, prometheus.NewRegistry())
+	assert.NoError(t, err)
+
+	// have to overwrite the registry or test panics with multiple metric reg
+	prometheus.DefaultRegisterer = prometheus.NewRegistry()
+	configurableOverrides, err := newUserConfigOverrides(cfg, baseOverrides)
+	assert.NoError(t, err)
+
+	// wait for service and subservices to start and load runtime config
+	err = services.StartAndAwaitRunning(context.TODO(), configurableOverrides)
+	require.NoError(t, err)
+
+	return path, configurableOverrides, func() {
+		err := services.StopAndAwaitTerminated(context.TODO(), configurableOverrides)
+		require.NoError(t, err)
+	}
+}
+
+func writeUserConfigurableOverridesToDisk(t *testing.T, dir string, tenant string, limits *userconfigurableoverrides.Limits) {
+	client, err := userconfigurableoverrides.New(&userconfigurableoverrides.Config{
+		Backend: backend.Local,
+		Local:   &local.Config{Path: dir},
+	})
+	assert.NoError(t, err)
+
+	_, err = client.Set(context.Background(), tenant, limits, backend.VersionNew)
+	assert.NoError(t, err)
+}
+
+func deleteUserConfigurableOverridesFromDisk(t *testing.T, dir string, tenant string) {
+	client, err := userconfigurableoverrides.New(&userconfigurableoverrides.Config{
+		Backend: backend.Local,
+		Local:   &local.Config{Path: dir},
+	})
+	assert.NoError(t, err)
+
+	err = client.Delete(context.Background(), tenant, backend.VersionNew)
+	assert.NoError(t, err)
+}
+
+type badClient struct{}
+
+var _ userconfigurableoverrides.Client = (*badClient)(nil)
+
+func (b *badClient) List(context.Context) ([]string, error) {
+	return nil, errors.New("no")
+}
+
+func (b *badClient) Get(context.Context, string) (*userconfigurableoverrides.Limits, backend.Version, error) {
+	return nil, "", errors.New("no")
+}
+
+func (b *badClient) Set(context.Context, string, *userconfigurableoverrides.Limits, backend.Version) (backend.Version, error) {
+	return "", errors.New("no")
+}
+
+func (b *badClient) Delete(context.Context, string, backend.Version) error {
+	return errors.New("no")
+}
+
+func (b badClient) Shutdown() {
+}
+
+func boolPtr(b bool) *bool {
+	return &b
+}
+
+func mapBoolPtr(m map[string]bool) *map[string]bool {
+	return &m
+}
+
+// TestUserConfigOverridesManager_OverridesRuntimeConfig verifies the layering of
+// user-configurable overrides on top of per-tenant runtime overrides: for fields set
+// in user-configurable overrides, the user-configurable value wins outright; for fields
+// not set, runtime overrides bubble through.
+func TestUserConfigOverridesManager_OverridesRuntimeConfig(t *testing.T) {
+	tenantID := "test"
+
+	// setup per tenant runtime override for tenant "test"
+	pto := perTenantRuntimeOverrides(tenantID)
+
+	_, mgr, cleanup := localUserConfigOverrides(t, Overrides{}, toYamlBytes(t, pto))
+	defer cleanup()
+	// mgr.Interface will call baseOverrides manager, which is runtime config overrides.
+	baseMgr := mgr.Interface
+
+	// Set Forwarders in UserConfigOverrides limits
+	mgr.tenantLimits[tenantID] = &userconfigurableoverrides.Limits{
+		Forwarders: &[]string{"my-other-forwarder"},
+		MetricsGenerator: userconfigurableoverrides.LimitsMetricsGenerator{
+			Processors:                      &listtomap.ListToMap{"span-metrics": {}},
+			TraceIDLabelName:                strPtr("custom_trace_id"),
+			IngestionSlack:                  &userconfigurableoverrides.Duration{Duration: time.Minute},
+			NativeHistogramBucketFactor:     func(f float64) *float64 { return &f }(2.1),
+			NativeHistogramMinResetDuration: &userconfigurableoverrides.Duration{Duration: 2 * time.Minute},
+			Processor: userconfigurableoverrides.LimitsMetricsGeneratorProcessor{
+				SpanMetrics: userconfigurableoverrides.LimitsMetricsGeneratorProcessorSpanMetrics{
+					IntrinsicDimensions: mapBoolPtr(map[string]bool{"service": true}),
+					DimensionMappings: &[]sharedconfig.DimensionMappings{{
+						Name:        "svc",
+						SourceLabel: []string{"service"},
+						Join:        "",
+					}},
+				},
+			},
+		},
+	}
+
+	// Test all override methods
+
+	// Forwarders are set in user-configurable overrides and will override runtime overrides
+	assert.NotEqual(t, mgr.Forwarders(tenantID), baseMgr.Forwarders(tenantID))
+
+	// Processors set in user-configurable overrides fully override the runtime list (no merge)
+	assert.Equal(t, mgr.MetricsGeneratorProcessors(tenantID), map[string]struct{}{"span-metrics": {}})
+
+	// For the remaining settings runtime overrides will bubble up
+	assert.Equal(t, mgr.IngestionRateStrategy(), baseMgr.IngestionRateStrategy())
+	assert.Equal(t, mgr.MaxLocalTracesPerUser(tenantID), baseMgr.MaxLocalTracesPerUser(tenantID))
+	assert.Equal(t, mgr.MaxGlobalTracesPerUser(tenantID), baseMgr.MaxGlobalTracesPerUser(tenantID))
+	assert.Equal(t, mgr.MaxBytesPerTrace(tenantID), baseMgr.MaxBytesPerTrace(tenantID))
+	assert.Equal(t, mgr.Forwarders(tenantID), []string{"my-other-forwarder"})
+	assert.Equal(t, baseMgr.Forwarders(tenantID), []string{"fwd", "fwd-2"})
+
+	assert.Equal(t, mgr.MaxBytesPerTagValuesQuery(tenantID), baseMgr.MaxBytesPerTagValuesQuery(tenantID))
+	assert.Equal(t, mgr.MaxBlocksPerTagValuesQuery(tenantID), baseMgr.MaxBlocksPerTagValuesQuery(tenantID))
+	assert.Equal(t, mgr.IngestionRateLimitBytes(tenantID), baseMgr.IngestionRateLimitBytes(tenantID))
+	assert.Equal(t, mgr.IngestionBurstSizeBytes(tenantID), baseMgr.IngestionBurstSizeBytes(tenantID))
+	assert.Equal(t, time.Minute, mgr.MetricsGeneratorIngestionSlack(tenantID))
+	assert.NotEqual(t, mgr.MetricsGeneratorIngestionSlack(tenantID), baseMgr.MetricsGeneratorIngestionSlack(tenantID))
+	assert.Equal(t, mgr.MetricsGeneratorRingSize(tenantID), baseMgr.MetricsGeneratorRingSize(tenantID))
+	assert.Equal(t, 2.1, mgr.MetricsGeneratorNativeHistogramBucketFactor(tenantID))
+	assert.NotEqual(t, mgr.MetricsGeneratorNativeHistogramBucketFactor(tenantID), baseMgr.MetricsGeneratorNativeHistogramBucketFactor(tenantID))
+	assert.Equal(t, 2*time.Minute, mgr.MetricsGeneratorNativeHistogramMinResetDuration(tenantID))
+	assert.NotEqual(t, mgr.MetricsGeneratorNativeHistogramMinResetDuration(tenantID), baseMgr.MetricsGeneratorNativeHistogramMinResetDuration(tenantID))
+	assert.Equal(t, mgr.MetricsGeneratorMaxActiveSeries(tenantID), baseMgr.MetricsGeneratorMaxActiveSeries(tenantID))
+	assert.Equal(t, mgr.MetricsGeneratorCollectionInterval(tenantID), baseMgr.MetricsGeneratorCollectionInterval(tenantID))
+	assert.Equal(t, mgr.MetricsGeneratorDisableCollection(tenantID), baseMgr.MetricsGeneratorDisableCollection(tenantID))
+	assert.Equal(t, "custom_trace_id", mgr.MetricsGeneratorTraceIDLabelName(tenantID))
+	assert.Equal(t, mgr.MetricsGeneratorForwarderQueueSize(tenantID), baseMgr.MetricsGeneratorForwarderQueueSize(tenantID))
+	assert.Equal(t, mgr.MetricsGeneratorForwarderWorkers(tenantID), baseMgr.MetricsGeneratorForwarderWorkers(tenantID))
+	assert.Equal(t, mgr.MetricsGeneratorProcessorServiceGraphsHistogramBuckets(tenantID), baseMgr.MetricsGeneratorProcessorServiceGraphsHistogramBuckets(tenantID))
+	assert.Equal(t, mgr.MetricsGeneratorProcessorServiceGraphsDimensions(tenantID), baseMgr.MetricsGeneratorProcessorServiceGraphsDimensions(tenantID))
+	assert.Equal(t, mgr.MetricsGeneratorProcessorServiceGraphsPeerAttributes(tenantID), baseMgr.MetricsGeneratorProcessorServiceGraphsPeerAttributes(tenantID))
+	assert.Equal(t, mgr.MetricsGeneratorProcessorServiceGraphsFilterPolicies(tenantID), baseMgr.MetricsGeneratorProcessorServiceGraphsFilterPolicies(tenantID))
+	assert.Equal(t, mgr.MetricsGeneratorProcessorSpanMetricsHistogramBuckets(tenantID), baseMgr.MetricsGeneratorProcessorSpanMetricsHistogramBuckets(tenantID))
+	assert.Equal(t, mgr.MetricsGeneratorProcessorSpanMetricsDimensions(tenantID), baseMgr.MetricsGeneratorProcessorSpanMetricsDimensions(tenantID))
+	assert.Equal(t, map[string]bool{"service": true}, mgr.MetricsGeneratorProcessorSpanMetricsIntrinsicDimensions(tenantID))
+	assert.NotEqual(t, mgr.MetricsGeneratorProcessorSpanMetricsIntrinsicDimensions(tenantID), baseMgr.MetricsGeneratorProcessorSpanMetricsIntrinsicDimensions(tenantID))
+	assert.Equal(t, []sharedconfig.DimensionMappings{{Name: "svc", SourceLabel: []string{"service"}, Join: ""}}, mgr.MetricsGeneratorProcessorSpanMetricsDimensionMappings(tenantID))
+	assert.NotEqual(t, baseMgr.MetricsGeneratorProcessorSpanMetricsDimensionMappings(tenantID), mgr.MetricsGeneratorProcessorSpanMetricsDimensionMappings(tenantID))
+	assert.Equal(t, mgr.MetricsGeneratorProcessorSpanMetricsFilterPolicies(tenantID), baseMgr.MetricsGeneratorProcessorSpanMetricsFilterPolicies(tenantID))
+	baseEnableTargetInfoValue, baseEnableTargetInfoIsSet := mgr.MetricsGeneratorProcessorSpanMetricsEnableTargetInfo(tenantID)
+	overrideEnableTargetInfoValue, overrideEnableTargetInfoIsSet := baseMgr.MetricsGeneratorProcessorSpanMetricsEnableTargetInfo(tenantID)
+	assert.Equal(t, overrideEnableTargetInfoValue, baseEnableTargetInfoValue)
+	assert.Equal(t, overrideEnableTargetInfoIsSet, baseEnableTargetInfoIsSet)
+	assert.Equal(t, mgr.MetricsGeneratorProcessorServiceGraphsEnableClientServerPrefix(tenantID), baseMgr.MetricsGeneratorProcessorServiceGraphsEnableClientServerPrefix(tenantID))
+	assert.Equal(t, mgr.MetricsGeneratorProcessorSpanMetricsTargetInfoExcludedDimensions(tenantID), baseMgr.MetricsGeneratorProcessorSpanMetricsTargetInfoExcludedDimensions(tenantID))
+	assert.Equal(t, mgr.MetricsGeneratorProcessorHostInfoHostIdentifiers(tenantID), baseMgr.MetricsGeneratorProcessorHostInfoHostIdentifiers(tenantID))
+	assert.Equal(t, mgr.MetricsGeneratorProcessorHostInfoMetricName(tenantID), baseMgr.MetricsGeneratorProcessorHostInfoMetricName(tenantID))
+	assert.Equal(t, mgr.BlockRetention(tenantID), baseMgr.BlockRetention(tenantID))
+	assert.Equal(t, mgr.MaxSearchDuration(tenantID), baseMgr.MaxSearchDuration(tenantID))
+	assert.Equal(t, mgr.DedicatedColumns(tenantID), baseMgr.DedicatedColumns(tenantID))
+	baseEnableInstanceLabelValue, baseEnableInstanceLabelIsSet := mgr.MetricsGeneratorProcessorSpanMetricsEnableInstanceLabel(tenantID)
+	overrideEnableInstanceLabelValue, overrideEnableInstanceLabelIsSet := baseMgr.MetricsGeneratorProcessorSpanMetricsEnableInstanceLabel(tenantID)
+	assert.Equal(t, overrideEnableInstanceLabelValue, baseEnableInstanceLabelValue)
+	assert.Equal(t, overrideEnableInstanceLabelIsSet, baseEnableInstanceLabelIsSet)
+}
+
+// tests precedence semantics through the JSON round-trip - no merge,
+// user-configurable wins, and `[]` disables all - so an omitempty regression on Processors is caught.
+func TestUserConfigOverridesManager_MetricsGeneratorProcessorsPrecedenceRoundTrip(t *testing.T) {
+	tenantID := "test"
+
+	testCases := []struct {
+		name             string
+		runtime          listtomap.ListToMap
+		userConfigurable *listtomap.ListToMap
+		expected         map[string]struct{}
+	}{
+		{
+			name:             "both unset, no processors returned",
+			runtime:          nil,
+			userConfigurable: nil,
+			expected:         map[string]struct{}{},
+		},
+		{
+			name:             "user-configurable unset, falls back to runtime",
+			runtime:          listtomap.ListToMap{"span-metrics": {}, "service-graphs": {}, "host-info": {}},
+			userConfigurable: nil,
+			expected:         map[string]struct{}{"span-metrics": {}, "service-graphs": {}, "host-info": {}},
+		},
+		{
+			name:             "only user-configurable set, user-configurable wins",
+			runtime:          nil,
+			userConfigurable: &listtomap.ListToMap{"span-metrics": {}},
+			expected:         map[string]struct{}{"span-metrics": {}},
+		},
+		{
+			name:             "both set, user-configurable fully overrides (no merge)",
+			runtime:          listtomap.ListToMap{"service-graphs": {}, "host-info": {}},
+			userConfigurable: &listtomap.ListToMap{"span-metrics": {}},
+			expected:         map[string]struct{}{"span-metrics": {}},
+		},
+		{
+			name:             "user-configurable empty list disables all processors (overrides runtime)",
+			runtime:          listtomap.ListToMap{"span-metrics": {}, "service-graphs": {}, "host-info": {}},
+			userConfigurable: &listtomap.ListToMap{},
+			expected:         map[string]struct{}{},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			mgr, cleanup := setupRuntimeProcessors(t, tenantID, tc.runtime)
+			defer cleanup()
+
+			if tc.userConfigurable != nil {
+				setAndReloadUserConfigProcessors(t, mgr, tenantID, tc.userConfigurable, backend.VersionNew)
+			}
+
+			require.Equal(t, tc.expected, mgr.MetricsGeneratorProcessors(tenantID))
+		})
+	}
+}
+
+// test DELETE path: deleting user-configurable overrides must fall back to runtime.
+func TestUserConfigOverridesManager_MetricsGeneratorProcessorsDeleteLifecycle(t *testing.T) {
+	tenantID := "test"
+
+	mgr, cleanup := setupRuntimeProcessors(t, tenantID, listtomap.ListToMap{"service-graphs": {}, "host-info": {}})
+	defer cleanup()
+
+	// 1) set user-configurable processors; user-configurable wins
+	version := setAndReloadUserConfigProcessors(t, mgr, tenantID, &listtomap.ListToMap{"span-metrics": {}}, backend.VersionNew)
+	require.Equal(t, map[string]struct{}{"span-metrics": {}}, mgr.MetricsGeneratorProcessors(tenantID))
+
+	// 2) delete user-configurable overrides; must fall back to runtime
+	require.NoError(t, mgr.client.Delete(context.Background(), tenantID, version))
+	require.NoError(t, mgr.reloadAllTenantLimits(context.Background()))
+	require.Equal(t, map[string]struct{}{"service-graphs": {}, "host-info": {}}, mgr.MetricsGeneratorProcessors(tenantID))
+}
+
+// tests the empty/non-empty boundary across successive POSTs
+func TestUserConfigOverridesManager_MetricsGeneratorProcessorsUpdateTransitions(t *testing.T) {
+	tenantID := "test"
+	runtime := listtomap.ListToMap{"service-graphs": {}, "host-info": {}}
+
+	testCases := []struct {
+		name               string
+		first, second      *listtomap.ListToMap
+		firstExp, finalExp map[string]struct{}
+	}{
+		{
+			name:     "non-empty to empty disables all processors",
+			first:    &listtomap.ListToMap{"span-metrics": {}},
+			second:   &listtomap.ListToMap{},
+			firstExp: map[string]struct{}{"span-metrics": {}},
+			finalExp: map[string]struct{}{},
+		},
+		{
+			name:     "empty to non-empty enables the new list",
+			first:    &listtomap.ListToMap{},
+			second:   &listtomap.ListToMap{"span-metrics": {}},
+			firstExp: map[string]struct{}{},
+			finalExp: map[string]struct{}{"span-metrics": {}},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			mgr, cleanup := setupRuntimeProcessors(t, tenantID, runtime)
+			defer cleanup()
+
+			version := setAndReloadUserConfigProcessors(t, mgr, tenantID, tc.first, backend.VersionNew)
+			require.Equal(t, tc.firstExp, mgr.MetricsGeneratorProcessors(tenantID))
+
+			setAndReloadUserConfigProcessors(t, mgr, tenantID, tc.second, version)
+			require.Equal(t, tc.finalExp, mgr.MetricsGeneratorProcessors(tenantID))
+		})
+	}
+}
+
+func setupRuntimeProcessors(t *testing.T, tenantID string, runtime listtomap.ListToMap) (*userConfigurableOverridesManager, func()) {
+	pto := &perTenantOverrides{
+		TenantLimits: map[string]*Overrides{
+			tenantID: {
+				MetricsGenerator: MetricsGeneratorOverrides{
+					Processors: runtime,
+				},
+			},
+		},
+	}
+	_, mgr, cleanup := localUserConfigOverrides(t, Overrides{}, toYamlBytes(t, pto))
+	return mgr, cleanup
+}
+
+// setAndReloadUserConfigProcessors persists user-configurable processors for the tenant through
+// the full client round-trip (Set + reloadAllTenantLimits) and returns the new version.
+// Use this when a test needs to exercise the JSON serialization path, not a direct
+// in-memory write to mgr.tenantLimits.
+func setAndReloadUserConfigProcessors(t *testing.T, mgr *userConfigurableOverridesManager, tenantID string, processors *listtomap.ListToMap, version backend.Version) backend.Version {
+	limits := &userconfigurableoverrides.Limits{
+		MetricsGenerator: userconfigurableoverrides.LimitsMetricsGenerator{
+			Processors: processors,
+		},
+	}
+	v, err := mgr.client.Set(context.Background(), tenantID, limits, version)
+	require.NoError(t, err)
+	require.NoError(t, mgr.reloadAllTenantLimits(context.Background()))
+	return v
+}
+
+func perTenantRuntimeOverrides(tenantID string) *perTenantOverrides {
+	pto := &perTenantOverrides{
+		TenantLimits: map[string]*Overrides{
+			tenantID: {
+				Ingestion: IngestionOverrides{
+					RateStrategy:           LocalIngestionRateStrategy,
+					RateLimitBytes:         400,
+					BurstSizeBytes:         400,
+					MaxLocalTracesPerUser:  500,
+					MaxGlobalTracesPerUser: 5000,
+				},
+				Read: ReadOverrides{
+					MaxBytesPerTagValuesQuery:  1000,
+					MaxBlocksPerTagValuesQuery: 100,
+					MaxSearchDuration:          model.Duration(1000 * time.Hour),
+				},
+				Compaction: CompactionOverrides{
+					BlockRetention: model.Duration(360 * time.Hour),
+				},
+				MetricsGenerator: MetricsGeneratorOverrides{
+					RingSize:           2,
+					Processors:         listtomap.ListToMap{"span-metrics": {}, "service-graphs": {}, "host-info": {}},
+					MaxActiveSeries:    60000,
+					CollectionInterval: 15 * time.Second,
+					DisableCollection:  false,
+					Forwarder: ForwarderOverrides{
+						QueueSize: 400,
+						Workers:   3,
+					},
+					Processor: ProcessorOverrides{
+						ServiceGraphs: ServiceGraphsOverrides{
+							HistogramBuckets:         []float64{0.002, 0.004, 0.008, 0.016, 0.032, 0.064},
+							Dimensions:               []string{"k8s.cluster-name", "k8s.namespace.name", "http.method", "http.route", "http.status_code", "service.version"},
+							PeerAttributes:           []string{"foo", "bar"},
+							EnableClientServerPrefix: boolPtr(true),
+						},
+						SpanMetrics: SpanMetricsOverrides{
+							HistogramBuckets:             []float64{0.002, 0.004, 0.008, 0.016, 0.032, 0.064},
+							Dimensions:                   []string{"k8s.cluster-name", "k8s.namespace.name", "http.method", "http.route", "http.status_code", "service.version"},
+							IntrinsicDimensions:          map[string]bool{"foo": true, "bar": true},
+							FilterPolicies:               []filterconfig.FilterPolicy{{Exclude: &filterconfig.PolicyMatch{MatchType: filterconfig.Regex, Attributes: []filterconfig.MatchPolicyAttribute{{Key: "resource.service.name", Value: "unknown_service:myservice"}}}}},
+							DimensionMappings:            []sharedconfig.DimensionMappings{{Name: "foo", SourceLabel: []string{"bar"}, Join: "baz"}},
+							EnableTargetInfo:             boolPtr(true),
+							TargetInfoExcludedDimensions: []string{"bar", "namespace", "env"},
+							EnableInstanceLabel:          boolPtr(false),
+						},
+						HostInfo: HostInfoOverrides{
+							HostIdentifiers: []string{"host.name"},
+							MetricName:      "override_host_info",
+						},
+					},
+					IngestionSlack: 0,
+				},
+				Forwarders: []string{"fwd", "fwd-2"},
+				Global:     GlobalOverrides{MaxBytesPerTrace: 5000000},
+				Storage: StorageOverrides{
+					DedicatedColumns: backend.DedicatedColumns{
+						{Scope: "resource", Name: "dedicated.resource.foo", Type: "string"},
+						{Scope: "span", Name: "dedicated.span.bar", Type: "string"},
+					},
+				},
+			},
+		},
+	}
+
+	return pto
+}
+
+func strPtr(s string) *string {
+	return &s
+}

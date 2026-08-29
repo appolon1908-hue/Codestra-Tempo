@@ -1,0 +1,172 @@
+package querier
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/go-kit/log/level"
+	"github.com/grafana/tempo/modules/overrides"
+	"github.com/grafana/tempo/pkg/api"
+	"github.com/grafana/tempo/pkg/tempopb"
+	"github.com/grafana/tempo/pkg/traceql"
+	"github.com/grafana/tempo/pkg/util/log"
+	"github.com/grafana/tempo/tempodb/backend"
+	"github.com/grafana/tempo/tempodb/encoding/common"
+)
+
+func (q *Querier) QueryRange(ctx context.Context, req *tempopb.QueryRangeRequest) (resp *tempopb.QueryRangeResponse, err error) {
+	ctx, span, tenantID, err := startQueryRangeSpan(ctx, "Querier.QueryRange", req)
+	if err != nil {
+		return nil, fmt.Errorf("error extracting org id in Querier.QueryRange: %w", err)
+	}
+	defer func() { finishQuerierSpan(span, err, resp.GetMetrics()) }()
+
+	if req.QueryMode == QueryModeRecent {
+		return q.queryRangeRecent(ctx, req)
+	}
+
+	setQueryRangeBlockSpanAttributes(span, req)
+	return q.queryBlock(ctx, req, tenantID)
+}
+
+func (q *Querier) queryRangeRecent(ctx context.Context, req *tempopb.QueryRangeRequest) (resp *tempopb.QueryRangeResponse, err error) {
+	// correct max series limit logic should've been set by the query-frontend sharder
+	c, err := traceql.QueryRangeCombinerFor(req, traceql.AggregateModeSum, int(req.MaxSeries))
+	if err != nil {
+		return nil, err
+	}
+
+	results, err := q.forLiveStoreMetricsRing(ctx, func(ctx context.Context, client tempopb.MetricsClient) (any, error) {
+		return client.QueryRange(ctx, req)
+	})
+	if err != nil {
+		_ = level.Error(log.Logger).Log("msg", "error querying live-stores in Querier.queryRangeRecent", "err", err)
+		return nil, fmt.Errorf("error querying live-stores in Querier.queryRangeRecent: %w", err)
+	}
+
+	for _, result := range results {
+		resp := result.(*tempopb.QueryRangeResponse)
+		c.Combine(resp)
+		if c.MaxSeriesReached() {
+			break
+		}
+	}
+
+	return c.Response(), nil
+}
+
+func (q *Querier) queryBlock(ctx context.Context, req *tempopb.QueryRangeRequest, tenantID string) (resp *tempopb.QueryRangeResponse, err error) {
+	defer observeBackendProcessing(api.OpMetrics, tenantID, time.Now())
+
+	blockID, err := backend.ParseUUID(req.BlockID)
+	if err != nil {
+		return nil, err
+	}
+
+	dc, err := backend.DedicatedColumnsFromTempopb(req.DedicatedColumns)
+	if err != nil {
+		return nil, err
+	}
+
+	meta := &backend.BlockMeta{
+		Version:          req.Version,
+		TenantID:         tenantID,
+		StartTime:        time.Unix(0, int64(req.Start)),
+		EndTime:          time.Unix(0, int64(req.End)),
+		BlockID:          blockID,
+		Size_:            req.Size_,
+		FooterSize:       req.FooterSize,
+		DedicatedColumns: dc,
+	}
+
+	opts := common.DefaultSearchOptions()
+	opts.StartPage = int(req.StartPage)
+	opts.TotalPages = int(req.PagesToSearch)
+
+	// Parse without optimizations to read hints; optimizations are applied by CompileMetricsQueryRange.
+	expr, err := traceql.ParseNoOptimizations(req.Query)
+	if err != nil {
+		return nil, err
+	}
+
+	var compileOpts []traceql.CompileOption
+
+	unsafe := q.limits.UnsafeQueryHints(tenantID)
+	if unsafe {
+		compileOpts = append(compileOpts, traceql.WithUnsafeHints(true))
+	}
+	for _, name := range req.SkipASTTransformations {
+		compileOpts = append(compileOpts, traceql.WithSkipOptimization(name))
+	}
+
+	if v, ok := expr.Hints.GetFloat(traceql.HintTimeOverlapCutoff, unsafe); ok && v >= 0 && v <= 1.0 {
+		// Use valid hint from query.
+		compileOpts = append(compileOpts, traceql.WithTimeOverlapCutoff(v))
+	} else {
+		// Use default.
+		compileOpts = append(compileOpts, traceql.WithTimeOverlapCutoff(q.cfg.Metrics.TimeOverlapCutoff))
+	}
+
+	if p := q.limits.MetricsSpanOnlyFetch(tenantID); p != nil {
+		compileOpts = append(compileOpts, traceql.WithSpanOnlyFetch(*p))
+	}
+
+	compileOpts = append(compileOpts, overrides.SpanPruningAwarenessCompileOptions(q.limits.SpanPruningAwareness(tenantID))...)
+	if p := q.limits.EngineBytesTracking(tenantID); p != nil {
+		compileOpts = append(compileOpts, traceql.WithEngineBytesTracking(*p))
+	}
+
+	eval, err := traceql.NewEngine().CompileMetricsQueryRange(req, compileOpts...)
+	if err != nil {
+		return nil, err
+	}
+
+	f := traceql.NewSpansetFetcherWrapperBoth(
+		func(ctx context.Context, req traceql.FetchSpansRequest) (traceql.FetchSpansResponse, error) {
+			return q.store.Fetch(ctx, meta, req, opts)
+		},
+		func(ctx context.Context, req traceql.FetchSpansRequest) (traceql.FetchSpansOnlyResponse, error) {
+			return q.store.FetchSpans(ctx, meta, req, opts)
+		},
+	)
+
+	err = eval.Do(ctx, f, uint64(meta.StartTime.UnixNano()), uint64(meta.EndTime.UnixNano()), int(req.MaxSeries))
+	if err != nil {
+		return nil, err
+	}
+
+	res := eval.Results()
+
+	em := eval.Metrics()
+
+	if req.MaxSeries > 0 && len(res) > int(req.MaxSeries) {
+		limitedRes := make(traceql.SeriesSet)
+		count := 0
+		for k, v := range res {
+			if count >= int(req.MaxSeries) {
+				break
+			}
+			limitedRes[k] = v
+			count++
+		}
+		res = limitedRes
+	}
+
+	response := &tempopb.QueryRangeResponse{
+		Series: res.ToProto(req),
+		Metrics: &tempopb.SearchMetrics{
+			InspectedBytes:    em.Bytes,
+			InspectedSpans:    em.SpansTotal,
+			BackendReads:      em.BackendReads,
+			BackendBytes:      em.BackendBytes,
+			AdditionalMetrics: em.AdditionalMetrics,
+		},
+	}
+
+	if req.MaxSeries > 0 && len(res) > int(req.MaxSeries) {
+		response.Status = tempopb.PartialStatus_PARTIAL
+	}
+
+	return response, nil
+}

@@ -1,0 +1,592 @@
+package traceql
+
+import (
+	"fmt"
+	"math"
+	"sort"
+	"time"
+
+	"github.com/grafana/tempo/pkg/tempopb"
+)
+
+const (
+	internalMetaTypeBaseline       = "baseline"
+	internalMetaTypeSelection      = "selection"
+	internalMetaTypeBaselineTotal  = "baseline_total"
+	internalMetaTypeSelectionTotal = "selection_total"
+
+	// internalLabelBaseline      = "__baseline"
+	internalLabelError         = "__meta_error"
+	internalErrorTooManyValues = "__too_many_values__"
+	maxCompareTopN             = 1000
+)
+
+var (
+	internalLabelTypeBaseline       = Label{Name: internalLabelMetaType, Value: NewStaticString(internalMetaTypeBaseline)}
+	internalLabelTypeBaselineTotal  = Label{Name: internalLabelMetaType, Value: NewStaticString(internalMetaTypeBaselineTotal)}
+	internalLabelTypeSelection      = Label{Name: internalLabelMetaType, Value: NewStaticString(internalMetaTypeSelection)}
+	internalLabelTypeSelectionTotal = Label{Name: internalLabelMetaType, Value: NewStaticString(internalMetaTypeSelectionTotal)}
+	internalLabelErrorTooManyValues = Label{Name: internalLabelError, Value: NewStaticString(internalErrorTooManyValues)}
+)
+
+type MetricsCompare struct {
+	f                  *SpansetFilter
+	intervalMapper     IntervalMapper
+	start, end         int
+	topN               int
+	baselines          map[Attribute]map[StaticMapKey]*staticWithCounts
+	selections         map[Attribute]map[StaticMapKey]*staticWithCounts
+	baselineTotals     map[Attribute][]float64
+	selectionTotals    map[Attribute][]float64
+	baselineExemplars  []Exemplar
+	selectionExemplars []Exemplar
+	seriesAgg          SeriesAggregator
+	maxExemplars       uint32
+	extrapolate        bool
+
+	// Runtime fields to avoid allocating closures
+	// and escaping to the heap when we call span.AllAttributesFunc.
+	dest              map[Attribute]map[StaticMapKey]*staticWithCounts
+	destTotals        map[Attribute][]float64
+	interval          int
+	currentMultiplier float64
+	attrCallback      func(Attribute, Static)
+}
+
+type staticWithCounts struct {
+	val    Static
+	counts []float64
+}
+
+func newMetricsCompare(f *SpansetFilter, topN, start, end int) *MetricsCompare {
+	m := &MetricsCompare{
+		f:                 f,
+		topN:              topN,
+		start:             start,
+		end:               end,
+		currentMultiplier: 1,
+	}
+	m.attrCallback = m.processAttribute
+	return m
+}
+
+// SetExtrapolate toggles per-span sampling extrapolation for compare(). When
+// true, each span contributes its IntrinsicSpanMultiplier value to the
+// per-attribute counts and totals instead of 1.
+func (m *MetricsCompare) SetExtrapolate(extrapolate bool) {
+	m.extrapolate = extrapolate
+}
+
+func (m *MetricsCompare) extractConditions(request *FetchSpansRequest) {
+	request.SecondPassSelectAll = true
+	if !request.HasAttribute(IntrinsicSpanStartTimeAttribute) {
+		request.SecondPassConditions = append(request.SecondPassConditions, Condition{Attribute: IntrinsicSpanStartTimeAttribute})
+	}
+	// We don't need to extract conditions from the comparison expression
+	// because we're already selecting all.
+}
+
+func (m *MetricsCompare) init(q *tempopb.QueryRangeRequest, mode AggregateMode) {
+	switch mode {
+	case AggregateModeRaw:
+		m.intervalMapper = NewIntervalMapperFromReq(q)
+		m.baselines = make(map[Attribute]map[StaticMapKey]*staticWithCounts)
+		m.selections = make(map[Attribute]map[StaticMapKey]*staticWithCounts)
+		m.baselineTotals = make(map[Attribute][]float64)
+		m.selectionTotals = make(map[Attribute][]float64)
+		m.maxExemplars = q.Exemplars
+
+	case AggregateModeSum:
+		m.seriesAgg = NewSimpleCombiner(q, sumAggregation)
+		return
+
+	case AggregateModeFinal:
+		m.seriesAgg = NewBaselineAggregator(q, m.topN, q.Exemplars)
+		return
+	}
+}
+
+func (m *MetricsCompare) isSelection(span Span, spanStartTime uint64) Static {
+	// Determine if this span is inside the selection
+	isSelection := StaticFalse
+	if m.start > 0 && m.end > 0 {
+		// Timestamp filtering
+		if spanStartTime > uint64(m.start) && spanStartTime <= uint64(m.end) {
+			isSelection, _ = m.f.Expression.execute(span)
+		}
+	} else {
+		// No timestamp filtering
+		isSelection, _ = m.f.Expression.execute(span)
+	}
+	return isSelection
+}
+
+func (m *MetricsCompare) observe(span Span) {
+	// For performance, MetricsCompare doesn't use the Range/StepAggregator abstractions.
+	// This lets us:
+	// * Include the same attribute value in multiple series. This doesn't fit within
+	//   the existing by() grouping or even the potential byeach() (which was in this branch and then deleted)
+	// * Avoid reading the span start time twice, once for the selection window filter, and
+	//   then again instead of StepAggregator.
+	// TODO - It would be nice to use those abstractions, area for future improvement
+	st := span.StartTimeUnixNanos()
+	m.interval = m.intervalMapper.Interval(st)
+
+	if m.extrapolate {
+		// spanExtrapolation already returns a stochastically-rounded integer
+		// when the tracestate carried an OTEP-235 R-value, so per-attribute
+		// counts stay integer without any extra work here.
+		m.currentMultiplier = spanExtrapolation(span)
+	} else {
+		m.currentMultiplier = 1
+	}
+
+	// Determine if this span is inside the selection
+	// and choose destination buffers
+	if m.isSelection(span, st).Equals(&StaticTrue) {
+		m.dest = m.selections
+		m.destTotals = m.selectionTotals
+	} else {
+		m.dest = m.baselines
+		m.destTotals = m.baselineTotals
+	}
+
+	// Increment values for all attributes of this span
+	span.AllAttributesFunc(m.attrCallback)
+}
+
+// processAttribute is the callback for span.AllAttributesFunc.
+// But it's structured in a certain way to avoid allocating closures and escaping
+// to the heap.  It depends on setup of destination buffer and interval calculation
+// prior in the observe() method.
+func (m *MetricsCompare) processAttribute(a Attribute, v Static) {
+	// We don't group by attributes of these types because the
+	// cardinality isn't useful.
+	if v.Type == TypeDuration {
+		return
+	}
+
+	// These attributes get pulled back by select all, or might be used in a comparison query,
+	// but we never group by them because the cardinality isn't useful.
+	switch a {
+	case IntrinsicSpanStartTimeAttribute,
+		IntrinsicTraceIDAttribute,
+		IntrinsicParentIDAttribute,
+		IntrinsicNestedSetLeftAttribute,
+		IntrinsicNestedSetRightAttribute,
+		IntrinsicNestedSetParentAttribute:
+		return
+	}
+
+	values, ok := m.dest[a]
+	if !ok {
+		values = make(map[StaticMapKey]*staticWithCounts)
+		m.dest[a] = values
+	}
+
+	vk := v.MapKey()
+	sc, ok := values[vk]
+	if !ok {
+		sc = &staticWithCounts{val: v, counts: make([]float64, m.intervalMapper.IntervalCount())}
+		values[vk] = sc
+	}
+	sc.counts[m.interval] += m.currentMultiplier
+
+	// TODO - It's probably faster to aggregate these at the end
+	// instead of incrementing in the hotpath twice
+	totals, ok := m.destTotals[a]
+	if !ok {
+		totals = make([]float64, m.intervalMapper.IntervalCount())
+		m.destTotals[a] = totals
+	}
+	totals[m.interval] += m.currentMultiplier
+}
+
+func (m *MetricsCompare) observeExemplar(span Span) {
+	st := span.StartTimeUnixNanos()
+	isSelection := m.isSelection(span, st)
+
+	// Exemplars
+	if uint32(len(m.baselineExemplars)) >= m.maxExemplars || uint32(len(m.selectionExemplars)) >= m.maxExemplars {
+		return
+	}
+
+	all := span.AllAttributes()
+	lbls := make(Labels, 0, len(all))
+	for a, v := range all {
+		lbls = append(lbls, Label{Name: a.String(), Value: v})
+	}
+	exemplar := Exemplar{
+		Labels:      lbls,
+		Value:       math.NaN(), // TODO: What value?
+		TimestampMs: st / uint64(time.Millisecond),
+	}
+	if isSelection.Equals(&StaticTrue) {
+		m.selectionExemplars = append(m.selectionExemplars, exemplar)
+	} else {
+		m.baselineExemplars = append(m.baselineExemplars, exemplar)
+	}
+}
+
+func (m *MetricsCompare) observeSeries(ss []*tempopb.TimeSeries) {
+	m.seriesAgg.Combine(ss)
+}
+
+func (m *MetricsCompare) result(multiplier float64) SeriesSet {
+	if m.seriesAgg != nil {
+		// In job-level mode the series come from the series aggregator.
+		return m.seriesAgg.Results()
+	}
+
+	var (
+		top   = topN[StaticMapKey]{}
+		ss    = make(SeriesSet)
+		erred = make(map[Attribute]struct{})
+	)
+
+	add := func(ls Labels, counts []float64) {
+		ss[ls.MapKey()] = TimeSeries{
+			Labels: ls,
+			Values: counts,
+		}
+	}
+
+	addValues := func(prefix Label, data map[Attribute]map[StaticMapKey]*staticWithCounts) {
+		for a, values := range data {
+			name := a.String()
+
+			// Compute topN values for this attribute
+			top.reset()
+			for mk, sc := range values {
+				top.add(mk, sc.counts)
+			}
+
+			top.get(m.topN, func(mk StaticMapKey) {
+				sc := values[mk]
+				add(Labels{
+					prefix,
+					{Name: name, Value: sc.val},
+				}, sc.counts)
+			})
+
+			if len(values) > m.topN {
+				erred[a] = struct{}{}
+			}
+		}
+	}
+
+	addValues(internalLabelTypeBaseline, m.baselines)
+	addValues(internalLabelTypeSelection, m.selections)
+
+	// Add errors for attributes that hit the limit in either area
+	for a := range erred {
+		add(Labels{
+			internalLabelErrorTooManyValues,
+			{Name: a.String()},
+		}, nil)
+	}
+
+	addTotals := func(prefix Label, data map[Attribute][]float64) {
+		for a, counts := range data {
+			add(Labels{
+				prefix,
+				{Name: a.String()},
+			}, counts)
+		}
+	}
+
+	addTotals(internalLabelTypeBaselineTotal, m.baselineTotals)
+	addTotals(internalLabelTypeSelectionTotal, m.selectionTotals)
+
+	// Add exemplars
+	addExemplar := func(prefix Label, e Exemplar) {
+		for _, l := range e.Labels {
+			seriesLabels := Labels{
+				prefix,
+				{Name: l.Name},
+			}
+			key := seriesLabels.MapKey()
+			if ts, ok := ss[key]; ok {
+				ts.Exemplars = append(ts.Exemplars, e)
+				ss[key] = ts
+			}
+		}
+	}
+
+	for _, e := range m.baselineExemplars {
+		addExemplar(internalLabelTypeBaselineTotal, e)
+	}
+	for _, e := range m.selectionExemplars {
+		addExemplar(internalLabelTypeSelectionTotal, e)
+	}
+
+	// Multiply to account for sampling as needed.
+	if multiplier > 1.0 {
+		for _, s := range ss {
+			for i := range s.Values {
+				s.Values[i] *= multiplier
+			}
+		}
+	}
+
+	return ss
+}
+
+func (m *MetricsCompare) length() int {
+	return len(m.baselines) + len(m.selections) + len(m.baselineTotals) + len(m.selectionTotals)
+}
+
+func (m *MetricsCompare) validate() error {
+	err := m.f.validate()
+	if err != nil {
+		return err
+	}
+
+	if m.topN <= 0 || m.topN > maxCompareTopN {
+		return fmt.Errorf("compare() top number of values must be an integer between 1 and %d", maxCompareTopN)
+	}
+
+	if m.start == 0 && m.end == 0 {
+		return nil
+	}
+
+	if m.start <= 0 || m.end <= 0 {
+		return fmt.Errorf("compare() timestamps must be positive integer unix nanoseconds")
+	}
+	if m.end <= m.start {
+		return fmt.Errorf("compare() end timestamp must be greater than start timestamp")
+	}
+	return nil
+}
+
+func (m *MetricsCompare) String() string {
+	return "compare(" + m.f.String() + "}"
+}
+
+var (
+	_ firstStageElement = (*MetricsCompare)(nil)
+	_ spanProcessor     = (*MetricsCompare)(nil)
+	_ seriesProcessor   = (*MetricsCompare)(nil)
+)
+
+// BaselineAggregator is a special series combiner for the compare() function.
+// It resplits job-level results into baseline and selection buffers, and if
+// an attribute reached max cardinality at the job-level, it will be marked
+// as such at the query-level.
+type BaselineAggregator struct {
+	topN            int
+	intervalMapper  IntervalMapper
+	baseline        map[string]map[StaticMapKey]staticWithTimeSeries
+	selection       map[string]map[StaticMapKey]staticWithTimeSeries
+	baselineTotals  map[string]map[StaticMapKey]staticWithTimeSeries
+	selectionTotals map[string]map[StaticMapKey]staticWithTimeSeries
+	maxed           map[string]struct{}
+	exemplarBuckets bucketSet
+}
+
+type staticWithTimeSeries struct {
+	val    Static
+	series TimeSeries
+}
+
+func NewBaselineAggregator(req *tempopb.QueryRangeRequest, topN int, exemplars uint32) *BaselineAggregator {
+	return &BaselineAggregator{
+		baseline:        make(map[string]map[StaticMapKey]staticWithTimeSeries),
+		selection:       make(map[string]map[StaticMapKey]staticWithTimeSeries),
+		baselineTotals:  make(map[string]map[StaticMapKey]staticWithTimeSeries),
+		selectionTotals: make(map[string]map[StaticMapKey]staticWithTimeSeries),
+		maxed:           make(map[string]struct{}),
+		intervalMapper:  NewIntervalMapperFromReq(req),
+		topN:            topN,
+		exemplarBuckets: newExemplarBucketSet(exemplars, req.Start, req.End, req.Step, IsInstant(req)),
+	}
+}
+
+func (b *BaselineAggregator) Combine(ss []*tempopb.TimeSeries) {
+	for _, s := range ss {
+		var metaType string
+		var err string
+		var a string
+		var v Static
+
+		// Scan all labels
+		for _, l := range s.Labels {
+			switch l.Key {
+			case internalLabelMetaType:
+				metaType = l.Value.GetStringValue()
+			case internalLabelError:
+				err = l.Value.GetStringValue()
+			default:
+				a = l.Key
+				v = StaticFromAnyValue(l.Value)
+			}
+		}
+
+		// Check for errors on this attribute
+		if err != "" {
+			if err == internalErrorTooManyValues {
+				// A sub-job reached max values for this attribute.
+				// Record the error
+				b.maxed[a] = struct{}{}
+			}
+			// Skip remaining processing regardless of error type
+			continue
+		}
+
+		// Merge this time series into the destination buffer
+		// based on meta type
+		var dest map[string]map[StaticMapKey]staticWithTimeSeries
+		switch metaType {
+		case internalMetaTypeBaseline:
+			dest = b.baseline
+		case internalMetaTypeSelection:
+			dest = b.selection
+		case internalMetaTypeBaselineTotal:
+			dest = b.baselineTotals
+		case internalMetaTypeSelectionTotal:
+			dest = b.selectionTotals
+		default:
+			// Unknown type, ignore
+			continue
+		}
+
+		attr, ok := dest[a]
+		if !ok {
+			attr = make(map[StaticMapKey]staticWithTimeSeries)
+			dest[a] = attr
+		}
+
+		vk := v.MapKey()
+		ts, ok := attr[vk]
+		if !ok {
+			ts = staticWithTimeSeries{val: v, series: TimeSeries{Values: make([]float64, b.intervalMapper.IntervalCount())}}
+			attr[vk] = ts
+		}
+
+		if len(attr) > b.topN {
+			// This attribute just reached max cardinality overall (not within a sub-job)
+			// Record the error
+			b.maxed[a] = struct{}{}
+		}
+
+		for _, sample := range s.Samples {
+			j := b.intervalMapper.IntervalMs(sample.TimestampMs)
+			if j >= 0 && j < len(ts.series.Values) {
+				ts.series.Values[j] += sample.Value
+			}
+		}
+
+		for _, exemplar := range s.Exemplars {
+			if b.exemplarBuckets.testTotal() {
+				break
+			}
+			if b.exemplarBuckets.addAndTest(uint64(exemplar.TimestampMs)) { //nolint: gosec // G115
+				continue
+			}
+
+			lbls := make(Labels, 0, len(exemplar.Labels))
+			for _, l := range exemplar.Labels {
+				lbls = append(lbls, Label{Name: l.Key, Value: StaticFromAnyValue(l.Value)})
+			}
+			ts.series.Exemplars = append(ts.series.Exemplars, Exemplar{
+				Labels:      lbls,
+				Value:       exemplar.Value,
+				TimestampMs: uint64(exemplar.TimestampMs),
+			})
+		}
+		attr[vk] = ts
+	}
+}
+
+func (b *BaselineAggregator) Results() SeriesSet {
+	output := make(SeriesSet)
+	topN := &topN[Static]{}
+
+	addSeries := func(prefix Label, name string, value Static, samples []float64, exemplars []Exemplar) {
+		ls := Labels{
+			prefix,
+			{Name: name, Value: value},
+		}
+		output[ls.MapKey()] = TimeSeries{
+			Labels:    ls,
+			Values:    samples,
+			Exemplars: exemplars,
+		}
+	}
+
+	do := func(buffer map[string]map[StaticMapKey]staticWithTimeSeries, prefix Label) {
+		for a, m := range buffer {
+
+			topN.reset()
+			for _, ts := range m {
+				topN.add(ts.val, ts.series.Values)
+			}
+
+			topN.get(b.topN, func(key Static) {
+				ts := m[key.MapKey()]
+				addSeries(prefix, a, key, ts.series.Values, ts.series.Exemplars)
+			})
+		}
+	}
+
+	do(b.baseline, internalLabelTypeBaseline)
+	do(b.selection, internalLabelTypeSelection)
+	do(b.baselineTotals, internalLabelTypeBaselineTotal)
+	do(b.selectionTotals, internalLabelTypeSelectionTotal)
+
+	// Add series for every attribute that exceeded max value.
+	for a := range b.maxed {
+		addSeries(internalLabelErrorTooManyValues, a, NewStaticNil(), nil, nil)
+	}
+
+	return output
+}
+
+func (b *BaselineAggregator) Length() int {
+	return len(b.baseline) + len(b.selection) + len(b.baselineTotals) + len(b.selectionTotals)
+}
+
+var _ SeriesAggregator = (*BaselineAggregator)(nil)
+
+// topN is a helper struct that gets the topN keys based on total sum
+type topN[T any] struct {
+	entries []struct {
+		key   T
+		total float64
+	}
+}
+
+func (t *topN[T]) add(key T, values []float64) {
+	sum := 0.0
+	for _, v := range values {
+		sum += v
+	}
+	t.entries = append(t.entries, struct {
+		key   T
+		total float64
+	}{key, sum})
+}
+
+// get the top N values. Given as a callback to avoid allocating.
+// bool result indicates if there were more than N values
+func (t *topN[T]) get(n int, cb func(key T)) {
+	if len(t.entries) <= n {
+		// <= N, no need to sort
+		for _, e := range t.entries {
+			cb(e.key)
+		}
+		return
+	}
+
+	sort.Slice(t.entries, func(i, j int) bool {
+		return t.entries[i].total > t.entries[j].total // Sort descending
+	})
+
+	for i := 0; i < n; i++ {
+		cb(t.entries[i].key)
+	}
+}
+
+func (t *topN[T]) reset() {
+	t.entries = t.entries[:0]
+}

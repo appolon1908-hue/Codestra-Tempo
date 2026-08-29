@@ -1,0 +1,346 @@
+package generator
+
+import (
+	"flag"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/grafana/tempo/modules/generator/processor/servicegraphs"
+	"github.com/grafana/tempo/modules/generator/processor/spanmetrics"
+	"github.com/grafana/tempo/pkg/sharedconfig"
+	"github.com/grafana/tempo/pkg/spanfilter/config"
+)
+
+func TestProcessorConfig_copyWithOverrides(t *testing.T) {
+	original := &ProcessorConfig{
+		ServiceGraphs: servicegraphs.Config{
+			HistogramBuckets: []float64{1},
+			Dimensions:       []string{},
+			Subprocessors:    map[servicegraphs.Subprocessor]bool{},
+		},
+		SpanMetrics: spanmetrics.Config{
+			HistogramBuckets:    []float64{1, 2},
+			Dimensions:          []string{"namespace"},
+			IntrinsicDimensions: spanmetrics.IntrinsicDimensions{Service: true},
+			Subprocessors:       map[spanmetrics.Subprocessor]bool{},
+		},
+	}
+
+	t.Run("test enable service graph flags", func(t *testing.T) {
+		o := &mockOverrides{
+			serviceGraphsEnableClientServerPrefix:              true,
+			serviceGraphsEnableVirtualNodeLabel:                boolPtr(true),
+			serviceGraphsEnableMessagingSystemLatencyHistogram: boolPtr(true),
+		}
+
+		copied, err := original.copyWithOverrides(o, "tenant")
+		require.NoError(t, err)
+		assert.Equal(t, true, copied.ServiceGraphs.EnableClientServerPrefix)
+		assert.Equal(t, true, copied.ServiceGraphs.EnableVirtualNodeLabel)
+		assert.Equal(t, true, copied.ServiceGraphs.EnableMessagingSystemLatencyHistogram)
+	})
+	t.Run("overrides buckets and dimension", func(t *testing.T) {
+		o := &mockOverrides{
+			serviceGraphsHistogramBuckets:  []float64{1, 2},
+			serviceGraphsDimensions:        []string{"namespace"},
+			spanMetricsHistogramBuckets:    []float64{1, 2, 3},
+			spanMetricsDimensions:          []string{"cluster", "namespace"},
+			spanMetricsIntrinsicDimensions: map[string]bool{"status_code": true},
+		}
+
+		copied, err := original.copyWithOverrides(o, "tenant")
+		require.NoError(t, err)
+
+		assert.NotEqual(t, *original, copied)
+
+		// assert nothing changed
+		assert.Equal(t, []float64{1}, original.ServiceGraphs.HistogramBuckets)
+		assert.Equal(t, []string{}, original.ServiceGraphs.Dimensions)
+		assert.Equal(t, []float64{1, 2}, original.SpanMetrics.HistogramBuckets)
+		assert.Equal(t, []string{"namespace"}, original.SpanMetrics.Dimensions)
+		assert.Equal(t, spanmetrics.IntrinsicDimensions{Service: true}, original.SpanMetrics.IntrinsicDimensions)
+
+		// assert overrides were applied
+		assert.Equal(t, []float64{1, 2}, copied.ServiceGraphs.HistogramBuckets)
+		assert.Equal(t, []string{"namespace"}, copied.ServiceGraphs.Dimensions)
+		assert.Equal(t, []float64{1, 2, 3}, copied.SpanMetrics.HistogramBuckets)
+		assert.Equal(t, []string{"cluster", "namespace"}, copied.SpanMetrics.Dimensions)
+		assert.Equal(t, spanmetrics.IntrinsicDimensions{Service: true, StatusCode: true}, copied.SpanMetrics.IntrinsicDimensions)
+	})
+
+	t.Run("empty overrides", func(t *testing.T) {
+		o := &mockOverrides{}
+
+		copied, err := original.copyWithOverrides(o, "tenant")
+		require.NoError(t, err)
+
+		assert.Equal(t, *original, copied)
+	})
+
+	t.Run("invalid overrides", func(t *testing.T) {
+		o := &mockOverrides{
+			spanMetricsIntrinsicDimensions: map[string]bool{"invalid": true},
+		}
+
+		_, err := original.copyWithOverrides(o, "tenant")
+		require.Error(t, err)
+	})
+
+	t.Run("nil policy overrides", func(t *testing.T) {
+		o := &mockOverrides{
+			spanMetricsFilterPolicies: nil,
+		}
+
+		copied, err := original.copyWithOverrides(o, "tenant")
+		require.NoError(t, err)
+
+		assert.Equal(t, *original, copied)
+	})
+
+	t.Run("empty policy overrides", func(t *testing.T) {
+		o := &mockOverrides{
+			spanMetricsFilterPolicies: []config.FilterPolicy{},
+		}
+
+		copied, err := original.copyWithOverrides(o, "tenant")
+		require.NoError(t, err)
+
+		assert.NotEqual(t, *original, copied)
+
+		assert.Equal(t, []config.FilterPolicy{}, copied.SpanMetrics.FilterPolicies)
+	})
+
+	t.Run("policy overrides", func(t *testing.T) {
+		o := &mockOverrides{
+			spanMetricsFilterPolicies: []config.FilterPolicy{
+				{
+					Include: &config.PolicyMatch{
+						MatchType: config.Strict,
+						Attributes: []config.MatchPolicyAttribute{
+							{
+								Key:   "key",
+								Value: "value",
+							},
+						},
+					},
+				},
+			},
+		}
+
+		copied, err := original.copyWithOverrides(o, "tenant")
+		require.NoError(t, err)
+
+		assert.NotEqual(t, *original, copied)
+
+		assert.Equal(t, []config.FilterPolicy{
+			{
+				Include: &config.PolicyMatch{
+					MatchType: config.Strict,
+					Attributes: []config.MatchPolicyAttribute{
+						{
+							Key:   "key",
+							Value: "value",
+						},
+					},
+				},
+			},
+		}, copied.SpanMetrics.FilterPolicies)
+	})
+
+	t.Run("servicegraphs nil policy overrides", func(t *testing.T) {
+		o := &mockOverrides{
+			serviceGraphsFilterPolicies: nil,
+		}
+
+		copied, err := original.copyWithOverrides(o, "tenant")
+		require.NoError(t, err)
+
+		assert.Equal(t, *original, copied)
+	})
+
+	t.Run("servicegraphs empty policy overrides", func(t *testing.T) {
+		o := &mockOverrides{
+			serviceGraphsFilterPolicies: []config.FilterPolicy{},
+		}
+
+		copied, err := original.copyWithOverrides(o, "tenant")
+		require.NoError(t, err)
+
+		assert.NotEqual(t, *original, copied)
+		assert.Equal(t, []config.FilterPolicy{}, copied.ServiceGraphs.FilterPolicies)
+	})
+
+	t.Run("servicegraphs policy overrides", func(t *testing.T) {
+		o := &mockOverrides{
+			serviceGraphsFilterPolicies: []config.FilterPolicy{
+				{
+					Exclude: &config.PolicyMatch{
+						MatchType: config.Strict,
+						Attributes: []config.MatchPolicyAttribute{
+							{
+								Key:   "resource.service.name",
+								Value: "mythical-requester",
+							},
+						},
+					},
+				},
+			},
+		}
+
+		copied, err := original.copyWithOverrides(o, "tenant")
+		require.NoError(t, err)
+
+		assert.NotEqual(t, *original, copied)
+		assert.Equal(t, []config.FilterPolicy{
+			{
+				Exclude: &config.PolicyMatch{
+					MatchType: config.Strict,
+					Attributes: []config.MatchPolicyAttribute{
+						{
+							Key:   "resource.service.name",
+							Value: "mythical-requester",
+						},
+					},
+				},
+			},
+		}, copied.ServiceGraphs.FilterPolicies)
+	})
+
+	t.Run("span multiplier key overrides", func(t *testing.T) {
+		o := &mockOverrides{
+			serviceGraphsSpanMultiplierKey: "custom_key",
+			spanMetricsSpanMultiplierKey:   "custom_key",
+		}
+
+		copied, err := original.copyWithOverrides(o, "tenant")
+		require.NoError(t, err)
+
+		assert.NotEqual(t, *original, copied)
+		assert.Equal(t, "custom_key", copied.ServiceGraphs.SpanMultiplierKey)
+		assert.Equal(t, "custom_key", copied.SpanMetrics.SpanMultiplierKey)
+	})
+
+	t.Run("enable tracestate span multiplier overrides", func(t *testing.T) {
+		o := &mockOverrides{
+			serviceGraphsEnableTraceStateSpanMultiplier: boolPtr(true),
+			spanMetricsEnableTraceStateSpanMultiplier:   boolPtr(true),
+		}
+
+		copied, err := original.copyWithOverrides(o, "tenant")
+		require.NoError(t, err)
+
+		assert.NotEqual(t, *original, copied)
+		assert.True(t, copied.ServiceGraphs.EnableTraceStateSpanMultiplier)
+		assert.True(t, copied.SpanMetrics.EnableTraceStateSpanMultiplier)
+	})
+
+	t.Run("dimension_mappings preserved when no override", func(t *testing.T) {
+		// Create original config with dimension_mappings set
+		originalWithMappings := &ProcessorConfig{
+			SpanMetrics: spanmetrics.Config{
+				DimensionMappings: []sharedconfig.DimensionMappings{
+					{Name: "env", SourceLabel: []string{"deployment.environment"}},
+				},
+				TargetInfoExcludedDimensions: []string{"telemetry.sdk.version"},
+			},
+		}
+
+		// Empty overrides should preserve base config values
+		o := &mockOverrides{}
+
+		copied, err := originalWithMappings.copyWithOverrides(o, "tenant")
+		require.NoError(t, err)
+
+		// Verify dimension_mappings from base config is preserved
+		assert.Equal(t, []sharedconfig.DimensionMappings{
+			{Name: "env", SourceLabel: []string{"deployment.environment"}},
+		}, copied.SpanMetrics.DimensionMappings)
+
+		// Verify target_info_excluded_dimensions from base config is preserved
+		assert.Equal(t, []string{"telemetry.sdk.version"}, copied.SpanMetrics.TargetInfoExcludedDimensions)
+	})
+
+	t.Run("dimension_mappings overridden when override is set", func(t *testing.T) {
+		// Create original config with dimension_mappings set
+		originalWithMappings := &ProcessorConfig{
+			SpanMetrics: spanmetrics.Config{
+				DimensionMappings: []sharedconfig.DimensionMappings{
+					{Name: "env", SourceLabel: []string{"deployment.environment"}},
+				},
+				TargetInfoExcludedDimensions: []string{"telemetry.sdk.version"},
+			},
+		}
+
+		// Override should replace base config values
+		o := &mockOverrides{
+			spanMetricsDimensionMappings: []sharedconfig.DimensionMappings{
+				{Name: "cluster", SourceLabel: []string{"k8s.cluster.name"}},
+			},
+			spanMetricsTargetInfoExcludedDimensions: []string{"process.runtime.version"},
+		}
+
+		copied, err := originalWithMappings.copyWithOverrides(o, "tenant")
+		require.NoError(t, err)
+
+		// Verify override replaced base config
+		assert.Equal(t, []sharedconfig.DimensionMappings{
+			{Name: "cluster", SourceLabel: []string{"k8s.cluster.name"}},
+		}, copied.SpanMetrics.DimensionMappings)
+
+		assert.Equal(t, []string{"process.runtime.version"}, copied.SpanMetrics.TargetInfoExcludedDimensions)
+	})
+}
+
+func TestConfig_RegisterFlagsAndApplyDefaults_setsPartitionRingMode(t *testing.T) {
+	cfg := &Config{}
+	cfg.RegisterFlagsAndApplyDefaults("", flag.NewFlagSet("", flag.PanicOnError))
+
+	assert.Equal(t, RingModePartition, cfg.RingMode)
+}
+
+func TestConfig_ValidateRingMode(t *testing.T) {
+	cfg := &Config{}
+	cfg.RegisterFlagsAndApplyDefaults("", flag.NewFlagSet("", flag.PanicOnError))
+	cfg.Storage.Path = t.TempDir()
+
+	t.Run("valid partition ring mode", func(t *testing.T) {
+		cfg := *cfg
+		cfg.RingMode = RingModePartition
+		require.NoError(t, cfg.Validate())
+	})
+
+	t.Run("valid generator ring mode without kafka", func(t *testing.T) {
+		cfg := *cfg
+		cfg.RingMode = RingModeGenerator
+		require.NoError(t, cfg.Validate())
+	})
+
+	t.Run("valid generator ring mode with configured consumer group", func(t *testing.T) {
+		cfg := *cfg
+		cfg.ConsumeFromKafka = true
+		cfg.RingMode = RingModeGenerator
+		cfg.Ingest.Kafka.Topic = "tempo"
+		cfg.Ingest.Kafka.ConsumerGroup = "generator-a"
+		require.NoError(t, cfg.Validate())
+	})
+
+	t.Run("generator ring mode requires consumer group when consuming from kafka", func(t *testing.T) {
+		cfg := *cfg
+		cfg.ConsumeFromKafka = true
+		cfg.RingMode = RingModeGenerator
+		cfg.Ingest.Kafka.Topic = "tempo"
+		require.EqualError(t, cfg.Validate(), "ingest.kafka.consumer_group must be configured when metrics-generator ring mode is generator")
+	})
+
+	t.Run("invalid ring mode", func(t *testing.T) {
+		cfg := *cfg
+		cfg.RingMode = RingMode("invalid")
+		require.EqualError(t, cfg.Validate(), "invalid ring mode: invalid, valid values are partition and generator")
+	})
+}
+
+func boolPtr(b bool) *bool {
+	return &b
+}

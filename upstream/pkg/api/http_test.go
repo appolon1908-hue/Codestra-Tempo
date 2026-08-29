@@ -1,0 +1,1523 @@
+package api
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strconv"
+	"strings"
+	"testing"
+	"testing/synctest"
+	"time"
+
+	spanpruningprocessor "github.com/open-telemetry/opentelemetry-collector-contrib/processor/spanpruningprocessor"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/grafana/tempo/cmd/tempo-query/tempo"
+	"github.com/grafana/tempo/pkg/model/tracediff"
+	"github.com/grafana/tempo/pkg/tempopb"
+)
+
+func TestMarshalingFormatFromAcceptHeader(t *testing.T) {
+	tests := []struct {
+		name         string
+		acceptHeader string
+		expected     MarshallingFormat
+	}{
+		{name: "empty accept header", acceptHeader: "", expected: MarshallingFormatJSON},
+		{name: "json", acceptHeader: "application/json", expected: MarshallingFormatJSON},
+		{name: "protobuf", acceptHeader: "application/protobuf", expected: MarshallingFormatProtobuf},
+		{name: "simplified json", acceptHeader: "application/vnd.grafana.llm", expected: MarshallingFormatLLM},
+		{name: "invalid", acceptHeader: "application/invalid", expected: MarshallingFormatJSON},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			actual := MarshalingFormatFromAcceptHeader(http.Header{HeaderAccept: []string{tt.acceptHeader}})
+			assert.Equal(t, tt.expected, actual)
+		})
+	}
+}
+
+// For licensing reasons these strings exist in two packages. This test exists to make sure they don't
+// drift.
+func TestEquality(t *testing.T) {
+	assert.Equal(t, HeaderAccept, tempo.AcceptHeaderKey)
+	assert.Equal(t, HeaderAcceptProtobuf, tempo.ProtobufTypeHeaderValue)
+}
+
+func TestQuerierParseSearchRequest(t *testing.T) {
+	tests := []struct {
+		name     string
+		urlQuery string
+		err      string
+		expected *tempopb.SearchRequest
+	}{
+		{
+			name: "empty query",
+			expected: &tempopb.SearchRequest{
+				Tags:            map[string]string{},
+				SpansPerSpanSet: defaultSpansPerSpanSet,
+			},
+		},
+		{
+			name:     "zero ranges",
+			urlQuery: "start=0&end=0",
+			expected: &tempopb.SearchRequest{
+				Tags:            map[string]string{},
+				SpansPerSpanSet: defaultSpansPerSpanSet,
+			},
+		},
+		{
+			name:     "limit set",
+			urlQuery: "limit=10",
+			expected: &tempopb.SearchRequest{
+				Tags:            map[string]string{},
+				Limit:           10,
+				SpansPerSpanSet: defaultSpansPerSpanSet,
+			},
+		},
+		{
+			name:     "zero limit",
+			urlQuery: "limit=0",
+			err:      "invalid limit: must be a positive number",
+		},
+		{
+			name:     "negative limit",
+			urlQuery: "limit=-5",
+			err:      "invalid limit: strconv.ParseUint: parsing \"-5\": invalid syntax",
+		},
+		{
+			name:     "non-numeric limit",
+			urlQuery: "limit=five",
+			err:      "invalid limit: strconv.ParseUint: parsing \"five\": invalid syntax",
+		},
+		{
+			name:     "minDuration and maxDuration",
+			urlQuery: "minDuration=10s&maxDuration=20s",
+			expected: &tempopb.SearchRequest{
+				Tags:            map[string]string{},
+				MinDurationMs:   10000,
+				MaxDurationMs:   20000,
+				SpansPerSpanSet: defaultSpansPerSpanSet,
+			},
+		},
+		{
+			name:     "minDuration greater than maxDuration",
+			urlQuery: "minDuration=20s&maxDuration=5s",
+			err:      "invalid maxDuration: must be greater than minDuration",
+		},
+		{
+			name:     "invalid minDuration",
+			urlQuery: "minDuration=10seconds",
+			err:      "invalid minDuration: time: unknown unit \"seconds\" in duration \"10seconds\"",
+		},
+		{
+			name:     "invalid maxDuration",
+			urlQuery: "maxDuration=1msec",
+			err:      "invalid maxDuration: time: unknown unit \"msec\" in duration \"1msec\"",
+		},
+		{
+			name:     "traceql query",
+			urlQuery: "q=" + url.QueryEscape(`{ .foo="bar" }`),
+			expected: &tempopb.SearchRequest{
+				Query:           `{ .foo="bar" }`,
+				Tags:            map[string]string{},
+				SpansPerSpanSet: defaultSpansPerSpanSet,
+			},
+		},
+		{
+			name:     "traceql query and tags",
+			urlQuery: "q=" + url.QueryEscape(`{ .foo="bar" }`) + "&tags=" + url.QueryEscape("service.name=foo"),
+			err:      "invalid request: can't specify tags and q in the same query",
+		},
+		{
+			name:     "tags and limit",
+			urlQuery: "tags=" + url.QueryEscape("limit=five") + "&limit=5",
+			expected: &tempopb.SearchRequest{
+				Tags: map[string]string{
+					"limit": "five",
+				},
+				Limit:           5,
+				SpansPerSpanSet: defaultSpansPerSpanSet,
+			},
+		},
+		{
+			name:     "tags query parameter with duplicate tag",
+			urlQuery: "tags=" + url.QueryEscape("service.name=foo service.name=bar"),
+			err:      "invalid tags: tag service.name has been set twice",
+		},
+		{
+			name:     "top-level tags with conflicting query parameter tags",
+			urlQuery: "service.name=bar&tags=" + url.QueryEscape("service.name=foo"),
+			expected: &tempopb.SearchRequest{
+				Tags: map[string]string{
+					"service.name": "foo",
+				},
+				SpansPerSpanSet: defaultSpansPerSpanSet,
+			},
+		},
+		{
+			name:     "start and end both set",
+			urlQuery: "tags=" + url.QueryEscape("service.name=foo") + "&start=10&end=20",
+			expected: &tempopb.SearchRequest{
+				Tags: map[string]string{
+					"service.name": "foo",
+				},
+				Start:           10,
+				End:             20,
+				SpansPerSpanSet: defaultSpansPerSpanSet,
+			},
+		},
+		{
+			name:     "end before start",
+			urlQuery: "tags=" + url.QueryEscape("service.name=foo") + "&start=20&end=10",
+			err:      "http parameter start must be before end. received start=20 end=10",
+		},
+		{
+			name:     "negative start",
+			urlQuery: "start=-1&end=20",
+			err:      "invalid start: strconv.ParseUint: parsing \"-1\": invalid syntax",
+		},
+		{
+			name:     "start exceeds uint32",
+			urlQuery: "start=4294967296&end=4294967297",
+			err:      "invalid start: strconv.ParseUint: parsing \"4294967296\": value out of range",
+		},
+		{
+			name:     "negative end",
+			urlQuery: "start=10&end=-1",
+			err:      "invalid end: strconv.ParseUint: parsing \"-1\": invalid syntax",
+		},
+		{
+			name:     "limit exceeds uint32",
+			urlQuery: "limit=4294967298",
+			err:      "invalid limit: strconv.ParseUint: parsing \"4294967298\": value out of range",
+		},
+		{
+			name:     "spss exceeds uint32",
+			urlQuery: "spss=4294967296",
+			err:      "invalid spss: strconv.ParseUint: parsing \"4294967296\": value out of range",
+		},
+		{
+			name:     "top-level tags",
+			urlQuery: "service.name=bar",
+			expected: &tempopb.SearchRequest{
+				Tags: map[string]string{
+					"service.name": "bar",
+				},
+				SpansPerSpanSet: defaultSpansPerSpanSet,
+			},
+		},
+		{
+			name:     "top-level tags with range specified are ignored",
+			urlQuery: "service.name=bar&start=10&end=20",
+			expected: &tempopb.SearchRequest{
+				Tags:            map[string]string{},
+				Start:           10,
+				End:             20,
+				SpansPerSpanSet: defaultSpansPerSpanSet,
+			},
+		},
+		{
+			name:     "zero spss",
+			urlQuery: "spss=0",
+			expected: &tempopb.SearchRequest{
+				Tags:            map[string]string{},
+				SpansPerSpanSet: 0,
+			},
+		},
+		{
+			name:     "negative spss",
+			urlQuery: "spss=-2",
+			err:      "invalid spss: strconv.ParseUint: parsing \"-2\": invalid syntax",
+		},
+		{
+			name:     "non-numeric spss",
+			urlQuery: "spss=four",
+			err:      "invalid spss: strconv.ParseUint: parsing \"four\": invalid syntax",
+		},
+		{
+			name:     "only spss",
+			urlQuery: "spss=2",
+			expected: &tempopb.SearchRequest{
+				Tags:            map[string]string{},
+				SpansPerSpanSet: 2,
+			},
+		},
+		{
+			name:     "tags with spss",
+			urlQuery: "tags=" + url.QueryEscape("service.name=foo") + "&spss=7",
+			expected: &tempopb.SearchRequest{
+				Tags: map[string]string{
+					"service.name": "foo",
+				},
+				SpansPerSpanSet: 7,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := httptest.NewRequest("GET", "http://tempo/api/search?"+tt.urlQuery, nil)
+			fmt.Println("RequestURI:", r.RequestURI)
+
+			searchRequest, err := ParseSearchRequest(r)
+
+			if tt.err != "" {
+				assert.EqualError(t, err, tt.err)
+			} else {
+				assert.NoError(t, err)
+				assert.Equal(t, tt.expected, searchRequest)
+			}
+		})
+	}
+}
+
+func TestQuerierParseSearchRequestTags(t *testing.T) {
+	type strMap map[string]string
+
+	tests := []struct {
+		tags     string
+		expected map[string]string
+	}{
+		{"service.name=foo http.url=api/search", strMap{"service.name": "foo", "http.url": "api/search"}},
+		{"service%n@me=foo", strMap{"service%n@me": "foo"}},
+		{"service.name=foo error", strMap{"service.name": "foo", "error": ""}},
+		{"service.name=\"foo bar\"", strMap{"service.name": "foo bar"}},
+		{"service.name=\"foo=bar\"", strMap{"service.name": "foo=bar"}},
+		{"service.name=\"foo\\bar\"", strMap{"service.name": "foo\bar"}},
+		{"service.name=\"foo \\\"bar\\\"\"", strMap{"service.name": "foo \"bar\""}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.tags, func(t *testing.T) {
+			r := httptest.NewRequest("GET", "http://tempo/api/search?tags="+url.QueryEscape(tt.tags), nil)
+			fmt.Println("RequestURI:", r.RequestURI)
+
+			searchRequest, err := ParseSearchRequest(r)
+
+			assert.NoError(t, err)
+			assert.Equal(t, tt.expected, searchRequest.Tags)
+		})
+	}
+}
+
+func TestQuerierParseSearchRequestTagsError(t *testing.T) {
+	tests := []struct {
+		tags string
+		err  string
+	}{
+		{"service.name=foo =error", "invalid tags: unexpected '=' at pos 18"},
+		{"service.name=foo=bar", "invalid tags: unexpected '=' at pos 17"},
+		{"service.name=\"foo bar", "invalid tags: unterminated quoted value at pos 22"},
+		{"\"service name\"=foo", "invalid tags: unexpected '\"' at pos 1"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.tags, func(t *testing.T) {
+			r := httptest.NewRequest("GET", "http://tempo/api/search?tags="+url.QueryEscape(tt.tags), nil)
+			fmt.Println("RequestURI:", r.RequestURI)
+
+			_, err := ParseSearchRequest(r)
+
+			assert.EqualError(t, err, tt.err)
+		})
+	}
+}
+
+func TestParseSearchBlockRequest(t *testing.T) {
+	tests := []struct {
+		url           string
+		expected      *tempopb.SearchBlockRequest
+		expectedError string
+	}{
+		{
+			url:           "/",
+			expectedError: "start and end required",
+		},
+		{
+			url:           "/?start=10&end=20",
+			expectedError: "invalid startPage: strconv.ParseInt: parsing \"\": invalid syntax",
+		},
+		{
+			url:           "/?start=10&end=20&startPage=0",
+			expectedError: "invalid pagesToSearch : strconv.ParseInt: parsing \"\": invalid syntax",
+		},
+		{
+			url:           "/?start=10&end=20&startPage=0&pagesToSearch=10",
+			expectedError: "invalid blockID: invalid UUID length: 0",
+		},
+		{
+			url:           "/?start=10&end=20&startPage=0&pagesToSearch=10&blockID=adsf",
+			expectedError: "invalid blockID: invalid UUID length: 4",
+		},
+		{
+			url:           "/?start=10&end=20&startPage=0&pagesToSearch=10&blockID=b92ec614-3fd7-4299-b6db-f657e7025a9b&encoding=s2",
+			expectedError: "invalid indexPageSize : strconv.ParseInt: parsing \"\": invalid syntax",
+		},
+		{
+			url:           "/?start=10&end=20&startPage=0&pagesToSearch=10&blockID=b92ec614-3fd7-4299-b6db-f657e7025a9b&encoding=s2&indexPageSize=10",
+			expectedError: "invalid totalRecords : strconv.ParseInt: parsing \"\": invalid syntax",
+		},
+		{
+			url:           "/?start=10&end=20&startPage=0&pagesToSearch=10&blockID=b92ec614-3fd7-4299-b6db-f657e7025a9b&encoding=s2&indexPageSize=10&totalRecords=-1",
+			expectedError: "totalRecords must be greater than 0. received -1",
+		},
+		{
+			url:           "/?start=10&end=20&startPage=0&pagesToSearch=10&blockID=b92ec614-3fd7-4299-b6db-f657e7025a9b&encoding=s2&indexPageSize=10&totalRecords=11&dataEncoding=v1",
+			expectedError: "version required",
+		},
+		{
+			url:           "/?start=10&end=20&startPage=0&pagesToSearch=10&blockID=b92ec614-3fd7-4299-b6db-f657e7025a9b&encoding=s2&indexPageSize=10&totalRecords=11&dataEncoding=v1&version=v2&size=1000",
+			expectedError: "invalid footerSize : strconv.ParseUint: parsing \"\": invalid syntax",
+		},
+		{
+			url: "/?tags=foo%3Dbar&start=10&end=20&startPage=0&pagesToSearch=10&blockID=b92ec614-3fd7-4299-b6db-f657e7025a9b&encoding=none&footerSize=2000&indexPageSize=10&totalRecords=11&dataEncoding=v1&version=v2&size=1000",
+			expected: &tempopb.SearchBlockRequest{
+				SearchReq: &tempopb.SearchRequest{
+					Tags: map[string]string{
+						"foo": "bar",
+					},
+					Start:           10,
+					End:             20,
+					Limit:           defaultLimit,
+					SpansPerSpanSet: defaultSpansPerSpanSet,
+				},
+				StartPage:     0,
+				PagesToSearch: 10,
+				BlockID:       "b92ec614-3fd7-4299-b6db-f657e7025a9b",
+				IndexPageSize: 10,
+				TotalRecords:  11,
+				Version:       "v2",
+				Size_:         1000,
+				FooterSize:    2000,
+			},
+		},
+		{
+			url: "/?tags=foo%3Dbar&start=10&end=20&blockID=b92ec614-3fd7-4299-b6db-f657e7025a9b&dataEncoding=&dc=%5B%7B%22type%22%3A0%2C%22name%22%3A%22net.sock.host.addr%22%2C%22scope%22%3A0%7D%5D&encoding=none&footerSize=2000&indexPageSize=0&pagesToSearch=10&size=1000&startPage=0&totalRecords=2&version=vParquet3",
+			expected: &tempopb.SearchBlockRequest{
+				SearchReq: &tempopb.SearchRequest{
+					Tags: map[string]string{
+						"foo": "bar",
+					},
+					Start:           10,
+					End:             20,
+					Limit:           defaultLimit,
+					SpansPerSpanSet: defaultSpansPerSpanSet,
+				},
+				StartPage:     0,
+				PagesToSearch: 10,
+				BlockID:       "b92ec614-3fd7-4299-b6db-f657e7025a9b",
+				IndexPageSize: 0,
+				TotalRecords:  2,
+				Version:       "vParquet3",
+				Size_:         1000,
+				FooterSize:    2000,
+				DedicatedColumns: []*tempopb.DedicatedColumn{
+					{Scope: tempopb.DedicatedColumn_SPAN, Name: "net.sock.host.addr", Type: tempopb.DedicatedColumn_STRING},
+				},
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		r := httptest.NewRequest("GET", tc.url, nil)
+		actualReq, actualErr := ParseSearchBlockRequest(r)
+
+		if len(tc.expectedError) != 0 {
+			assert.EqualError(t, actualErr, tc.expectedError)
+			assert.Nil(t, actualReq)
+			continue
+		}
+		assert.Equal(t, tc.expected, actualReq)
+	}
+}
+
+func TestBuildSearchBlockRequest(t *testing.T) {
+	tests := []struct {
+		req     *tempopb.SearchBlockRequest
+		httpReq *http.Request
+		query   string
+	}{
+		{
+			req: &tempopb.SearchBlockRequest{
+				StartPage:     0,
+				PagesToSearch: 10,
+				BlockID:       "b92ec614-3fd7-4299-b6db-f657e7025a9b",
+				IndexPageSize: 10,
+				TotalRecords:  11,
+				Version:       "v2",
+				Size_:         1000,
+				FooterSize:    2000,
+			},
+			query: "?blockID=b92ec614-3fd7-4299-b6db-f657e7025a9b&pagesToSearch=10&size=1000&startPage=0&encoding=none&indexPageSize=10&totalRecords=11&version=v2&footerSize=2000",
+		},
+		{
+			req: &tempopb.SearchBlockRequest{
+				StartPage:     0,
+				PagesToSearch: 10,
+				BlockID:       "b92ec614-3fd7-4299-b6db-f657e7025a9b",
+				IndexPageSize: 10,
+				TotalRecords:  11,
+				Version:       "v2",
+				Size_:         1000,
+				FooterSize:    2000,
+			},
+			httpReq: httptest.NewRequest("GET", "/test/path", nil),
+			query:   "/test/path?blockID=b92ec614-3fd7-4299-b6db-f657e7025a9b&pagesToSearch=10&size=1000&startPage=0&encoding=none&indexPageSize=10&totalRecords=11&version=v2&footerSize=2000",
+		},
+		{
+			req: &tempopb.SearchBlockRequest{
+				SearchReq: &tempopb.SearchRequest{
+					Tags: map[string]string{
+						"foo": "bar",
+					},
+					Start:         10,
+					End:           20,
+					MinDurationMs: 30,
+					MaxDurationMs: 40,
+					Limit:         50,
+				},
+				StartPage:     0,
+				PagesToSearch: 10,
+				BlockID:       "b92ec614-3fd7-4299-b6db-f657e7025a9b",
+				IndexPageSize: 10,
+				TotalRecords:  11,
+				Version:       "v2",
+				Size_:         1000,
+				FooterSize:    2000,
+			},
+			query: "?start=10&end=20&limit=50&maxDuration=40ms&minDuration=30ms&spss=0&tags=foo%3Dbar&blockID=b92ec614-3fd7-4299-b6db-f657e7025a9b&pagesToSearch=10&size=1000&startPage=0&encoding=none&indexPageSize=10&totalRecords=11&version=v2&footerSize=2000",
+		},
+		{
+			req: &tempopb.SearchBlockRequest{
+				StartPage:     0,
+				PagesToSearch: 10,
+				BlockID:       "b92ec614-3fd7-4299-b6db-f657e7025a9b",
+				IndexPageSize: 0,
+				TotalRecords:  2,
+				Version:       "vParquet3",
+				Size_:         1000,
+				FooterSize:    2000,
+				DedicatedColumns: []*tempopb.DedicatedColumn{
+					{Scope: tempopb.DedicatedColumn_RESOURCE, Name: "net.sock.host.addr", Type: tempopb.DedicatedColumn_STRING},
+				},
+			},
+			httpReq: httptest.NewRequest("GET", "/test/path", nil),
+			query:   "/test/path?blockID=b92ec614-3fd7-4299-b6db-f657e7025a9b&pagesToSearch=10&size=1000&startPage=0&encoding=none&indexPageSize=0&totalRecords=2&version=vParquet3&footerSize=2000&dc=%5B%7B%22scope%22%3A1%2C%22name%22%3A%22net.sock.host.addr%22%7D%5D",
+		},
+	}
+
+	for _, tc := range tests {
+		jsonBytes, err := json.Marshal(tc.req.DedicatedColumns)
+		require.NoError(t, err)
+
+		actualURL, err := BuildSearchBlockRequest(tc.httpReq, tc.req, string(jsonBytes))
+		assert.NoError(t, err)
+		assert.Equal(t, tc.query, actualURL.URL.String())
+	}
+}
+
+func TestParseTraceDiffRequest(t *testing.T) {
+	tests := []struct {
+		name        string
+		body        string
+		expectedErr string
+		assertReq   func(t *testing.T, req *TraceDiffRequest)
+	}{
+		{
+			name: "valid minimal request defaults format",
+			body: `{"base":{"traceId":"abc123"},"compare":{"traceId":"def456"}}`,
+			assertReq: func(t *testing.T, req *TraceDiffRequest) {
+				t.Helper()
+				assert.Equal(t, tracediff.VersionTracePatchV0, req.Format)
+				assert.Equal(t, "abc123", req.Base.TraceID)
+				assert.Equal(t, "def456", req.Compare.TraceID)
+				assert.Len(t, req.Base.TraceIDBytes, 16)
+				assert.Len(t, req.Compare.TraceIDBytes, 16)
+				assert.True(t, req.Base.StartTime.IsZero())
+				assert.True(t, req.Base.EndTime.IsZero())
+				assert.True(t, req.Compare.StartTime.IsZero())
+				assert.True(t, req.Compare.EndTime.IsZero())
+			},
+		},
+		{
+			name: "valid request with independent windows",
+			body: `{"base":{"traceId":"abc123","start":10,"end":20},"compare":{"traceId":"def456","start":100,"end":200}}`,
+			assertReq: func(t *testing.T, req *TraceDiffRequest) {
+				t.Helper()
+				assert.Equal(t, tracediff.VersionTracePatchV0, req.Format)
+				assert.Equal(t, time.Unix(10, 0), req.Base.StartTime)
+				assert.Equal(t, time.Unix(20, 0), req.Base.EndTime)
+				assert.Equal(t, time.Unix(100, 0), req.Compare.StartTime)
+				assert.Equal(t, time.Unix(200, 0), req.Compare.EndTime)
+			},
+		},
+		{
+			name: "explicit composed format",
+			body: `{"base":{"traceId":"abc123"},"compare":{"traceId":"def456"},"format":"trace-summary-v0-composed"}`,
+			assertReq: func(t *testing.T, req *TraceDiffRequest) {
+				t.Helper()
+				assert.Equal(t, tracediff.VersionTraceSummaryV0Composed, req.Format)
+			},
+		},
+		{
+			name: "explicit patch format",
+			body: `{"base":{"traceId":"abc123"},"compare":{"traceId":"def456"},"format":"trace-patch-v0"}`,
+			assertReq: func(t *testing.T, req *TraceDiffRequest) {
+				t.Helper()
+				assert.Equal(t, tracediff.VersionTracePatchV0, req.Format)
+			},
+		},
+		{
+			name: "explicit native summary format",
+			body: `{"base":{"traceId":"abc123"},"compare":{"traceId":"def456"},"format":"trace-summary-v0-native"}`,
+			assertReq: func(t *testing.T, req *TraceDiffRequest) {
+				t.Helper()
+				assert.Equal(t, tracediff.VersionTraceSummaryV0Native, req.Format)
+			},
+		},
+		{
+			name:        "unknown format",
+			body:        `{"base":{"traceId":"abc123"},"compare":{"traceId":"def456"},"format":"trace-summary-v1"}`,
+			expectedErr: `invalid format "trace-summary-v1": must be one of "trace-summary-v0-composed", "trace-patch-v0", "trace-summary-v0-native"`,
+		},
+		{
+			name:        "empty body",
+			body:        "",
+			expectedErr: "invalid trace diff request body",
+		},
+		{
+			name:        "malformed json",
+			body:        `{"base":`,
+			expectedErr: "invalid trace diff request body",
+		},
+		{
+			name:        "missing base",
+			body:        `{"compare":{"traceId":"def456"}}`,
+			expectedErr: "base.traceId is required",
+		},
+		{
+			name:        "missing compare",
+			body:        `{"base":{"traceId":"abc123"}}`,
+			expectedErr: "compare.traceId is required",
+		},
+		{
+			name:        "missing base trace ID",
+			body:        `{"base":{},"compare":{"traceId":"def456"}}`,
+			expectedErr: "base.traceId is required",
+		},
+		{
+			name:        "invalid trace ID",
+			body:        `{"base":{"traceId":"not-hex"},"compare":{"traceId":"def456"}}`,
+			expectedErr: "invalid base.traceId",
+		},
+		{
+			name:        "base end equals start",
+			body:        `{"base":{"traceId":"abc123","start":10,"end":10},"compare":{"traceId":"def456"}}`,
+			expectedErr: "base.start must be before base.end. received start=10 end=10",
+		},
+		{
+			name:        "compare end before start",
+			body:        `{"base":{"traceId":"abc123"},"compare":{"traceId":"def456","start":20,"end":10}}`,
+			expectedErr: "compare.start must be before compare.end. received start=20 end=10",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, PathTraceDiffV2, strings.NewReader(tt.body))
+
+			actual, err := ParseTraceDiffRequest(req)
+			if tt.expectedErr != "" {
+				require.ErrorContains(t, err, tt.expectedErr)
+				return
+			}
+
+			require.NoError(t, err)
+			require.NotNil(t, actual)
+			if tt.assertReq != nil {
+				tt.assertReq(t, actual)
+			}
+		})
+	}
+}
+
+func TestParseTraceByIDRequest(t *testing.T) {
+	tests := []struct {
+		httpReq       *http.Request
+		queryMode     string
+		startTime     time.Time
+		endTime       time.Time
+		blockStart    string
+		blockEnd      string
+		expectedError string
+	}{
+		{
+			httpReq:    httptest.NewRequest("GET", "/api/traces/1234?blockEnd=ffffffffffffffffffffffffffffffff&blockStart=00000000000000000000000000000000&mode=blocks&start=1&end=2", nil),
+			queryMode:  "blocks",
+			startTime:  time.Unix(1, 0),
+			endTime:    time.Unix(2, 0),
+			blockStart: "00000000000000000000000000000000",
+			blockEnd:   "ffffffffffffffffffffffffffffffff",
+		},
+		{
+			httpReq:    httptest.NewRequest("GET", "/api/traces/1234?blockEnd=ffffffffffffffffffffffffffffffff&blockStart=00000000000000000000000000000000&mode=blocks", nil),
+			queryMode:  "blocks",
+			startTime:  time.Time{},
+			endTime:    time.Time{},
+			blockStart: "00000000000000000000000000000000",
+			blockEnd:   "ffffffffffffffffffffffffffffffff",
+		},
+		{
+			httpReq:    httptest.NewRequest("GET", "/api/traces/1234?mode=blocks", nil),
+			queryMode:  "blocks",
+			startTime:  time.Time{},
+			endTime:    time.Time{},
+			blockStart: "00000000-0000-0000-0000-000000000000",
+			blockEnd:   "FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF",
+		},
+		{
+			httpReq:    httptest.NewRequest("GET", "/api/traces/1234?mode=blocks&blockStart=12345678000000001235000001240000&blockEnd=ffffffffffffffffffffffffffffffff", nil),
+			queryMode:  "blocks",
+			startTime:  time.Time{},
+			endTime:    time.Time{},
+			blockStart: "12345678000000001235000001240000",
+			blockEnd:   "ffffffffffffffffffffffffffffffff",
+		},
+		{
+			httpReq:    httptest.NewRequest("GET", "/api/traces/1234?mode=blocks&blockStart=12345678000000001235000001240000&blockEnd=ffffffffffffffffffffffffffffffff&rf1After=1970-01-01T01:16:40Z", nil),
+			queryMode:  "blocks",
+			startTime:  time.Time{},
+			endTime:    time.Time{},
+			blockStart: "12345678000000001235000001240000",
+			blockEnd:   "ffffffffffffffffffffffffffffffff",
+		},
+		{
+			httpReq:       httptest.NewRequest("GET", "/api/traces/1234?mode=blocks&blockStart=12345678000000001235000001240000&blockEnd=ffffffffffffffffffffffffffffffff&start=1&end=1", nil),
+			queryMode:     "blocks",
+			startTime:     time.Time{},
+			endTime:       time.Time{},
+			blockStart:    "12345678000000001235000001240000",
+			blockEnd:      "ffffffffffffffffffffffffffffffff",
+			expectedError: "http parameter start must be before end. received start=1 end=1",
+		},
+		{
+			httpReq:    httptest.NewRequest("GET", "/api/traces/1234?mode=external&start=1&end=2", nil),
+			queryMode:  "external",
+			startTime:  time.Unix(1, 0),
+			endTime:    time.Unix(2, 0),
+			blockStart: "00000000-0000-0000-0000-000000000000",
+			blockEnd:   "FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF",
+		},
+	}
+
+	for _, tc := range tests {
+		blockStart, blockEnd, queryMode, startTime, endTime, err := ParseTraceByIDRequest(tc.httpReq)
+		if len(tc.expectedError) != 0 {
+			assert.EqualError(t, err, tc.expectedError)
+			continue
+		}
+		assert.NoError(t, err)
+		assert.Equal(t, tc.queryMode, queryMode)
+		assert.Equal(t, tc.blockStart, blockStart)
+		assert.Equal(t, tc.blockEnd, blockEnd)
+		assert.Equal(t, tc.startTime, startTime)
+		assert.Equal(t, tc.endTime, endTime)
+	}
+}
+
+func TestParseTraceByIDFilterParams(t *testing.T) {
+	tests := []struct {
+		name              string
+		urlQuery          string
+		wantQuery         string
+		wantKeepHierarchy bool
+		wantMatchDepth    int
+		wantAncestorDepth int
+		wantErr           bool
+	}{
+		// no q means no filter at all, so the zero-value TraceByIDFilterParams is returned:
+		// match_depth and ancestor_depth are both 0 here, not their filtered-path defaults.
+		{name: "no params means no filter", urlQuery: "", wantMatchDepth: 0, wantAncestorDepth: 0},
+		{name: "query only defaults keep_hierarchy false", urlQuery: "q=" + url.QueryEscape("{ .a = 1 }"), wantQuery: "{ .a = 1 }", wantMatchDepth: 0, wantAncestorDepth: -1},
+		// a whitespace-only q is trimmed to empty, so it is treated as no filter and keep_hierarchy is ignored.
+		{name: "whitespace-only q is treated as empty", urlQuery: "q=" + url.QueryEscape("   ") + "&keep_hierarchy=true", wantMatchDepth: 0, wantAncestorDepth: 0},
+		// surrounding whitespace on a real query is trimmed, not passed to the parser.
+		{name: "surrounding whitespace on q is trimmed", urlQuery: "q=" + url.QueryEscape("  { .a = 1 }  "), wantQuery: "{ .a = 1 }", wantMatchDepth: 0, wantAncestorDepth: -1},
+		{
+			name:              "query and explicit keep_hierarchy true",
+			urlQuery:          "q=" + url.QueryEscape("{ .a = 1 }") + "&keep_hierarchy=true",
+			wantQuery:         "{ .a = 1 }",
+			wantKeepHierarchy: true,
+			wantMatchDepth:    0,
+			wantAncestorDepth: -1,
+		},
+		{
+			name:              "explicit keep_hierarchy false overrides default",
+			urlQuery:          "q=" + url.QueryEscape("{ .a = 1 }") + "&keep_hierarchy=false",
+			wantQuery:         "{ .a = 1 }",
+			wantMatchDepth:    0,
+			wantAncestorDepth: -1,
+		},
+		{
+			name:     "invalid keep_hierarchy with query",
+			urlQuery: "q=" + url.QueryEscape("{ .a = 1 }") + "&keep_hierarchy=yes-please",
+			wantErr:  true,
+		},
+		{name: "invalid keep_hierarchy ignored without query", urlQuery: "keep_hierarchy=yes-please", wantMatchDepth: 0, wantAncestorDepth: 0},
+		{
+			name:              "match_depth absent with query defaults to 0",
+			urlQuery:          "q=" + url.QueryEscape("{ .a = 1 }"),
+			wantQuery:         "{ .a = 1 }",
+			wantMatchDepth:    0,
+			wantAncestorDepth: -1,
+		},
+		{
+			name:              "match_depth explicit zero",
+			urlQuery:          "q=" + url.QueryEscape("{ .a = 1 }") + "&match_depth=0",
+			wantQuery:         "{ .a = 1 }",
+			wantMatchDepth:    0,
+			wantAncestorDepth: -1,
+		},
+		{
+			name:              "match_depth explicit -1 means unbounded",
+			urlQuery:          "q=" + url.QueryEscape("{ .a = 1 }") + "&match_depth=-1",
+			wantQuery:         "{ .a = 1 }",
+			wantMatchDepth:    -1,
+			wantAncestorDepth: -1,
+		},
+		{
+			name:              "match_depth explicit positive value",
+			urlQuery:          "q=" + url.QueryEscape("{ .a = 1 }") + "&match_depth=2",
+			wantQuery:         "{ .a = 1 }",
+			wantMatchDepth:    2,
+			wantAncestorDepth: -1,
+		},
+		{
+			name:              "ancestor_depth absent with query defaults to -1",
+			urlQuery:          "q=" + url.QueryEscape("{ .a = 1 }"),
+			wantQuery:         "{ .a = 1 }",
+			wantMatchDepth:    0,
+			wantAncestorDepth: -1,
+		},
+		{
+			name:              "ancestor_depth explicit zero",
+			urlQuery:          "q=" + url.QueryEscape("{ .a = 1 }") + "&keep_hierarchy=true&ancestor_depth=0",
+			wantQuery:         "{ .a = 1 }",
+			wantKeepHierarchy: true,
+			wantMatchDepth:    0,
+			wantAncestorDepth: 0,
+		},
+		{
+			name:              "ancestor_depth explicit -1 means unbounded",
+			urlQuery:          "q=" + url.QueryEscape("{ .a = 1 }") + "&keep_hierarchy=true&ancestor_depth=-1",
+			wantQuery:         "{ .a = 1 }",
+			wantKeepHierarchy: true,
+			wantMatchDepth:    0,
+			wantAncestorDepth: -1,
+		},
+		{
+			name:              "ancestor_depth explicit positive value",
+			urlQuery:          "q=" + url.QueryEscape("{ .a = 1 }") + "&keep_hierarchy=true&ancestor_depth=3",
+			wantQuery:         "{ .a = 1 }",
+			wantKeepHierarchy: true,
+			wantMatchDepth:    0,
+			wantAncestorDepth: 3,
+		},
+		// without keep_hierarchy, ancestor_depth has nothing to bound, so it is never read: the value
+		// is left at its default no matter what was sent, and even an unusable one cannot fail the
+		// request. This lets someone flip keep_hierarchy off without stripping the depth beside it.
+		{
+			name:              "ancestor_depth not read when keep_hierarchy absent",
+			urlQuery:          "q=" + url.QueryEscape("{ .a = 1 }") + "&ancestor_depth=3",
+			wantQuery:         "{ .a = 1 }",
+			wantMatchDepth:    0,
+			wantAncestorDepth: -1,
+		},
+		{
+			name:              "ancestor_depth not read when keep_hierarchy false",
+			urlQuery:          "q=" + url.QueryEscape("{ .a = 1 }") + "&keep_hierarchy=false&ancestor_depth=0",
+			wantQuery:         "{ .a = 1 }",
+			wantMatchDepth:    0,
+			wantAncestorDepth: -1,
+		},
+		{
+			name:     "match_depth below -1 with query is an error",
+			urlQuery: "q=" + url.QueryEscape("{ .a = 1 }") + "&match_depth=-2",
+			wantErr:  true,
+		},
+		{
+			name:     "non-numeric match_depth with query is an error",
+			urlQuery: "q=" + url.QueryEscape("{ .a = 1 }") + "&match_depth=abc",
+			wantErr:  true,
+		},
+		{
+			name:     "ancestor_depth below -1 with keep_hierarchy is an error",
+			urlQuery: "q=" + url.QueryEscape("{ .a = 1 }") + "&keep_hierarchy=true&ancestor_depth=-2",
+			wantErr:  true,
+		},
+		{
+			name:     "non-numeric ancestor_depth with keep_hierarchy is an error",
+			urlQuery: "q=" + url.QueryEscape("{ .a = 1 }") + "&keep_hierarchy=true&ancestor_depth=abc",
+			wantErr:  true,
+		},
+		// the same unusable values are accepted without keep_hierarchy, because they are never read.
+		{
+			name:              "ancestor_depth below -1 ignored without keep_hierarchy",
+			urlQuery:          "q=" + url.QueryEscape("{ .a = 1 }") + "&ancestor_depth=-2",
+			wantQuery:         "{ .a = 1 }",
+			wantMatchDepth:    0,
+			wantAncestorDepth: -1,
+		},
+		{
+			name:              "ancestor_depth below -1 ignored with keep_hierarchy false",
+			urlQuery:          "q=" + url.QueryEscape("{ .a = 1 }") + "&keep_hierarchy=false&ancestor_depth=-2",
+			wantQuery:         "{ .a = 1 }",
+			wantMatchDepth:    0,
+			wantAncestorDepth: -1,
+		},
+		{
+			name:              "non-numeric ancestor_depth ignored without keep_hierarchy",
+			urlQuery:          "q=" + url.QueryEscape("{ .a = 1 }") + "&ancestor_depth=abc",
+			wantQuery:         "{ .a = 1 }",
+			wantMatchDepth:    0,
+			wantAncestorDepth: -1,
+		},
+		{
+			name:              "invalid match_depth ignored without query",
+			urlQuery:          "match_depth=-2",
+			wantMatchDepth:    0,
+			wantAncestorDepth: 0,
+		},
+		{
+			name:              "query, keep_hierarchy, and ancestor_depth combined",
+			urlQuery:          "q=" + url.QueryEscape("{ .a = 1 }") + "&keep_hierarchy=true&ancestor_depth=2",
+			wantQuery:         "{ .a = 1 }",
+			wantKeepHierarchy: true,
+			wantMatchDepth:    0,
+			wantAncestorDepth: 2,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := httptest.NewRequest("GET", "/api/v2/traces/1234?"+tt.urlQuery, nil)
+			params, err := ParseTraceByIDFilterParams(r)
+			if tt.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tt.wantQuery, params.Query)
+			require.Equal(t, tt.wantKeepHierarchy, params.KeepHierarchy)
+			require.Equal(t, tt.wantMatchDepth, params.MatchDepth)
+			require.Equal(t, tt.wantAncestorDepth, params.AncestorDepth)
+		})
+	}
+}
+
+func TestParseSpanPruningRequest(t *testing.T) {
+	defaultCfg := func() *spanpruningprocessor.Config {
+		return spanpruningprocessor.NewFactory().CreateDefaultConfig().(*spanpruningprocessor.Config)
+	}
+
+	tests := []struct {
+		name             string
+		query            string
+		enabledByDefault bool
+		expectEnabled    bool
+		expectCfg        *spanpruningprocessor.Config
+		expectedError    string
+	}{
+		{
+			name:          "absent param disables pruning",
+			query:         "",
+			expectEnabled: false,
+			expectCfg:     nil,
+		},
+		{
+			name:          "explicit false disables pruning",
+			query:         "span_pruning=false",
+			expectEnabled: false,
+			expectCfg:     nil,
+		},
+		{
+			name:             "enabledByDefault enables pruning with defaults when the param is absent",
+			query:            "",
+			enabledByDefault: true,
+			expectEnabled:    true,
+			expectCfg:        defaultCfg(),
+		},
+		{
+			name:             "explicit false is respected even when enabledByDefault is set",
+			query:            "span_pruning=false",
+			enabledByDefault: true,
+			expectEnabled:    false,
+			expectCfg:        nil,
+		},
+		{
+			name:             "explicit true is respected when enabledByDefault is set",
+			query:            "span_pruning=true",
+			enabledByDefault: true,
+			expectEnabled:    true,
+			expectCfg:        defaultCfg(),
+		},
+		{
+			name:             "enabledByDefault honors request overrides when span_pruning param is absent",
+			query:            "span_pruning_min_spans=10",
+			enabledByDefault: true,
+			expectEnabled:    true,
+			expectCfg: func() *spanpruningprocessor.Config {
+				cfg := defaultCfg()
+				cfg.MinSpansToAggregate = 10
+				return cfg
+			}(),
+		},
+		{
+			name:          "invalid bool value",
+			query:         "span_pruning=maybe",
+			expectedError: `invalid span_pruning value "maybe": must be a boolean`,
+		},
+		{
+			name:          "true with defaults",
+			query:         "span_pruning=true",
+			expectEnabled: true,
+			expectCfg:     defaultCfg(),
+		},
+		{
+			name:          "group_by trims whitespace and drops empty entries",
+			query:         "span_pruning=true&span_pruning_group_by=" + url.QueryEscape("http.route, , db.statement,"),
+			expectEnabled: true,
+			expectCfg: func() *spanpruningprocessor.Config {
+				cfg := defaultCfg()
+				cfg.GroupByAttributes = []string{"http.route", "db.statement"}
+				return cfg
+			}(),
+		},
+		{
+			name:          "min_spans override",
+			query:         "span_pruning=true&span_pruning_min_spans=10",
+			expectEnabled: true,
+			expectCfg: func() *spanpruningprocessor.Config {
+				cfg := defaultCfg()
+				cfg.MinSpansToAggregate = 10
+				return cfg
+			}(),
+		},
+		{
+			name:          "min_spans invalid integer",
+			query:         "span_pruning=true&span_pruning_min_spans=nope",
+			expectedError: `invalid span_pruning_min_spans value "nope": strconv.Atoi: parsing "nope": invalid syntax`,
+		},
+		{
+			name:          "min_spans below processor minimum fails validation",
+			query:         "span_pruning=true&span_pruning_min_spans=1",
+			expectedError: "invalid span pruning config",
+		},
+		{
+			name:          "max_parent_depth override",
+			query:         "span_pruning=true&span_pruning_max_parent_depth=2",
+			expectEnabled: true,
+			expectCfg: func() *spanpruningprocessor.Config {
+				cfg := defaultCfg()
+				cfg.MaxParentDepth = 2
+				return cfg
+			}(),
+		},
+		{
+			name:          "max_parent_depth invalid integer",
+			query:         "span_pruning=true&span_pruning_max_parent_depth=nope",
+			expectedError: `invalid span_pruning_max_parent_depth value "nope": strconv.Atoi: parsing "nope": invalid syntax`,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest("GET", "/api/v2/traces/1234?"+tc.query, nil)
+			enabled, cfg, err := ParseSpanPruningRequest(req, tc.enabledByDefault)
+			if tc.expectedError != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tc.expectedError)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.expectEnabled, enabled)
+			assert.Equal(t, tc.expectCfg, cfg)
+		})
+	}
+}
+
+func TestBuildSearchRequest(t *testing.T) {
+	tests := []struct {
+		req     *tempopb.SearchRequest
+		httpReq *http.Request
+		query   string
+	}{
+		{
+			req: &tempopb.SearchRequest{
+				Tags: map[string]string{
+					"foo": "bar",
+				},
+				Start:           10,
+				End:             20,
+				MinDurationMs:   30,
+				MaxDurationMs:   40,
+				Limit:           50,
+				SpansPerSpanSet: 60,
+			},
+			query: "?start=10&end=20&limit=50&maxDuration=40ms&minDuration=30ms&spss=60&tags=foo%3Dbar",
+		},
+		{
+			req: &tempopb.SearchRequest{
+				Tags: map[string]string{
+					"foo": "bar",
+				},
+				Start:         10,
+				End:           20,
+				MaxDurationMs: 30,
+				Limit:         50,
+			},
+			query: "?start=10&end=20&limit=50&maxDuration=30ms&spss=0&tags=foo%3Dbar",
+		},
+		{
+			req: &tempopb.SearchRequest{
+				Tags: map[string]string{
+					"foo": "bar",
+				},
+				Start:         10,
+				End:           20,
+				MinDurationMs: 30,
+				Limit:         50,
+			},
+			query: "?start=10&end=20&limit=50&minDuration=30ms&spss=0&tags=foo%3Dbar",
+		},
+		{
+			req: &tempopb.SearchRequest{
+				Tags: map[string]string{
+					"foo": "bar",
+				},
+				Start:         10,
+				End:           20,
+				MinDurationMs: 30,
+				MaxDurationMs: 40,
+			},
+			query: "?start=10&end=20&maxDuration=40ms&minDuration=30ms&spss=0&tags=foo%3Dbar",
+		},
+		{
+			req: &tempopb.SearchRequest{
+				Tags:          map[string]string{},
+				Start:         10,
+				End:           20,
+				MinDurationMs: 30,
+				MaxDurationMs: 40,
+			},
+			query: "?start=10&end=20&maxDuration=40ms&minDuration=30ms&spss=0",
+		},
+		{
+			req: &tempopb.SearchRequest{
+				Query: "{ foo = `bar` }",
+				Start: 10,
+				End:   20,
+			},
+			query: "?start=10&end=20&spss=0&q=%7B+foo+%3D+%60bar%60+%7D",
+		},
+	}
+
+	for _, tc := range tests {
+		actualURL, err := BuildSearchRequest(tc.httpReq, tc.req)
+		assert.NoError(t, err)
+		assert.Equal(t, tc.query, actualURL.URL.String())
+	}
+}
+
+func Test_parseTimestamp(t *testing.T) {
+	now := time.Now()
+
+	tests := []struct {
+		name  string
+		value string
+		def   time.Time
+		want  time.Time
+
+		wantErr bool
+	}{
+		{"default", "", now, now, false},
+		{"unix timestamp", "1571332130", now, time.Unix(1571332130, 0), false},
+		{"unix nano timestamp", "1571334162051000000", now, time.Unix(0, 1571334162051000000), false},
+		{"unix timestamp with subseconds", "1571332130.934", now, time.Unix(1571332130, 934*1e6), false},
+		{"RFC3339 format", "2002-10-02T15:00:00Z", now, time.Date(2002, 10, 0o2, 15, 0, 0, 0, time.UTC), false},
+		{"RFC3339nano format", "2009-11-10T23:00:00.000000001Z", now, time.Date(2009, 11, 10, 23, 0, 0, 1, time.UTC), false},
+		{"invalid", "we", now, time.Time{}, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseTimestamp(tt.value, tt.def)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("parseTimestamp() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			assert.Equal(t, got, tt.want, fmt.Sprintf("parseTimestamp() = %v, want %v", got, tt.want))
+		})
+	}
+}
+
+func TestParseQueryRequestInvalidBounds(t *testing.T) {
+	tests := []struct {
+		name   string
+		params map[string]string
+		errMsg string
+	}{
+		{
+			name:   "invalid start",
+			params: map[string]string{"q": "{} | rate()", "start": "abc", "end": "1700000000"},
+			errMsg: "could not parse 'start' parameter",
+		},
+		{
+			name:   "invalid end",
+			params: map[string]string{"q": "{} | rate()", "start": "1700000000", "end": "bca"},
+			errMsg: "could not parse 'end' parameter",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run("range/"+tt.name, func(t *testing.T) {
+			r := makeReq(tt.params)
+			_, err := ParseQueryRangeRequest(r)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.errMsg)
+		})
+
+		t.Run("instant/"+tt.name, func(t *testing.T) {
+			r := makeReq(tt.params)
+			_, err := ParseQueryInstantRequest(r)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.errMsg)
+		})
+	}
+}
+
+func TestParseQueryRangeNegativeStep(t *testing.T) {
+	for _, step := range []string{"-1h", "-30m", "-1.5", "-0.001"} {
+		t.Run(step, func(t *testing.T) {
+			r := makeReq(map[string]string{
+				"q": "{} | rate()", "start": "1700000000", "end": "1700003600", "step": step,
+			})
+			_, err := ParseQueryRangeRequest(r)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "step must be positive")
+		})
+	}
+}
+
+func TestQueryRangeRoundtripEmpty(t *testing.T) {
+	req := &tempopb.QueryRangeRequest{
+		Step: uint64(time.Second), // you can't actually roundtrip an empty query b/c Build/Parse will force a default step
+	}
+
+	jsonBytes, err := json.Marshal(req.DedicatedColumns)
+	require.NoError(t, err)
+
+	httpReq := BuildQueryRangeRequest(nil, req, string(jsonBytes))
+	actualReq, err := ParseQueryRangeRequest(httpReq)
+	require.NoError(t, err)
+	assert.True(t, actualReq.Start != 0)
+	assert.True(t, actualReq.End != 0)
+}
+
+func TestQueryRangeRoundtrip(t *testing.T) {
+	req := &tempopb.QueryRangeRequest{
+		Query:     "{ foo = `bar` }",
+		Start:     uint64(24 * time.Hour),
+		End:       uint64(25 * time.Hour),
+		Step:      uint64(30 * time.Second),
+		QueryMode: "foo",
+	}
+
+	jsonBytes, err := json.Marshal(req.DedicatedColumns)
+	require.NoError(t, err)
+
+	httpReq := BuildQueryRangeRequest(nil, req, string(jsonBytes))
+	actualReq, err := ParseQueryRangeRequest(httpReq)
+	require.NoError(t, err)
+	assert.Equal(t, req, actualReq)
+}
+
+func Test_determineBounds(t *testing.T) {
+	type args struct {
+		now         time.Time
+		startString string
+		endString   string
+		sinceString string
+	}
+	tests := []struct {
+		name    string
+		args    args
+		start   time.Time
+		end     time.Time
+		wantErr assert.ErrorAssertionFunc
+	}{
+		{
+			name: "no start, end, since",
+			args: args{
+				now:         time.Unix(3600, 0),
+				startString: "",
+				endString:   "",
+				sinceString: "",
+			},
+			start:   time.Unix(0, 0),    // Default start is one hour before 'now' if nothing is provided
+			end:     time.Unix(3600, 0), // Default end is 'now' if nothing is provided
+			wantErr: assert.NoError,
+		},
+		{
+			name: "no since or no start with end in the future",
+			args: args{
+				now:         time.Unix(3600, 0),
+				startString: "",
+				endString:   "2022-12-18T00:00:00Z",
+				sinceString: "",
+			},
+			start:   time.Unix(0, 0), // Default should be one hour before now
+			end:     time.Date(2022, 12, 18, 0, 0, 0, 0, time.UTC),
+			wantErr: assert.NoError,
+		},
+		{
+			name: "no since, valid start and end",
+			args: args{
+				now:         time.Date(2022, 12, 18, 0, 0, 0, 0, time.UTC),
+				startString: "2022-12-17T00:00:00Z",
+				endString:   "2022-12-18T00:00:00Z",
+				sinceString: "",
+			},
+			start:   time.Date(2022, 12, 17, 0, 0, 0, 0, time.UTC),
+			end:     time.Date(2022, 12, 18, 0, 0, 0, 0, time.UTC),
+			wantErr: assert.NoError,
+		},
+		{
+			name: "invalid end",
+			args: args{
+				now:         time.Date(2022, 12, 18, 0, 0, 0, 0, time.UTC),
+				startString: "2022-12-17T00:00:00Z",
+				endString:   "WHAT TIME IS IT?",
+				sinceString: "",
+			},
+			start: time.Time{},
+			end:   time.Time{},
+			wantErr: func(t assert.TestingT, err error, i ...interface{}) bool {
+				return assert.ErrorContains(t, err, "could not parse 'end' parameter:", i...)
+			},
+		},
+		{
+			name: "invalid start",
+			args: args{
+				now:         time.Date(2022, 12, 18, 0, 0, 0, 0, time.UTC),
+				startString: "LET'S GOOO",
+				endString:   "2022-12-18T00:00:00Z",
+				sinceString: "",
+			},
+			start: time.Time{},
+			end:   time.Time{},
+			wantErr: func(t assert.TestingT, err error, i ...interface{}) bool {
+				return assert.ErrorContains(t, err, "could not parse 'start' parameter:", i...)
+			},
+		},
+		{
+			name: "invalid since",
+			args: args{
+				now:         time.Date(2022, 12, 18, 0, 0, 0, 0, time.UTC),
+				startString: "2022-12-17T00:00:00Z",
+				endString:   "2022-12-18T00:00:00Z",
+				sinceString: "HI!",
+			},
+			start: time.Time{},
+			end:   time.Time{},
+			wantErr: func(t assert.TestingT, err error, i ...interface{}) bool {
+				return assert.ErrorContains(t, err, "could not parse 'since' parameter:", i...)
+			},
+		},
+		{
+			name: "since 1h with no start or end",
+			args: args{
+				now:         time.Date(2022, 12, 18, 0, 0, 0, 0, time.UTC),
+				startString: "",
+				endString:   "",
+				sinceString: "1h",
+			},
+			start:   time.Date(2022, 12, 17, 23, 0, 0, 0, time.UTC),
+			end:     time.Date(2022, 12, 18, 0, 0, 0, 0, time.UTC),
+			wantErr: assert.NoError,
+		},
+		{
+			name: "since 1d with no start or end",
+			args: args{
+				now:         time.Date(2022, 12, 18, 0, 0, 0, 0, time.UTC),
+				startString: "",
+				endString:   "",
+				sinceString: "1d",
+			},
+			start:   time.Date(2022, 12, 17, 0, 0, 0, 0, time.UTC),
+			end:     time.Date(2022, 12, 18, 0, 0, 0, 0, time.UTC),
+			wantErr: assert.NoError,
+		},
+		{
+			name: "since 1h with no start and end time in the past",
+			args: args{
+				now:         time.Date(2022, 12, 18, 0, 0, 0, 0, time.UTC),
+				startString: "",
+				endString:   "2022-12-17T00:00:00Z",
+				sinceString: "1h",
+			},
+			start:   time.Date(2022, 12, 16, 23, 0, 0, 0, time.UTC), // start should be calculated relative to end when end is specified
+			end:     time.Date(2022, 12, 17, 0, 0, 0, 0, time.UTC),
+			wantErr: assert.NoError,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, got1, err := determineBounds(tt.args.now, tt.args.startString, tt.args.endString, tt.args.sinceString)
+			if !tt.wantErr(t, err, fmt.Sprintf("determineBounds(%v, %v, %v, %v)", tt.args.now, tt.args.startString, tt.args.endString, tt.args.sinceString)) {
+				return
+			}
+			assert.Equalf(t, tt.start, got, "determineBounds(%v, %v, %v, %v)", tt.args.now, tt.args.startString, tt.args.endString, tt.args.sinceString)
+			assert.Equalf(t, tt.end, got1, "determineBounds(%v, %v, %v, %v)", tt.args.now, tt.args.startString, tt.args.endString, tt.args.sinceString)
+		})
+	}
+}
+
+func makeReq(params map[string]string) *http.Request {
+	req, _ := http.NewRequest("GET", "http://example.com", nil)
+	q := req.URL.Query()
+	for k, v := range params {
+		q.Set(k, v)
+	}
+	req.URL.RawQuery = q.Encode()
+	return req
+}
+
+func TestClampDateRangeReq(t *testing.T) {
+	defStart := time.Hour
+	endBuffer := 5 * time.Minute
+	refNow := time.Date(2023, 10, 15, 12, 0, 0, 0, time.Local)
+
+	// Since parameter tests
+	sinceTests := []struct {
+		name        string
+		params      map[string]string
+		expectedErr string
+		sinceDur    time.Duration
+	}{
+		{"valid 1h", map[string]string{"since": "1h"}, "", time.Hour},
+		{"ignored start+end", map[string]string{"since": "2h", "start": "1697360400", "end": "1697364000"}, "", 2 * time.Hour},
+		{"invalid format", map[string]string{"since": "invalid"}, "could not parse 'since' parameter", 0},
+	}
+
+	for _, tt := range sinceTests {
+		t.Run(tt.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				time.Sleep(time.Until(refNow)) // Setting time.now to refNow
+				req := makeReq(tt.params)
+				start, end, err := ClampDateRangeReq(req, defStart, endBuffer)
+
+				if tt.expectedErr != "" {
+					require.Error(t, err)
+					assert.Contains(t, err.Error(), tt.expectedErr)
+					return
+				}
+
+				require.NoError(t, err)
+
+				expectedEnd := refNow.Add(-endBuffer)
+				expectedStart := expectedEnd.Add(-tt.sinceDur)
+				assert.Equal(t, expectedStart, start)
+				assert.Equal(t, expectedEnd, end)
+			})
+		})
+	}
+
+	// Default no-params test
+	t.Run("default no parameters", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			time.Sleep(time.Until(refNow)) // Setting time.now to refNow
+			req := makeReq(nil)
+			start, end, err := ClampDateRangeReq(req, defStart, endBuffer)
+			require.NoError(t, err)
+
+			assert.Equal(t, refNow.Add(-defStart), start)
+			assert.Equal(t, refNow.Add(-endBuffer), end)
+		})
+	})
+
+	// Start/end validation tests
+	testsStartEndValidation := []struct {
+		name   string
+		params map[string]string
+		err    string
+	}{
+		{"only start", map[string]string{"start": "1697360400"}, "only one of start and end provided"},
+		{"only end", map[string]string{"end": "1697364000"}, "only one of start and end provided"},
+		{"start empty", map[string]string{"start": "", "end": "1697364000"}, "only one of start and end provided"},
+		{"end empty", map[string]string{"start": "1697360400", "end": ""}, "only one of start and end provided"},
+	}
+
+	for _, tt := range testsStartEndValidation {
+		t.Run(tt.name, func(t *testing.T) {
+			req := makeReq(tt.params)
+			_, _, err := ClampDateRangeReq(req, defStart, endBuffer)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.err)
+		})
+	}
+
+	validEnd := refNow.Add(-endBuffer * 2)
+	// End time clamping tests
+	testsEndClamping := []struct {
+		name          string
+		params        map[string]string
+		expectedStart time.Time
+		expectedEnd   time.Time
+	}{
+		{"end clamped", map[string]string{"start": "1697360400", "end": "9999999999"}, time.Unix(1697360400, 0), refNow.Add(-endBuffer)},
+		{"end not clamped", map[string]string{"start": "1000000000", "end": strconv.FormatInt(validEnd.Unix(), 10)}, time.Unix(1000000000, 0), validEnd},
+	}
+
+	for _, tt := range testsEndClamping {
+		t.Run(tt.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				time.Sleep(time.Until(refNow)) // Setting time.now to refNow
+				req := makeReq(tt.params)
+				start, end, err := ClampDateRangeReq(req, defStart, endBuffer)
+				require.NoError(t, err)
+
+				assert.Equal(t, tt.expectedStart, start)
+				assert.WithinDuration(t, tt.expectedEnd, end, time.Second)
+			})
+		})
+	}
+
+	// Invalid timestamp parsing tests
+	testsInvalidParsing := []struct {
+		name   string
+		params map[string]string
+		err    string
+	}{
+		{"invalid start", map[string]string{"start": "invalid", "end": "1697364000"}, "could not parse 'start' parameter"},
+		{"invalid end", map[string]string{"start": "1697360400", "end": "invalid"}, "could not parse 'end' parameter"},
+		// {"start wrong length", map[string]string{"start": "123456", "end": "1697364000"}, "could not parse 'start' parameter"},
+		// {"end wrong length", map[string]string{"start": "1697360400", "end": "123456789012345"}, "could not parse 'end' parameter"},
+	}
+
+	for _, tt := range testsInvalidParsing {
+		t.Run(tt.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				req := makeReq(tt.params)
+				_, _, err := ClampDateRangeReq(req, defStart, endBuffer)
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.err)
+			})
+		})
+	}
+}

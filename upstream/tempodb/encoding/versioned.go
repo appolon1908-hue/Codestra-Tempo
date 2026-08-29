@@ -1,0 +1,162 @@
+package encoding
+
+import (
+	"context"
+	"fmt"
+	"io/fs"
+	"strings"
+	"time"
+
+	"github.com/grafana/tempo/tempodb/backend"
+	"github.com/grafana/tempo/tempodb/encoding/common"
+	"github.com/grafana/tempo/tempodb/encoding/unsupported"
+	"github.com/grafana/tempo/tempodb/encoding/vparquet3"
+	"github.com/grafana/tempo/tempodb/encoding/vparquet4"
+	"github.com/grafana/tempo/tempodb/encoding/vparquet5"
+)
+
+// VersionedEncoding represents a backend block version, and the methods to
+// read/write them.
+type VersionedEncoding interface {
+	Version() string
+
+	// OpenBlock for reading
+	OpenBlock(meta *backend.BlockMeta, r backend.Reader) (common.BackendBlock, error)
+
+	// NewCompactor creates a Compactor that can be used to combine blocks of this
+	// encoding. It is expected to use internal details for efficiency.
+	NewCompactor(common.CompactionOptions) common.Compactor
+
+	// Feature detection methods:
+	CompactionSupported() bool // Whether these blocks should be compacted, if false the compactor will ignore these.
+	WritesSupported() bool     // Whether this encoding can create new blocks, or is in deprecated read-only mode.
+
+	// CreateBlock with the given attributes and trace contents.
+	// BlockMeta is used as a container for many options. Required fields:
+	// * BlockID
+	// * TenantID
+	// * Encoding
+	// * StartTime
+	// * EndTime
+	// * TotalObjects
+	CreateBlock(ctx context.Context, cfg *common.BlockConfig, meta *backend.BlockMeta, i common.Iterator, r backend.Reader, to backend.Writer) (*backend.BlockMeta, error)
+
+	// CopyBlock from one backend to another.
+	CopyBlock(ctx context.Context, meta *backend.BlockMeta, from backend.Reader, to backend.Writer) error
+
+	// MigrateBlock from one backend and tenant to another.
+	MigrateBlock(ctx context.Context, fromMeta, toMeta *backend.BlockMeta, from backend.Reader, to backend.Writer) error
+
+	// OpenWALBlock opens an existing appendable block for the WAL
+	OpenWALBlock(filename, path string, ingestionSlack, additionalStartSlack time.Duration) (common.WALBlock, error, error)
+
+	// CreateWALBlock creates a new appendable block for the WAL
+	//
+	// BlockMeta is used as a container for many options. Required fields:
+	// * BlockID
+	// * TenantID
+	// * Encoding
+	// * DedicatedColumns (vParquet3)
+	// * ReplicationFactor (Optional)
+	CreateWALBlock(meta *backend.BlockMeta, filepath, dataEncoding string, ingestionSlack time.Duration) (common.WALBlock, error)
+
+	// OwnsWALBlock indicates if this encoding owns the WAL block
+	OwnsWALBlock(entry fs.DirEntry) bool
+}
+
+// FromVersion returns a versioned encoding for the provided string
+func FromVersion(v string) (VersionedEncoding, error) {
+	switch v {
+	case vparquet3.VersionString:
+		return vparquet3.Encoding{}, nil
+	case vparquet4.VersionString:
+		return vparquet4.Encoding{}, nil
+	case vparquet5.VersionString:
+		return vparquet5.Encoding{}, nil
+	default:
+		if strings.Contains(v, "preview") {
+			return unsupported.Encoding{}, nil
+		}
+		return nil, fmt.Errorf("%s is not a valid block version", v)
+	}
+}
+
+// FromVersionForWrites returns a versioned encoding for the provided string, but only for
+// encodings that are supported for creating new blocks.  Deprecated or readonly encodings will return an error.
+func FromVersionForWrites(v string) (VersionedEncoding, error) {
+	enc, err := FromVersion(v)
+	if err != nil {
+		return nil, err
+	}
+	if !enc.WritesSupported() {
+		return nil, fmt.Errorf("%s is not a valid block version for creating blocks", v)
+	}
+	return enc, nil
+}
+
+// DefaultEncoding for newly written blocks.
+//
+// The default is vParquet5. Existing vParquet3 and vParquet4 blocks are still
+// read without migration; only newly written blocks use this default. Pin
+// storage.trace.block.version to vParquet4 to opt out. See CHANGELOG.md for
+// migration guidance.
+func DefaultEncoding() VersionedEncoding {
+	return vparquet5.Encoding{}
+}
+
+// LatestEncoding returns the most recent encoding.
+func LatestEncoding() VersionedEncoding {
+	return vparquet5.Encoding{}
+}
+
+// AllEncodings returns all encodings
+func AllEncodings() []VersionedEncoding {
+	return []VersionedEncoding{
+		vparquet3.Encoding{},
+		vparquet4.Encoding{},
+		vparquet5.Encoding{},
+	}
+}
+
+// AllEncodingsForWrites is the list of encodings that can create new blocks.
+func AllEncodingsForWrites() []VersionedEncoding {
+	var writeable []VersionedEncoding
+	for _, enc := range AllEncodings() {
+		if enc.WritesSupported() {
+			writeable = append(writeable, enc)
+		}
+	}
+	return writeable
+}
+
+// OpenBlock for reading in the backend. It automatically chooses the encoding for the given block.
+func OpenBlock(meta *backend.BlockMeta, r backend.Reader) (common.BackendBlock, error) {
+	v, err := FromVersion(meta.Version)
+	if err != nil {
+		return nil, err
+	}
+	return v.OpenBlock(meta, r)
+}
+
+// CoalesceVersion resolves a block encoding version from a chain of version
+// strings ordered lowest to highest priority. Empty strings are skipped.
+// Falls back to DefaultEncoding if all are empty.
+// Returns the validated VersionedEncoding suitable for writes.
+func CoalesceVersion(versions ...string) (VersionedEncoding, error) {
+	ver := DefaultEncoding().Version()
+	for _, v := range versions {
+		if v != "" {
+			ver = v
+		}
+	}
+	return FromVersionForWrites(ver)
+}
+
+// CopyBlock from one backend to another. It automatically chooses the encoding for the given block.
+func CopyBlock(ctx context.Context, meta *backend.BlockMeta, from backend.Reader, to backend.Writer) error {
+	v, err := FromVersion(meta.Version)
+	if err != nil {
+		return err
+	}
+	return v.CopyBlock(ctx, meta, from, to)
+}

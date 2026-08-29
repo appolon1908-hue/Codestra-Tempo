@@ -1,0 +1,2291 @@
+package distributor
+
+import (
+	"bytes"
+	"context"
+	"encoding/binary"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"math/rand"
+	"os"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	kitlog "github.com/go-kit/log"
+	"github.com/gogo/status"
+	"github.com/golang/protobuf/proto" // nolint: all  //ProtoReflect
+	dslog "github.com/grafana/dskit/log"
+	"github.com/grafana/dskit/ring"
+	"github.com/grafana/dskit/services"
+	"github.com/grafana/dskit/user"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"github.com/twmb/franz-go/pkg/kfake"
+	"github.com/twmb/franz-go/pkg/kgo"
+	"go.opentelemetry.io/collector/pdata/ptrace"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
+
+	"github.com/grafana/tempo/modules/generator"
+	"github.com/grafana/tempo/pkg/ingest"
+
+	"github.com/grafana/tempo/modules/distributor/receiver"
+	"github.com/grafana/tempo/modules/overrides"
+	"github.com/grafana/tempo/pkg/tempopb"
+	v1_common "github.com/grafana/tempo/pkg/tempopb/common/v1"
+	v1_resource "github.com/grafana/tempo/pkg/tempopb/resource/v1"
+	v1 "github.com/grafana/tempo/pkg/tempopb/trace/v1"
+	"github.com/grafana/tempo/pkg/util"
+	"github.com/grafana/tempo/pkg/util/listtomap"
+	"github.com/grafana/tempo/pkg/util/test"
+)
+
+var ctx = user.InjectOrgID(context.Background(), "test")
+
+func batchesToTraces(t *testing.T, batches []*v1.ResourceSpans) ptrace.Traces {
+	t.Helper()
+
+	trace := tempopb.Trace{ResourceSpans: batches}
+
+	m, err := trace.Marshal()
+	require.NoError(t, err)
+
+	traces, err := (&ptrace.ProtoUnmarshaler{}).UnmarshalTraces(m)
+	require.NoError(t, err)
+
+	return traces
+}
+
+func TestRequestsByTraceID(t *testing.T) {
+	traceIDA := []byte{0x0A, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F}
+	traceIDB := []byte{0x0B, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F}
+	spanID := []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08}
+	// These 2 trace IDs are known to collide under fnv32
+	collision1, _ := util.HexStringToTraceID("fd5980503add11f09f80f77608c1b2da")
+	collision2, _ := util.HexStringToTraceID("091ea7803ade11f0998a055186ee1243")
+
+	tests := []struct {
+		name           string
+		emptyTenant    bool
+		batches        []*v1.ResourceSpans
+		expectedKeys   []uint32
+		expectedTraces []*tempopb.Trace
+		expectedIDs    [][]byte
+		expectedErr    error
+		expectedStarts []uint32
+		expectedEnds   []uint32
+	}{
+		{
+			name: "empty",
+			batches: []*v1.ResourceSpans{
+				{},
+				{},
+			},
+			expectedKeys:   []uint32{},
+			expectedTraces: []*tempopb.Trace{},
+			expectedIDs:    [][]byte{},
+			expectedStarts: []uint32{},
+			expectedEnds:   []uint32{},
+		},
+		{
+			name: "bad trace id",
+			batches: []*v1.ResourceSpans{
+				{
+					ScopeSpans: []*v1.ScopeSpans{
+						{
+							Spans: []*v1.Span{
+								{
+									TraceId: []byte{0x01},
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedErr: status.Errorf(codes.InvalidArgument, "trace ids must be 128 bit, received 8 bits"),
+		},
+		{
+			name: "empty trace id",
+			batches: []*v1.ResourceSpans{
+				{
+					ScopeSpans: []*v1.ScopeSpans{
+						{
+							Spans: []*v1.Span{
+								{
+									TraceId: []byte{},
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedErr: status.Errorf(codes.InvalidArgument, "trace ids must be 128 bit, received 0 bits"),
+		},
+		{
+			name: "one span",
+			batches: []*v1.ResourceSpans{
+				{
+					ScopeSpans: []*v1.ScopeSpans{
+						{
+							Spans: []*v1.Span{
+								{
+									TraceId:           traceIDA,
+									SpanId:            spanID,
+									StartTimeUnixNano: uint64(10 * time.Second),
+									EndTimeUnixNano:   uint64(20 * time.Second),
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedKeys: []uint32{util.TokenFor(util.FakeTenantID, traceIDA)},
+			expectedTraces: []*tempopb.Trace{
+				{
+					ResourceSpans: []*v1.ResourceSpans{
+						{
+							ScopeSpans: []*v1.ScopeSpans{
+								{
+									Spans: []*v1.Span{
+										{
+											TraceId:           traceIDA,
+											SpanId:            []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08},
+											StartTimeUnixNano: uint64(10 * time.Second),
+											EndTimeUnixNano:   uint64(20 * time.Second),
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedIDs: [][]byte{
+				traceIDA,
+			},
+			expectedStarts: []uint32{10},
+			expectedEnds:   []uint32{20},
+		},
+		{
+			name: "two traces, one batch",
+			batches: []*v1.ResourceSpans{
+				{
+					ScopeSpans: []*v1.ScopeSpans{
+						{
+							Spans: []*v1.Span{
+								{
+									TraceId:           traceIDA,
+									SpanId:            spanID,
+									StartTimeUnixNano: uint64(30 * time.Second),
+									EndTimeUnixNano:   uint64(40 * time.Second),
+								},
+								{
+									TraceId:           traceIDB,
+									SpanId:            spanID,
+									StartTimeUnixNano: uint64(50 * time.Second),
+									EndTimeUnixNano:   uint64(60 * time.Second),
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedKeys: []uint32{util.TokenFor(util.FakeTenantID, traceIDA), util.TokenFor(util.FakeTenantID, traceIDB)},
+			expectedTraces: []*tempopb.Trace{
+				{
+					ResourceSpans: []*v1.ResourceSpans{
+						{
+							ScopeSpans: []*v1.ScopeSpans{
+								{
+									Spans: []*v1.Span{
+										{
+											TraceId:           traceIDA,
+											SpanId:            spanID,
+											StartTimeUnixNano: uint64(30 * time.Second),
+											EndTimeUnixNano:   uint64(40 * time.Second),
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+				{
+					ResourceSpans: []*v1.ResourceSpans{
+						{
+							ScopeSpans: []*v1.ScopeSpans{
+								{
+									Spans: []*v1.Span{
+										{
+											TraceId:           traceIDB,
+											SpanId:            spanID,
+											StartTimeUnixNano: uint64(50 * time.Second),
+											EndTimeUnixNano:   uint64(60 * time.Second),
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedIDs: [][]byte{
+				traceIDA,
+				traceIDB,
+			},
+			expectedStarts: []uint32{30, 50},
+			expectedEnds:   []uint32{40, 60},
+		},
+		{
+			name: "two traces, distinct batches",
+			batches: []*v1.ResourceSpans{
+				{
+					Resource: &v1_resource.Resource{
+						DroppedAttributesCount: 3,
+					},
+					ScopeSpans: []*v1.ScopeSpans{
+						{
+							Spans: []*v1.Span{
+								{
+									TraceId:           traceIDA,
+									SpanId:            spanID,
+									StartTimeUnixNano: uint64(30 * time.Second),
+									EndTimeUnixNano:   uint64(40 * time.Second),
+								},
+							},
+						},
+					},
+				},
+				{
+					Resource: &v1_resource.Resource{
+						DroppedAttributesCount: 4,
+					},
+					ScopeSpans: []*v1.ScopeSpans{
+						{
+							Spans: []*v1.Span{
+								{
+									TraceId:           traceIDB,
+									SpanId:            spanID,
+									StartTimeUnixNano: uint64(50 * time.Second),
+									EndTimeUnixNano:   uint64(60 * time.Second),
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedKeys: []uint32{util.TokenFor(util.FakeTenantID, traceIDA), util.TokenFor(util.FakeTenantID, traceIDB)},
+			expectedTraces: []*tempopb.Trace{
+				{
+					ResourceSpans: []*v1.ResourceSpans{
+						{
+							Resource: &v1_resource.Resource{
+								DroppedAttributesCount: 3,
+							},
+							ScopeSpans: []*v1.ScopeSpans{
+								{
+									Spans: []*v1.Span{
+										{
+											TraceId:           traceIDA,
+											SpanId:            spanID,
+											StartTimeUnixNano: uint64(30 * time.Second),
+											EndTimeUnixNano:   uint64(40 * time.Second),
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+				{
+					ResourceSpans: []*v1.ResourceSpans{
+						{
+							Resource: &v1_resource.Resource{
+								DroppedAttributesCount: 4,
+							},
+							ScopeSpans: []*v1.ScopeSpans{
+								{
+									Spans: []*v1.Span{
+										{
+											TraceId:           traceIDB,
+											SpanId:            spanID,
+											StartTimeUnixNano: uint64(50 * time.Second),
+											EndTimeUnixNano:   uint64(60 * time.Second),
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedIDs: [][]byte{
+				traceIDA,
+				traceIDB,
+			},
+			expectedStarts: []uint32{30, 50},
+			expectedEnds:   []uint32{40, 60},
+		},
+		{
+			name: "resource copied",
+			batches: []*v1.ResourceSpans{
+				{
+					Resource: &v1_resource.Resource{
+						DroppedAttributesCount: 1,
+					},
+					ScopeSpans: []*v1.ScopeSpans{
+						{
+							Spans: []*v1.Span{
+								{
+									TraceId:           traceIDA,
+									SpanId:            spanID,
+									StartTimeUnixNano: uint64(30 * time.Second),
+									EndTimeUnixNano:   uint64(40 * time.Second),
+								},
+								{
+									TraceId:           traceIDB,
+									SpanId:            spanID,
+									StartTimeUnixNano: uint64(50 * time.Second),
+									EndTimeUnixNano:   uint64(60 * time.Second),
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedKeys: []uint32{util.TokenFor(util.FakeTenantID, traceIDA), util.TokenFor(util.FakeTenantID, traceIDB)},
+			expectedTraces: []*tempopb.Trace{
+				{
+					ResourceSpans: []*v1.ResourceSpans{
+						{
+							Resource: &v1_resource.Resource{
+								DroppedAttributesCount: 1,
+							},
+							ScopeSpans: []*v1.ScopeSpans{
+								{
+									Spans: []*v1.Span{
+										{
+											TraceId:           traceIDA,
+											SpanId:            spanID,
+											StartTimeUnixNano: uint64(30 * time.Second),
+											EndTimeUnixNano:   uint64(40 * time.Second),
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+				{
+					ResourceSpans: []*v1.ResourceSpans{
+						{
+							Resource: &v1_resource.Resource{
+								DroppedAttributesCount: 1,
+							},
+							ScopeSpans: []*v1.ScopeSpans{
+								{
+									Spans: []*v1.Span{
+										{
+											TraceId:           traceIDB,
+											SpanId:            spanID,
+											StartTimeUnixNano: uint64(50 * time.Second),
+											EndTimeUnixNano:   uint64(60 * time.Second),
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedIDs: [][]byte{
+				traceIDA,
+				traceIDB,
+			},
+			expectedStarts: []uint32{30, 50},
+			expectedEnds:   []uint32{40, 60},
+		},
+		{
+			name: "ils copied",
+			batches: []*v1.ResourceSpans{
+				{
+					ScopeSpans: []*v1.ScopeSpans{
+						{
+							Scope: &v1_common.InstrumentationScope{
+								Name: "test",
+							},
+							Spans: []*v1.Span{
+								{
+									TraceId:           traceIDA,
+									SpanId:            spanID,
+									StartTimeUnixNano: uint64(30 * time.Second),
+									EndTimeUnixNano:   uint64(40 * time.Second),
+								},
+								{
+									TraceId:           traceIDB,
+									SpanId:            spanID,
+									StartTimeUnixNano: uint64(50 * time.Second),
+									EndTimeUnixNano:   uint64(60 * time.Second),
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedKeys: []uint32{util.TokenFor(util.FakeTenantID, traceIDA), util.TokenFor(util.FakeTenantID, traceIDB)},
+			expectedTraces: []*tempopb.Trace{
+				{
+					ResourceSpans: []*v1.ResourceSpans{
+						{
+							ScopeSpans: []*v1.ScopeSpans{
+								{
+									Scope: &v1_common.InstrumentationScope{
+										Name: "test",
+									},
+									Spans: []*v1.Span{
+										{
+											TraceId:           traceIDA,
+											SpanId:            spanID,
+											StartTimeUnixNano: uint64(30 * time.Second),
+											EndTimeUnixNano:   uint64(40 * time.Second),
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+				{
+					ResourceSpans: []*v1.ResourceSpans{
+						{
+							ScopeSpans: []*v1.ScopeSpans{
+								{
+									Scope: &v1_common.InstrumentationScope{
+										Name: "test",
+									},
+									Spans: []*v1.Span{
+										{
+											TraceId:           traceIDB,
+											SpanId:            spanID,
+											StartTimeUnixNano: uint64(50 * time.Second),
+											EndTimeUnixNano:   uint64(60 * time.Second),
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedIDs: [][]byte{
+				traceIDA,
+				traceIDB,
+			},
+			expectedStarts: []uint32{30, 50},
+			expectedEnds:   []uint32{40, 60},
+		},
+		{
+			name: "one trace",
+			batches: []*v1.ResourceSpans{
+				{
+					Resource: &v1_resource.Resource{
+						DroppedAttributesCount: 3,
+					},
+					ScopeSpans: []*v1.ScopeSpans{
+						{
+							Scope: &v1_common.InstrumentationScope{
+								Name: "test",
+							},
+							Spans: []*v1.Span{
+								{
+									TraceId:           traceIDB,
+									Name:              "spanA",
+									SpanId:            spanID,
+									StartTimeUnixNano: uint64(30 * time.Second),
+									EndTimeUnixNano:   uint64(40 * time.Second),
+								},
+								{
+									TraceId:           traceIDB,
+									Name:              "spanB",
+									SpanId:            spanID,
+									StartTimeUnixNano: uint64(50 * time.Second),
+									EndTimeUnixNano:   uint64(60 * time.Second),
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedKeys: []uint32{util.TokenFor(util.FakeTenantID, traceIDB)},
+			expectedTraces: []*tempopb.Trace{
+				{
+					ResourceSpans: []*v1.ResourceSpans{
+						{
+							Resource: &v1_resource.Resource{
+								DroppedAttributesCount: 3,
+							},
+							ScopeSpans: []*v1.ScopeSpans{
+								{
+									Scope: &v1_common.InstrumentationScope{
+										Name: "test",
+									},
+									Spans: []*v1.Span{
+										{
+											TraceId:           traceIDB,
+											Name:              "spanA",
+											SpanId:            spanID,
+											StartTimeUnixNano: uint64(30 * time.Second),
+											EndTimeUnixNano:   uint64(40 * time.Second),
+										},
+										{
+											TraceId:           traceIDB,
+											Name:              "spanB",
+											SpanId:            spanID,
+											StartTimeUnixNano: uint64(50 * time.Second),
+											EndTimeUnixNano:   uint64(60 * time.Second),
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedIDs: [][]byte{
+				traceIDB,
+			},
+			expectedStarts: []uint32{30},
+			expectedEnds:   []uint32{60},
+		},
+		{
+			name: "two traces - two batches - don't combine across batches",
+			batches: []*v1.ResourceSpans{
+				{
+					Resource: &v1_resource.Resource{
+						DroppedAttributesCount: 3,
+					},
+					ScopeSpans: []*v1.ScopeSpans{
+						{
+							Scope: &v1_common.InstrumentationScope{
+								Name: "test",
+							},
+							Spans: []*v1.Span{
+								{
+									TraceId:           traceIDB,
+									Name:              "spanA",
+									SpanId:            spanID,
+									StartTimeUnixNano: uint64(30 * time.Second),
+									EndTimeUnixNano:   uint64(40 * time.Second),
+								},
+								{
+									TraceId:           traceIDB,
+									SpanId:            spanID,
+									Name:              "spanC",
+									StartTimeUnixNano: uint64(20 * time.Second),
+									EndTimeUnixNano:   uint64(50 * time.Second),
+								},
+								{
+									TraceId:           traceIDA,
+									Name:              "spanE",
+									SpanId:            spanID,
+									StartTimeUnixNano: uint64(70 * time.Second),
+									EndTimeUnixNano:   uint64(80 * time.Second),
+								},
+							},
+						},
+					},
+				},
+				{
+					Resource: &v1_resource.Resource{
+						DroppedAttributesCount: 4,
+					},
+					ScopeSpans: []*v1.ScopeSpans{
+						{
+							Scope: &v1_common.InstrumentationScope{
+								Name: "test2",
+							},
+							Spans: []*v1.Span{
+								{
+									TraceId:           traceIDB,
+									Name:              "spanB",
+									SpanId:            spanID,
+									StartTimeUnixNano: uint64(10 * time.Second),
+									EndTimeUnixNano:   uint64(30 * time.Second),
+								},
+								{
+									TraceId:           traceIDA,
+									SpanId:            spanID,
+									Name:              "spanD",
+									StartTimeUnixNano: uint64(60 * time.Second),
+									EndTimeUnixNano:   uint64(80 * time.Second),
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedKeys: []uint32{
+				util.TokenFor(util.FakeTenantID, traceIDB),
+				util.TokenFor(util.FakeTenantID, traceIDA),
+			},
+			expectedTraces: []*tempopb.Trace{
+				{
+					ResourceSpans: []*v1.ResourceSpans{
+						{
+							Resource: &v1_resource.Resource{
+								DroppedAttributesCount: 3,
+							},
+							ScopeSpans: []*v1.ScopeSpans{
+								{
+									Scope: &v1_common.InstrumentationScope{
+										Name: "test",
+									},
+									Spans: []*v1.Span{
+										{
+											TraceId:           traceIDB,
+											SpanId:            spanID,
+											Name:              "spanA",
+											StartTimeUnixNano: uint64(30 * time.Second),
+											EndTimeUnixNano:   uint64(40 * time.Second),
+										},
+										{
+											TraceId:           traceIDB,
+											SpanId:            spanID,
+											Name:              "spanC",
+											StartTimeUnixNano: uint64(20 * time.Second),
+											EndTimeUnixNano:   uint64(50 * time.Second),
+										},
+									},
+								},
+							},
+						},
+						{
+							Resource: &v1_resource.Resource{
+								DroppedAttributesCount: 4,
+							},
+							ScopeSpans: []*v1.ScopeSpans{
+								{
+									Scope: &v1_common.InstrumentationScope{
+										Name: "test2",
+									},
+									Spans: []*v1.Span{
+										{
+											TraceId:           traceIDB,
+											SpanId:            spanID,
+											Name:              "spanB",
+											StartTimeUnixNano: uint64(10 * time.Second),
+											EndTimeUnixNano:   uint64(30 * time.Second),
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+				{
+					ResourceSpans: []*v1.ResourceSpans{
+						{
+							Resource: &v1_resource.Resource{
+								DroppedAttributesCount: 3,
+							},
+							ScopeSpans: []*v1.ScopeSpans{
+								{
+									Scope: &v1_common.InstrumentationScope{
+										Name: "test",
+									},
+									Spans: []*v1.Span{
+										{
+											TraceId:           traceIDA,
+											SpanId:            spanID,
+											Name:              "spanE",
+											StartTimeUnixNano: uint64(70 * time.Second),
+											EndTimeUnixNano:   uint64(80 * time.Second),
+										},
+									},
+								},
+							},
+						},
+						{
+							Resource: &v1_resource.Resource{
+								DroppedAttributesCount: 4,
+							},
+							ScopeSpans: []*v1.ScopeSpans{
+								{
+									Scope: &v1_common.InstrumentationScope{
+										Name: "test2",
+									},
+									Spans: []*v1.Span{
+										{
+											TraceId:           traceIDA,
+											SpanId:            spanID,
+											Name:              "spanD",
+											StartTimeUnixNano: uint64(60 * time.Second),
+											EndTimeUnixNano:   uint64(80 * time.Second),
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedIDs: [][]byte{
+				traceIDB,
+				traceIDA,
+			},
+			expectedStarts: []uint32{10, 60},
+			expectedEnds:   []uint32{50, 80},
+		},
+		{
+			// These 2 trace IDs are known to collide under fnv32
+			name:        "known collisions",
+			emptyTenant: true,
+			batches: []*v1.ResourceSpans{
+				{
+					Resource: &v1_resource.Resource{
+						DroppedAttributesCount: 3,
+					},
+					ScopeSpans: []*v1.ScopeSpans{
+						{
+							Scope: &v1_common.InstrumentationScope{
+								Name: "test",
+							},
+							Spans: []*v1.Span{
+								{
+									TraceId:           collision2,
+									Name:              "spanA",
+									SpanId:            spanID,
+									StartTimeUnixNano: uint64(30 * time.Second),
+									EndTimeUnixNano:   uint64(40 * time.Second),
+								},
+								{
+									TraceId:           collision2,
+									Name:              "spanC",
+									SpanId:            spanID,
+									StartTimeUnixNano: uint64(20 * time.Second),
+									EndTimeUnixNano:   uint64(50 * time.Second),
+								},
+								{
+									TraceId:           collision1,
+									SpanId:            spanID,
+									Name:              "spanE",
+									StartTimeUnixNano: uint64(70 * time.Second),
+									EndTimeUnixNano:   uint64(80 * time.Second),
+								},
+							},
+						},
+					},
+				},
+				{
+					Resource: &v1_resource.Resource{
+						DroppedAttributesCount: 4,
+					},
+					ScopeSpans: []*v1.ScopeSpans{
+						{
+							Scope: &v1_common.InstrumentationScope{
+								Name: "test2",
+							},
+							Spans: []*v1.Span{
+								{
+									TraceId:           collision2,
+									Name:              "spanB",
+									SpanId:            spanID,
+									StartTimeUnixNano: uint64(10 * time.Second),
+									EndTimeUnixNano:   uint64(30 * time.Second),
+								},
+								{
+									TraceId:           collision1,
+									Name:              "spanD",
+									SpanId:            spanID,
+									StartTimeUnixNano: uint64(60 * time.Second),
+									EndTimeUnixNano:   uint64(80 * time.Second),
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedKeys: []uint32{
+				util.TokenFor("", collision1),
+				util.TokenFor("", collision2),
+			},
+			expectedTraces: []*tempopb.Trace{
+				{
+					ResourceSpans: []*v1.ResourceSpans{
+						{
+							Resource: &v1_resource.Resource{
+								DroppedAttributesCount: 3,
+							},
+							ScopeSpans: []*v1.ScopeSpans{
+								{
+									Scope: &v1_common.InstrumentationScope{
+										Name: "test",
+									},
+									Spans: []*v1.Span{
+										{
+											TraceId:           collision1,
+											SpanId:            spanID,
+											Name:              "spanE",
+											StartTimeUnixNano: uint64(70 * time.Second),
+											EndTimeUnixNano:   uint64(80 * time.Second),
+										},
+									},
+								},
+							},
+						},
+						{
+							Resource: &v1_resource.Resource{
+								DroppedAttributesCount: 4,
+							},
+							ScopeSpans: []*v1.ScopeSpans{
+								{
+									Scope: &v1_common.InstrumentationScope{
+										Name: "test2",
+									},
+									Spans: []*v1.Span{
+										{
+											TraceId:           collision1,
+											SpanId:            spanID,
+											Name:              "spanD",
+											StartTimeUnixNano: uint64(60 * time.Second),
+											EndTimeUnixNano:   uint64(80 * time.Second),
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+				{
+					ResourceSpans: []*v1.ResourceSpans{
+						{
+							Resource: &v1_resource.Resource{
+								DroppedAttributesCount: 3,
+							},
+							ScopeSpans: []*v1.ScopeSpans{
+								{
+									Scope: &v1_common.InstrumentationScope{
+										Name: "test",
+									},
+									Spans: []*v1.Span{
+										{
+											TraceId:           collision2,
+											SpanId:            spanID,
+											Name:              "spanA",
+											StartTimeUnixNano: uint64(30 * time.Second),
+											EndTimeUnixNano:   uint64(40 * time.Second),
+										},
+										{
+											TraceId:           collision2,
+											SpanId:            spanID,
+											Name:              "spanC",
+											StartTimeUnixNano: uint64(20 * time.Second),
+											EndTimeUnixNano:   uint64(50 * time.Second),
+										},
+									},
+								},
+							},
+						},
+						{
+							Resource: &v1_resource.Resource{
+								DroppedAttributesCount: 4,
+							},
+							ScopeSpans: []*v1.ScopeSpans{
+								{
+									Scope: &v1_common.InstrumentationScope{
+										Name: "test2",
+									},
+									Spans: []*v1.Span{
+										{
+											TraceId:           collision2,
+											SpanId:            spanID,
+											Name:              "spanB",
+											StartTimeUnixNano: uint64(10 * time.Second),
+											EndTimeUnixNano:   uint64(30 * time.Second),
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedIDs: [][]byte{
+				collision1,
+				collision2,
+			},
+			expectedStarts: []uint32{60, 10},
+			expectedEnds:   []uint32{80, 50},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tenant := util.FakeTenantID
+			if tt.emptyTenant {
+				tenant = ""
+			}
+			ringTokens, rebatchedTraces, _, _, err := requestsByTraceID(tt.batches, tenant, 1, 1000)
+			require.Equal(t, len(ringTokens), len(rebatchedTraces))
+
+			for i, expectedID := range tt.expectedIDs {
+				foundIndex := -1
+				for j, tr := range rebatchedTraces {
+					if bytes.Equal(expectedID, tr.id) {
+						foundIndex = j
+						break
+					}
+				}
+				require.NotEqual(t, -1, foundIndex, "expected key %d not found", foundIndex)
+
+				// now confirm that the request at this position is the expected one
+				require.Equal(t, tt.expectedIDs[i], rebatchedTraces[foundIndex].id)
+				require.Equal(t, tt.expectedTraces[i], rebatchedTraces[foundIndex].trace)
+				require.Equal(t, tt.expectedStarts[i], rebatchedTraces[foundIndex].start)
+				require.Equal(t, tt.expectedEnds[i], rebatchedTraces[foundIndex].end)
+			}
+
+			require.Equal(t, tt.expectedErr, err)
+		})
+	}
+}
+
+func TestRequestsByTraceIDDoesNotPreallocateEachTraceFromTotalSpanCount(t *testing.T) {
+	const spanCount = 1000
+	spans := make([]*v1.Span, 0, spanCount)
+	for i := 0; i < spanCount; i++ {
+		traceID := make([]byte, 16)
+		spanID := make([]byte, 8)
+		binary.BigEndian.PutUint64(traceID[8:], uint64(i+1))
+		binary.BigEndian.PutUint64(spanID, uint64(i+1))
+		spans = append(spans, &v1.Span{
+			TraceId: traceID,
+			SpanId:  spanID,
+		})
+	}
+
+	_, rebatchedTraces, _, _, err := requestsByTraceID([]*v1.ResourceSpans{{
+		ScopeSpans: []*v1.ScopeSpans{{Spans: spans}},
+	}}, "test", spanCount, 1000)
+	require.NoError(t, err)
+	require.Len(t, rebatchedTraces, spanCount)
+
+	// The invariant: per-trace slice capacity must be bounded and must not scale
+	// with the request's total span count, otherwise a high-cardinality request
+	// preallocates too much memory. Without the cap each of the spanCount unique
+	// traces would preallocate spanCount/tracesPerBatch slots.
+	for _, tr := range rebatchedTraces {
+		require.Len(t, tr.trace.ResourceSpans, 1)
+		require.LessOrEqual(t, cap(tr.trace.ResourceSpans), maxPreallocSpansPerTrace)
+		require.Len(t, tr.trace.ResourceSpans[0].ScopeSpans, 1)
+		require.Len(t, tr.trace.ResourceSpans[0].ScopeSpans[0].Spans, 1)
+		require.LessOrEqual(t, cap(tr.trace.ResourceSpans[0].ScopeSpans[0].Spans), maxPreallocSpansPerTrace)
+	}
+}
+
+func TestProcessAttributes(t *testing.T) {
+	spanCount := 10
+	batchCount := 3
+	trace := test.MakeTraceWithSpanCount(batchCount, spanCount, []byte{0x0A, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F})
+
+	maxAttrByte := 1000
+	longString := strings.Repeat("t", 1100)
+
+	// add long attributes to the resource level
+	trace.ResourceSpans[0].Resource.Attributes = append(
+		trace.ResourceSpans[0].Resource.Attributes,
+		test.MakeAttribute("long value", longString),
+	)
+	trace.ResourceSpans[0].Resource.Attributes = append(
+		trace.ResourceSpans[0].Resource.Attributes,
+		test.MakeAttribute(longString, "long key"),
+	)
+
+	// add long attributes to the span level
+	trace.ResourceSpans[0].ScopeSpans[0].Spans[0].Attributes = append(
+		trace.ResourceSpans[0].ScopeSpans[0].Spans[0].Attributes,
+		test.MakeAttribute("long value", longString),
+	)
+	trace.ResourceSpans[0].ScopeSpans[0].Spans[0].Attributes = append(
+		trace.ResourceSpans[0].ScopeSpans[0].Spans[0].Attributes,
+		test.MakeAttribute(longString, "long key"),
+	)
+
+	// add long attributes to the event level
+	trace.ResourceSpans[0].ScopeSpans[0].Spans[0].Events = append(
+		trace.ResourceSpans[0].ScopeSpans[0].Spans[0].Events,
+		&v1.Span_Event{
+			TimeUnixNano: 0,
+			Attributes: []*v1_common.KeyValue{
+				test.MakeAttribute("long value", longString),
+				test.MakeAttribute(longString, "long key"),
+			},
+		},
+	)
+
+	// add long attributes to the link level
+	trace.ResourceSpans[0].ScopeSpans[0].Spans[0].Links = append(
+		trace.ResourceSpans[0].ScopeSpans[0].Spans[0].Links,
+		&v1.Span_Link{
+			TraceId: []byte{0x0A, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F},
+			SpanId:  []byte{0x0A, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F},
+			Attributes: []*v1_common.KeyValue{
+				test.MakeAttribute("long value", longString),
+				test.MakeAttribute(longString, "long key"),
+			},
+		},
+	)
+
+	// add long attributes to scope level
+	trace.ResourceSpans[0].ScopeSpans[0].Scope = &v1_common.InstrumentationScope{
+		Name:    "scope scope",
+		Version: "1.0",
+		Attributes: []*v1_common.KeyValue{
+			test.MakeAttribute("long value", longString),
+			test.MakeAttribute(longString, "long key"),
+		},
+	}
+
+	_, rebatchedTrace, truncatedCount, _, _ := requestsByTraceID(trace.ResourceSpans, "test", spanCount*batchCount, maxAttrByte)
+	// 2 at resource level, 2 at span level, 2 at event level, 2 at link level, 2 at scope level
+	assert.Equal(t, 10, truncatedCount.Total())
+	assert.Equal(t, 2, truncatedCount.Resource)
+	assert.Equal(t, 2, truncatedCount.Scope)
+	assert.Equal(t, 2, truncatedCount.Span)
+	assert.Equal(t, 2, truncatedCount.Event)
+	assert.Equal(t, 2, truncatedCount.Link)
+	for _, rT := range rebatchedTrace {
+		for _, resource := range rT.trace.ResourceSpans {
+			// find large resource attributes
+			for _, attr := range resource.Resource.Attributes {
+				if attr.Key == "long value" {
+					assert.Equal(t, longString[:maxAttrByte], attr.Value.GetStringValue())
+				}
+				if attr.Value.GetStringValue() == "long key" {
+					assert.Equal(t, longString[:maxAttrByte], attr.Key)
+				}
+			}
+			// find large span attributes
+			for _, scope := range resource.ScopeSpans {
+				for _, attr := range scope.Scope.Attributes {
+					if attr.Key == "long value" {
+						assert.Equal(t, longString[:maxAttrByte], attr.Value.GetStringValue())
+					}
+					if attr.Value.GetStringValue() == "long key" {
+						assert.Equal(t, longString[:maxAttrByte], attr.Key)
+					}
+				}
+
+				for _, span := range scope.Spans {
+					for _, attr := range span.Attributes {
+						if attr.Key == "long value" {
+							assert.Equal(t, longString[:maxAttrByte], attr.Value.GetStringValue())
+						}
+						if attr.Value.GetStringValue() == "long key" {
+							assert.Equal(t, longString[:maxAttrByte], attr.Key)
+						}
+					}
+					// events
+					for _, event := range span.Events {
+						for _, attr := range event.Attributes {
+							if attr.Key == "long value" {
+								assert.Equal(t, longString[:maxAttrByte], attr.Value.GetStringValue())
+							}
+							if attr.Value.GetStringValue() == "long key" {
+								assert.Equal(t, longString[:maxAttrByte], attr.Key)
+							}
+						}
+					}
+
+					// links
+					for _, link := range span.Links {
+						for _, attr := range link.Attributes {
+							if attr.Key == "long value" {
+								assert.Equal(t, longString[:maxAttrByte], attr.Value.GetStringValue())
+							}
+							if attr.Value.GetStringValue() == "long key" {
+								assert.Equal(t, longString[:maxAttrByte], attr.Key)
+							}
+						}
+					}
+				}
+			}
+
+		}
+	}
+}
+
+func TestRequestsByTraceID_TruncationDetail(t *testing.T) {
+	longString := strings.Repeat("t", 5000)
+	maxAttrByte := 1000
+
+	// No truncation — detail should be nil
+	trace := test.MakeTraceWithSpanCount(1, 1, []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10})
+	_, _, truncatedCount, detail, err := requestsByTraceID(trace.ResourceSpans, "test", 1, maxAttrByte)
+	require.NoError(t, err)
+	assert.Equal(t, 0, truncatedCount.Total())
+	assert.Nil(t, detail)
+
+	// With truncation — detail is always populated
+	trace = test.MakeTraceWithSpanCount(1, 1, []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10})
+	trace.ResourceSpans[0].Resource.Attributes = append(trace.ResourceSpans[0].Resource.Attributes,
+		test.MakeAttribute("oversized", longString))
+	_, _, truncatedCount, detail, err = requestsByTraceID(trace.ResourceSpans, "test", 1, maxAttrByte)
+	require.NoError(t, err)
+	assert.Greater(t, truncatedCount.Total(), 0)
+	require.NotNil(t, detail)
+	assert.Equal(t, "resource", detail.scope)
+	assert.Equal(t, "value", detail.field)
+	assert.Equal(t, "oversized", detail.name)
+	assert.Equal(t, 5000, detail.origSize)
+
+	// maxSpanAttrSize == 0 — no truncation, no detail
+	trace = test.MakeTraceWithSpanCount(1, 1, []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10})
+	trace.ResourceSpans[0].Resource.Attributes = append(trace.ResourceSpans[0].Resource.Attributes,
+		test.MakeAttribute("oversized", longString))
+	_, _, truncatedCount, detail, err = requestsByTraceID(trace.ResourceSpans, "test", 1, 0)
+	require.NoError(t, err)
+	assert.Equal(t, 0, truncatedCount.Total())
+	assert.Nil(t, detail)
+}
+
+func TestProcessAttributesDetail(t *testing.T) {
+	// Without detail — nil detail, truncation still happens
+	attributes := []*v1_common.KeyValue{
+		test.MakeAttribute("key", strings.Repeat("v", 5000)),
+	}
+	count := processAttributes(attributes, 2048, nil, "span")
+	assert.Equal(t, 1, count)
+	assert.Equal(t, 2048, len(attributes[0].Value.GetStringValue()))
+
+	// Value truncation — detail captured deterministically
+	attributes = []*v1_common.KeyValue{
+		test.MakeAttribute("key", strings.Repeat("v", 5000)),
+	}
+	detail := truncatedAttrInfo{}
+	count = processAttributes(attributes, 2048, &detail, "span")
+	assert.Equal(t, 1, count)
+	assert.Equal(t, "key", detail.name)
+	assert.Equal(t, "span", detail.scope)
+	assert.Equal(t, "value", detail.field)
+	assert.Equal(t, 5000, detail.origSize)
+
+	// Key truncation — detail captured deterministically
+	attributes = []*v1_common.KeyValue{
+		test.MakeAttribute(strings.Repeat("k", 5000), "short"),
+	}
+	detail = truncatedAttrInfo{}
+	count = processAttributes(attributes, 2048, &detail, "resource")
+	assert.Equal(t, 1, count)
+	assert.Equal(t, "key", detail.field)
+	assert.Equal(t, "resource", detail.scope)
+	assert.Equal(t, 5000, detail.origSize)
+	assert.Equal(t, strings.Repeat("k", 2048), detail.name) // truncated prefix, not full original
+
+	// Only the first truncation is captured (first of two values)
+	attributes = []*v1_common.KeyValue{
+		test.MakeAttribute("key1", strings.Repeat("v", 5000)),
+		test.MakeAttribute("key2", strings.Repeat("v", 6000)),
+	}
+	detail = truncatedAttrInfo{}
+	count = processAttributes(attributes, 2048, &detail, "span")
+	assert.Equal(t, 2, count)
+	assert.Equal(t, "key1", detail.name)
+	assert.Equal(t, 5000, detail.origSize)
+
+	// Both key AND value oversized — key wins (checked first)
+	attributes = []*v1_common.KeyValue{
+		test.MakeAttribute(strings.Repeat("k", 5000), strings.Repeat("v", 6000)),
+	}
+	detail = truncatedAttrInfo{}
+	count = processAttributes(attributes, 2048, &detail, "span")
+	assert.Equal(t, 2, count)
+	assert.Equal(t, "key", detail.field)
+	assert.Equal(t, 5000, detail.origSize)
+
+	// Already-captured detail (origSize > 0) is not overwritten
+	detail = truncatedAttrInfo{scope: "resource", name: "first", field: "value", origSize: 3000}
+	attributes = []*v1_common.KeyValue{
+		test.MakeAttribute("key2", strings.Repeat("v", 6000)),
+	}
+	count = processAttributes(attributes, 2048, &detail, "span")
+	assert.Equal(t, 1, count)
+	assert.Equal(t, "first", detail.name)
+	assert.Equal(t, 3000, detail.origSize)
+}
+
+func BenchmarkTestsByRequestID(b *testing.B) {
+	spansPer := 5000
+	batches := 100
+	traces := []*tempopb.Trace{
+		test.MakeTraceWithSpanCount(batches, spansPer, []byte{0x0A, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F}),
+		test.MakeTraceWithSpanCount(batches, spansPer, []byte{0x0B, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F}),
+		test.MakeTraceWithSpanCount(batches, spansPer, []byte{0x0C, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F}),
+		test.MakeTraceWithSpanCount(batches, spansPer, []byte{0x0D, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F}),
+	}
+	ils := make([][]*v1.ScopeSpans, batches)
+
+	for i := 0; i < batches; i++ {
+		for _, t := range traces {
+			ils[i] = append(ils[i], t.ResourceSpans[i].ScopeSpans...)
+		}
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		for _, blerg := range ils {
+			_, _, _, _, err := requestsByTraceID([]*v1.ResourceSpans{
+				{
+					ScopeSpans: blerg,
+				},
+			}, "test", spansPer*len(traces), 5)
+			require.NoError(b, err)
+		}
+	}
+}
+
+func TestDistributor(t *testing.T) {
+	for i, tc := range []struct {
+		lines            int
+		expectedResponse *tempopb.PushResponse
+		expectedError    error
+	}{
+		{
+			lines:            10,
+			expectedResponse: nil,
+		},
+		{
+			lines:            100,
+			expectedResponse: nil,
+		},
+	} {
+		t.Run(fmt.Sprintf("[%d](samples=%v)", i, tc.lines), func(t *testing.T) {
+			limits := overrides.Config{}
+			limits.RegisterFlagsAndApplyDefaults(&flag.FlagSet{})
+
+			// todo:  test limits
+			d := prepare(t, limits, nil)
+
+			b := test.MakeBatch(tc.lines, []byte{})
+			traces := batchesToTraces(t, []*v1.ResourceSpans{b})
+			response, err := d.PushTraces(ctx, traces)
+
+			assert.True(t, proto.Equal(tc.expectedResponse, response))
+			assert.Equal(t, tc.expectedError, err)
+		})
+	}
+}
+
+func TestLogReceivedSpans(t *testing.T) {
+	for i, tc := range []struct {
+		LogReceivedSpansEnabled bool
+		filterByStatusError     bool
+		includeAllAttributes    bool
+		batches                 []*v1.ResourceSpans
+		expectedLogsSpan        []testLogSpan
+	}{
+		{
+			LogReceivedSpansEnabled: false,
+			batches: []*v1.ResourceSpans{
+				makeResourceSpans("test", []*v1.ScopeSpans{
+					makeScope(
+						makeSpan("0a0102030405060708090a0b0c0d0e0f", "dad44adc9a83b370", "Test Span", nil),
+					),
+				}),
+			},
+			expectedLogsSpan: []testLogSpan{},
+		},
+		{
+			LogReceivedSpansEnabled: true,
+			filterByStatusError:     false,
+			batches: []*v1.ResourceSpans{
+				makeResourceSpans("test-service", []*v1.ScopeSpans{
+					makeScope(
+						makeSpan("0a0102030405060708090a0b0c0d0e0f", "dad44adc9a83b370", "Test Span1", nil),
+						makeSpan("e3210a2b38097332d1fe43083ea93d29", "6c21c48da4dbd1a7", "Test Span2", nil),
+					),
+					makeScope(
+						makeSpan("bb42ec04df789ff04b10ea5274491685", "1b3a296034f4031e", "Test Span3", nil),
+					),
+				}),
+				makeResourceSpans("test-service2", []*v1.ScopeSpans{
+					makeScope(
+						makeSpan("b1c792dea27d511c145df8402bdd793a", "56afb9fe18b6c2d6", "Test Span", nil),
+					),
+				}),
+			},
+			expectedLogsSpan: []testLogSpan{
+				{
+					Msg:     "received",
+					Level:   "info",
+					TraceID: "0a0102030405060708090a0b0c0d0e0f",
+					SpanID:  "dad44adc9a83b370",
+				},
+				{
+					Msg:     "received",
+					Level:   "info",
+					TraceID: "e3210a2b38097332d1fe43083ea93d29",
+					SpanID:  "6c21c48da4dbd1a7",
+				},
+				{
+					Msg:     "received",
+					Level:   "info",
+					TraceID: "bb42ec04df789ff04b10ea5274491685",
+					SpanID:  "1b3a296034f4031e",
+				},
+				{
+					Msg:     "received",
+					Level:   "info",
+					TraceID: "b1c792dea27d511c145df8402bdd793a",
+					SpanID:  "56afb9fe18b6c2d6",
+				},
+			},
+		},
+		{
+			LogReceivedSpansEnabled: true,
+			filterByStatusError:     true,
+			batches: []*v1.ResourceSpans{
+				makeResourceSpans("test-service", []*v1.ScopeSpans{
+					makeScope(
+						makeSpan("0a0102030405060708090a0b0c0d0e0f", "dad44adc9a83b370", "Test Span1", nil),
+						makeSpan("e3210a2b38097332d1fe43083ea93d29", "6c21c48da4dbd1a7", "Test Span2", &v1.Status{Code: v1.Status_STATUS_CODE_ERROR}),
+					),
+					makeScope(
+						makeSpan("bb42ec04df789ff04b10ea5274491685", "1b3a296034f4031e", "Test Span3", nil),
+					),
+				}),
+				makeResourceSpans("test-service2", []*v1.ScopeSpans{
+					makeScope(
+						makeSpan("b1c792dea27d511c145df8402bdd793a", "56afb9fe18b6c2d6", "Test Span", &v1.Status{Code: v1.Status_STATUS_CODE_ERROR}),
+					),
+				}),
+			},
+			expectedLogsSpan: []testLogSpan{
+				{
+					Msg:     "received",
+					Level:   "info",
+					TraceID: "e3210a2b38097332d1fe43083ea93d29",
+					SpanID:  "6c21c48da4dbd1a7",
+				},
+				{
+					Msg:     "received",
+					Level:   "info",
+					TraceID: "b1c792dea27d511c145df8402bdd793a",
+					SpanID:  "56afb9fe18b6c2d6",
+				},
+			},
+		},
+		{
+			LogReceivedSpansEnabled: true,
+			filterByStatusError:     true,
+			includeAllAttributes:    true,
+			batches: []*v1.ResourceSpans{
+				makeResourceSpans("test-service", []*v1.ScopeSpans{
+					makeScope(
+						makeSpan("0a0102030405060708090a0b0c0d0e0f", "dad44adc9a83b370", "Test Span1", nil,
+							makeAttribute("tag1", "value1")),
+						makeSpan("e3210a2b38097332d1fe43083ea93d29", "6c21c48da4dbd1a7", "Test Span2", &v1.Status{Code: v1.Status_STATUS_CODE_ERROR},
+							makeAttribute("tag1", "value1"),
+							makeAttribute("tag2", "value2")),
+					),
+					makeScope(
+						makeSpan("bb42ec04df789ff04b10ea5274491685", "1b3a296034f4031e", "Test Span3", nil),
+					),
+				}, makeAttribute("resource_attribute1", "value1")),
+				makeResourceSpans("test-service2", []*v1.ScopeSpans{
+					makeScope(
+						makeSpan("b1c792dea27d511c145df8402bdd793a", "56afb9fe18b6c2d6", "Test Span", &v1.Status{Code: v1.Status_STATUS_CODE_ERROR}),
+					),
+				}, makeAttribute("resource_attribute2", "value2")),
+			},
+			expectedLogsSpan: []testLogSpan{
+				{
+					Name:               "Test Span2",
+					Msg:                "received",
+					Level:              "info",
+					TraceID:            "e3210a2b38097332d1fe43083ea93d29",
+					SpanID:             "6c21c48da4dbd1a7",
+					SpanServiceName:    "test-service",
+					SpanStatus:         "STATUS_CODE_ERROR",
+					SpanKind:           "SPAN_KIND_SERVER",
+					SpanTag1:           "value1",
+					SpanTag2:           "value2",
+					ResourceAttribute1: "value1",
+				},
+				{
+					Name:               "Test Span",
+					Msg:                "received",
+					Level:              "info",
+					TraceID:            "b1c792dea27d511c145df8402bdd793a",
+					SpanID:             "56afb9fe18b6c2d6",
+					SpanServiceName:    "test-service2",
+					SpanStatus:         "STATUS_CODE_ERROR",
+					SpanKind:           "SPAN_KIND_SERVER",
+					ResourceAttribute2: "value2",
+				},
+			},
+		},
+		{
+			LogReceivedSpansEnabled: true,
+			filterByStatusError:     false,
+			includeAllAttributes:    true,
+			batches: []*v1.ResourceSpans{
+				makeResourceSpans("test-service", []*v1.ScopeSpans{
+					makeScope(
+						makeSpan("0a0102030405060708090a0b0c0d0e0f", "dad44adc9a83b370", "Test Span", nil, makeAttribute("tag1", "value1")),
+					),
+				}),
+			},
+			expectedLogsSpan: []testLogSpan{
+				{
+					Name:            "Test Span",
+					Msg:             "received",
+					Level:           "info",
+					TraceID:         "0a0102030405060708090a0b0c0d0e0f",
+					SpanID:          "dad44adc9a83b370",
+					SpanServiceName: "test-service",
+					SpanStatus:      "STATUS_CODE_OK",
+					SpanKind:        "SPAN_KIND_SERVER",
+					SpanTag1:        "value1",
+				},
+			},
+		},
+	} {
+		t.Run(fmt.Sprintf("[%d] TestLogReceivedSpans LogReceivedSpansEnabled=%v filterByStatusError=%v includeAllAttributes=%v", i, tc.LogReceivedSpansEnabled, tc.filterByStatusError, tc.includeAllAttributes), func(t *testing.T) {
+			limits := overrides.Config{}
+			limits.RegisterFlagsAndApplyDefaults(&flag.FlagSet{})
+
+			buf := &bytes.Buffer{}
+			logger := kitlog.NewJSONLogger(kitlog.NewSyncWriter(buf))
+
+			d := prepare(t, limits, logger)
+			d.cfg.LogReceivedSpans = LogSpansConfig{
+				Enabled:              tc.LogReceivedSpansEnabled,
+				FilterByStatusError:  tc.filterByStatusError,
+				IncludeAllAttributes: tc.includeAllAttributes,
+			}
+
+			traces := batchesToTraces(t, tc.batches)
+			_, err := d.PushTraces(ctx, traces)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			assert.ElementsMatch(t, tc.expectedLogsSpan, actualLogSpan(t, buf))
+		})
+	}
+}
+
+func actualLogSpan(t *testing.T, buf *bytes.Buffer) []testLogSpan {
+	bufJSON := "[" + strings.TrimRight(strings.ReplaceAll(buf.String(), "\n", ","), ",") + "]"
+	var actualLogsSpan []testLogSpan
+	err := json.Unmarshal([]byte(bufJSON), &actualLogsSpan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return actualLogsSpan
+}
+
+func TestRateLimitRespected(t *testing.T) {
+	// prepare test data
+	overridesConfig := overrides.Config{
+		Defaults: overrides.Overrides{
+			Ingestion: overrides.IngestionOverrides{
+				RateStrategy:   overrides.LocalIngestionRateStrategy,
+				RateLimitBytes: 400,
+				BurstSizeBytes: 200,
+			},
+		},
+	}
+	buf := &bytes.Buffer{}
+	logger := kitlog.NewJSONLogger(kitlog.NewSyncWriter(buf))
+	d := prepare(t, overridesConfig, logger)
+	batches := []*v1.ResourceSpans{
+		makeResourceSpans("test-service", []*v1.ScopeSpans{
+			makeScope(
+				makeSpan("0a0102030405060708090a0b0c0d0e0f", "dad44adc9a83b370", "Test Span1", nil,
+					makeAttribute("tag1", "value1")),
+				makeSpan("e3210a2b38097332d1fe43083ea93d29", "6c21c48da4dbd1a7", "Test Span2", &v1.Status{Code: v1.Status_STATUS_CODE_ERROR},
+					makeAttribute("tag1", "value1"),
+					makeAttribute("tag2", "value2")),
+			),
+			makeScope(
+				makeSpan("bb42ec04df789ff04b10ea5274491685", "1b3a296034f4031e", "Test Span3", nil),
+			),
+		}, makeAttribute("resource_attribute1", "value1")),
+		makeResourceSpans("test-service2", []*v1.ScopeSpans{
+			makeScope(
+				makeSpan("b1c792dea27d511c145df8402bdd793a", "56afb9fe18b6c2d6", "Test Span", &v1.Status{Code: v1.Status_STATUS_CODE_ERROR}),
+			),
+		}, makeAttribute("resource_attribute2", "value2")),
+	}
+	traces := batchesToTraces(t, batches)
+
+	// invoke unit
+	_, err := d.PushTraces(ctx, traces)
+
+	// validations
+	if err == nil {
+		t.Fatal("Expected error")
+	}
+	status, ok := status.FromError(err)
+	assert.True(t, ok)
+	assert.True(t, status.Code() == codes.ResourceExhausted, "Wrong status code")
+}
+
+func TestPushTracesSkipMetricsGenerationIngestStorage(t *testing.T) {
+	const topic = "test-topic"
+
+	kafka, err := kfake.NewCluster(kfake.NumBrokers(1), kfake.AllowAutoTopicCreation())
+	require.NoError(t, err)
+	t.Cleanup(kafka.Close)
+
+	limitCfg := overrides.Config{}
+	limitCfg.RegisterFlagsAndApplyDefaults(&flag.FlagSet{})
+
+	distributorCfg, overridesSvc, limits, middleware := setupDependencies(t, limitCfg)
+
+	distributorCfg.PushSpansToKafka = true
+	distributorCfg.KafkaConfig = ingest.KafkaConfig{}
+	distributorCfg.KafkaConfig.RegisterFlags(&flag.FlagSet{})
+	distributorCfg.KafkaConfig.Address = kafka.ListenAddrs()[0]
+	distributorCfg.KafkaConfig.Topic = topic
+
+	d, err := New(
+		distributorCfg,
+		LocalPushTargets{},
+		singlePartitionRingReader{},
+		overridesSvc,
+		middleware,
+		kitlog.NewLogfmtLogger(os.Stdout),
+		limits,
+		prometheus.NewRegistry(),
+	)
+	require.NoError(t, err)
+
+	traces := batchesToTraces(t, []*v1.ResourceSpans{test.MakeBatch(10, nil)})
+
+	reader, err := kgo.NewClient(kgo.SeedBrokers(kafka.ListenAddrs()...), kgo.ConsumeTopics(topic))
+	require.NoError(t, err)
+
+	t.Run("with no-generate-metrics header", func(t *testing.T) {
+		// Inject the header into the incoming context. In a real call this would be done
+		// by the gRPC server logic if the client sends that header in the outgoing
+		// context.
+		ctx := metadata.NewIncomingContext(ctx, metadata.Pairs(generator.NoGenerateMetricsContextKey, ""))
+		_, err = d.PushTraces(ctx, traces)
+		require.NoError(t, err)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		var recordProcessed bool
+		fetches := reader.PollFetches(ctx)
+		fetches.EachRecord(func(record *kgo.Record) {
+			recordProcessed = true
+			req, err := ingest.NewDecoder().Decode(record.Value)
+			require.NoError(t, err)
+			require.True(t, req.SkipMetricsGeneration)
+
+			reqs, err := ingest.NewPushBytesDecoder().Decode(record.Value)
+			require.NoError(t, err)
+			for req, err := range reqs {
+				require.NoError(t, err)
+				require.True(t, req.SkipMetricsGeneration)
+			}
+		})
+		// Expect that we've fetched at least one record.
+		require.True(t, recordProcessed)
+	})
+
+	t.Run("without no-generate-metrics header", func(t *testing.T) {
+		_, err = d.PushTraces(ctx, traces)
+		require.NoError(t, err)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		var recordProcessed bool
+		fetches := reader.PollFetches(ctx)
+		fetches.EachRecord(func(record *kgo.Record) {
+			recordProcessed = true
+			req, err := ingest.NewDecoder().Decode(record.Value)
+			require.NoError(t, err)
+			require.False(t, req.SkipMetricsGeneration)
+
+			reqs, err := ingest.NewPushBytesDecoder().Decode(record.Value)
+			require.NoError(t, err)
+			for req, err := range reqs {
+				require.NoError(t, err)
+				require.False(t, req.SkipMetricsGeneration)
+			}
+		})
+		// Expect that we've fetched at least one record.
+		require.True(t, recordProcessed)
+	})
+}
+
+func TestPushTracesKafkaWriteErrorReturnsRetryableStatus(t *testing.T) {
+	const topic = "test-topic"
+
+	kafka, err := kfake.NewCluster(kfake.NumBrokers(1), kfake.AllowAutoTopicCreation())
+	require.NoError(t, err)
+	t.Cleanup(kafka.Close)
+
+	limitCfg := overrides.Config{}
+	limitCfg.RegisterFlagsAndApplyDefaults(&flag.FlagSet{})
+
+	distributorCfg, overridesSvc, loggingLevel, middleware := setupDependencies(t, limitCfg)
+
+	distributorCfg.PushSpansToKafka = true
+	distributorCfg.KafkaConfig = ingest.KafkaConfig{}
+	distributorCfg.KafkaConfig.RegisterFlags(&flag.FlagSet{})
+	distributorCfg.KafkaConfig.Address = kafka.ListenAddrs()[0]
+	distributorCfg.KafkaConfig.Topic = topic
+	distributorCfg.KafkaConfig.WriteTimeout = time.Second
+
+	d, err := New(
+		distributorCfg,
+		LocalPushTargets{},
+		singlePartitionRingReader{},
+		overridesSvc,
+		middleware,
+		kitlog.NewLogfmtLogger(os.Stdout),
+		loggingLevel,
+		prometheus.NewRegistry(),
+	)
+	require.NoError(t, err)
+
+	kafka.Close()
+
+	traces := batchesToTraces(t, []*v1.ResourceSpans{test.MakeBatch(10, nil)})
+
+	_, err = d.PushTraces(ctx, traces)
+	require.Error(t, err)
+
+	st, ok := status.FromError(err)
+	require.True(t, ok, "kafka write error must carry a gRPC status, got %T: %v", err, err)
+	require.Equal(t, codes.Unavailable, st.Code())
+}
+
+func TestPushTracesToLocalLiveStore(t *testing.T) {
+	limits := overrides.Config{}
+	limitCfg := &flag.FlagSet{}
+	limits.RegisterFlagsAndApplyDefaults(limitCfg)
+
+	distributorCfg, overridesSvc, loggingLevel, middleware := setupDependencies(t, limits)
+
+	var (
+		called    bool
+		gotTenant string
+		gotReq    *tempopb.PushBytesRequest
+	)
+
+	d, err := New(
+		distributorCfg,
+		LocalPushTargets{
+			LiveStore: func(ctx context.Context, req *tempopb.PushBytesRequest) (*tempopb.PushResponse, error) {
+				called = true
+				gotReq = req
+				tenant, err := user.ExtractOrgID(ctx)
+				require.NoError(t, err)
+				gotTenant = tenant
+				return &tempopb.PushResponse{}, nil
+			},
+		},
+		nil,
+		overridesSvc,
+		middleware,
+		kitlog.NewLogfmtLogger(os.Stdout),
+		loggingLevel,
+		prometheus.NewRegistry(),
+	)
+	require.NoError(t, err)
+
+	traces := batchesToTraces(t, []*v1.ResourceSpans{test.MakeBatch(10, nil)})
+	_, err = d.PushTraces(ctx, traces)
+	require.NoError(t, err)
+
+	require.True(t, called)
+	require.Equal(t, "test", gotTenant)
+	require.NotNil(t, gotReq)
+	require.Len(t, gotReq.Traces, len(gotReq.Ids))
+	require.NotEmpty(t, gotReq.Traces)
+
+	decoded := &tempopb.Trace{}
+	require.NoError(t, decoded.Unmarshal(gotReq.Traces[0].Slice))
+	require.NotEmpty(t, decoded.ResourceSpans)
+}
+
+func TestPushTracesToLocalLiveStoreError(t *testing.T) {
+	limits := overrides.Config{}
+	limitCfg := &flag.FlagSet{}
+	limits.RegisterFlagsAndApplyDefaults(limitCfg)
+
+	distributorCfg, overridesSvc, loggingLevel, middleware := setupDependencies(t, limits)
+
+	d, err := New(
+		distributorCfg,
+		LocalPushTargets{
+			LiveStore: func(_ context.Context, _ *tempopb.PushBytesRequest) (*tempopb.PushResponse, error) {
+				return nil, errors.New("boom")
+			},
+		},
+		nil,
+		overridesSvc,
+		middleware,
+		kitlog.NewLogfmtLogger(os.Stdout),
+		loggingLevel,
+		prometheus.NewRegistry(),
+	)
+	require.NoError(t, err)
+
+	traces := batchesToTraces(t, []*v1.ResourceSpans{test.MakeBatch(10, nil)})
+	_, err = d.PushTraces(ctx, traces)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "failed to push spans to local live-store")
+}
+
+func TestPushLocalSkipsGeneratorWhenLiveStoreFails(t *testing.T) {
+	limits := overrides.Config{}
+	limitCfg := &flag.FlagSet{}
+	limits.RegisterFlagsAndApplyDefaults(limitCfg)
+	limits.Defaults.MetricsGenerator.Processors = listtomap.ListToMap{"service-graphs": {}}
+
+	distributorCfg, overridesSvc, loggingLevel, middleware := setupDependencies(t, limits)
+
+	generatorCalled := make(chan struct{}, 1)
+
+	d, err := New(
+		distributorCfg,
+		LocalPushTargets{
+			Generator: func(_ context.Context, _ *tempopb.PushSpansRequest) (*tempopb.PushResponse, error) {
+				generatorCalled <- struct{}{}
+				return &tempopb.PushResponse{}, nil
+			},
+			LiveStore: func(_ context.Context, _ *tempopb.PushBytesRequest) (*tempopb.PushResponse, error) {
+				return nil, errors.New("boom")
+			},
+		},
+		nil,
+		overridesSvc,
+		middleware,
+		kitlog.NewLogfmtLogger(os.Stdout),
+		loggingLevel,
+		prometheus.NewRegistry(),
+	)
+	require.NoError(t, err)
+	require.NotNil(t, d.generatorForwarder)
+
+	require.NoError(t, services.StartAndAwaitRunning(context.Background(), d.generatorForwarder))
+	defer func() {
+		require.NoError(t, services.StopAndAwaitTerminated(context.Background(), d.generatorForwarder))
+	}()
+
+	traces := batchesToTraces(t, []*v1.ResourceSpans{test.MakeBatch(10, nil)})
+	_, err = d.PushTraces(ctx, traces)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "failed to push spans to local live-store")
+
+	select {
+	case <-generatorCalled:
+		t.Fatal("expected generator not to be called when live-store push fails")
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+func TestArtificialLatency(t *testing.T) {
+	// prepare test data
+	overridesConfig := overrides.Config{}
+	overridesConfig.RegisterFlagsAndApplyDefaults(&flag.FlagSet{})
+
+	latency := 50 * time.Millisecond
+	buf := &bytes.Buffer{}
+	logger := kitlog.NewJSONLogger(kitlog.NewSyncWriter(buf))
+	d := prepare(t, overridesConfig, logger)
+	d.cfg.ArtificialDelay = latency
+
+	batches := []*v1.ResourceSpans{
+		makeResourceSpans("test-service", []*v1.ScopeSpans{
+			makeScope(
+				makeSpan("0a0102030405060708090a0b0c0d0e0f", "dad44adc9a83b370", "Test Span1", nil),
+			),
+			makeScope(
+				makeSpan("bb42ec04df789ff04b10ea5274491685", "1b3a296034f4031e", "Test Span3", nil),
+			),
+		}),
+	}
+
+	traces := batchesToTraces(t, batches)
+	reqStart := time.Now()
+	_, err := d.PushTraces(ctx, traces)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const tolerance = 10 * time.Millisecond
+	assert.GreaterOrEqual(t, time.Since(reqStart)+tolerance, latency, "Expected artificial latency not respected")
+}
+
+func TestArtificialLatencyIsAppliedOnError(t *testing.T) {
+	// prepare test data
+	overridesConfig := overrides.Config{}
+	overridesConfig.RegisterFlagsAndApplyDefaults(&flag.FlagSet{})
+
+	latency := 50 * time.Millisecond
+	buf := &bytes.Buffer{}
+	logger := kitlog.NewJSONLogger(kitlog.NewSyncWriter(buf))
+	d := prepare(t, overridesConfig, logger)
+	d.cfg.ArtificialDelay = latency
+
+	batches := []*v1.ResourceSpans{
+		makeResourceSpans("test-service", []*v1.ScopeSpans{}),
+	}
+
+	traces := batchesToTraces(t, batches)
+	reqStart := time.Now()
+	_, err := d.PushTraces(ctx, traces)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const tolerance = 10 * time.Millisecond
+	assert.GreaterOrEqual(t, time.Since(reqStart)+tolerance, latency, "Expected artificial latency not respected")
+}
+
+type testLogSpan struct {
+	Msg                string `json:"msg"`
+	Level              string `json:"level"`
+	PushErrorReason    string `json:"push_error_reason,omitempty"`
+	Tenant             string `json:"tenant,omitempty"`
+	TraceID            string `json:"traceid"`
+	SpanID             string `json:"spanid"`
+	Name               string `json:"span_name"`
+	SpanStatus         string `json:"span_status,omitempty"`
+	SpanKind           string `json:"span_kind,omitempty"`
+	SpanServiceName    string `json:"span_service_name,omitempty"`
+	SpanTag1           string `json:"span_tag1,omitempty"`
+	SpanTag2           string `json:"span_tag2,omitempty"`
+	ResourceAttribute1 string `json:"span_resource_attribute1,omitempty"`
+	ResourceAttribute2 string `json:"span_resource_attribute2,omitempty"`
+}
+
+func makeAttribute(key, value string) *v1_common.KeyValue {
+	return &v1_common.KeyValue{
+		Key:   key,
+		Value: &v1_common.AnyValue{Value: &v1_common.AnyValue_StringValue{StringValue: value}},
+	}
+}
+
+func makeSpan(traceID, spanID, name string, status *v1.Status, attributes ...*v1_common.KeyValue) *v1.Span {
+	if status == nil {
+		status = &v1.Status{Code: v1.Status_STATUS_CODE_OK}
+	}
+
+	traceIDBytes, err := hex.DecodeString(traceID)
+	if err != nil {
+		panic(err)
+	}
+	spanIDBytes, err := hex.DecodeString(spanID)
+	if err != nil {
+		panic(err)
+	}
+
+	return &v1.Span{
+		Name:       name,
+		TraceId:    traceIDBytes,
+		SpanId:     spanIDBytes,
+		Status:     status,
+		Kind:       v1.Span_SPAN_KIND_SERVER,
+		Attributes: attributes,
+	}
+}
+
+func makeScope(spans ...*v1.Span) *v1.ScopeSpans {
+	return &v1.ScopeSpans{
+		Scope: &v1_common.InstrumentationScope{
+			Name:    "super library",
+			Version: "0.0.1",
+		},
+		Spans: spans,
+	}
+}
+
+func makeResourceSpans(serviceName string, ils []*v1.ScopeSpans, attributes ...*v1_common.KeyValue) *v1.ResourceSpans {
+	rs := &v1.ResourceSpans{
+		Resource: &v1_resource.Resource{
+			Attributes: []*v1_common.KeyValue{
+				{
+					Key: "service.name",
+					Value: &v1_common.AnyValue{
+						Value: &v1_common.AnyValue_StringValue{
+							StringValue: serviceName,
+						},
+					},
+				},
+			},
+		},
+		ScopeSpans: ils,
+	}
+
+	rs.Resource.Attributes = append(rs.Resource.Attributes, attributes...)
+
+	return rs
+}
+
+func prepare(t *testing.T, limits overrides.Config, logger kitlog.Logger) *Distributor {
+	if logger == nil {
+		logger = kitlog.NewNopLogger()
+	}
+
+	distributorConfig, overridesSvc, l, mw := setupDependencies(t, limits)
+	d, err := New(distributorConfig, LocalPushTargets{}, nil, overridesSvc, mw, logger, l, prometheus.NewPedanticRegistry())
+	require.NoError(t, err)
+
+	return d
+}
+
+func setupDependencies(t *testing.T, limits overrides.Config) (Config, overrides.Service, dslog.Level, receiver.Middleware) {
+	t.Helper()
+
+	var distributorConfig Config
+
+	overridesSvc, err := overrides.NewOverrides(limits, nil, prometheus.DefaultRegisterer)
+	require.NoError(t, err)
+
+	distributorConfig.MaxAttributeBytes = 1000
+	distributorConfig.DistributorRing.HeartbeatPeriod = 100 * time.Millisecond
+	distributorConfig.DistributorRing.InstanceID = strconv.Itoa(rand.Int())
+	distributorConfig.DistributorRing.KVStore.Mock = nil
+	distributorConfig.DistributorRing.InstanceInterfaceNames = []string{"eth0", "en0", "lo0"}
+
+	l := dslog.Level{}
+	_ = l.Set("error")
+	mw := receiver.MultiTenancyMiddleware()
+
+	return distributorConfig, overridesSvc, l, mw
+}
+
+type singlePartitionRingReader struct{}
+
+func (m singlePartitionRingReader) PartitionRing() *ring.PartitionRing {
+	desc := ring.PartitionRingDesc{
+		Partitions: map[int32]ring.PartitionDesc{
+			0: {Id: 0, Tokens: []uint32{0}, State: ring.PartitionActive},
+		},
+	}
+	r, _ := ring.NewPartitionRing(desc)
+	return r
+}
+
+func TestCheckForRateLimits(t *testing.T) {
+	tests := []struct {
+		name            string
+		tracesSize      int
+		rateLimitBytes  int
+		burstLimitBytes int
+		expectError     string
+		errCode         codes.Code
+	}{
+		{
+			name:            "size under rate limit and burst limit",
+			tracesSize:      100,
+			rateLimitBytes:  500,
+			burstLimitBytes: 500,
+			expectError:     "",
+			errCode:         codes.OK,
+		},
+		{
+			name:            "size exactly at rate limit and burst limit",
+			tracesSize:      500,
+			rateLimitBytes:  500,
+			burstLimitBytes: 500,
+			expectError:     "",
+			errCode:         codes.OK,
+		},
+		{
+			name:            "size over rate limit but exactly at burst rate limit",
+			tracesSize:      500,
+			rateLimitBytes:  200, // to test that burst is respected
+			burstLimitBytes: 500,
+			expectError:     "",
+			errCode:         codes.OK,
+		},
+		{
+			name:            "size over rate limit but under burst limit",
+			tracesSize:      1100,
+			rateLimitBytes:  500, // to test that burst is respected
+			burstLimitBytes: 1500,
+			expectError:     "",
+			errCode:         codes.OK,
+		},
+		{
+			name:            "size over rate limit and burst limit",
+			tracesSize:      1100,
+			rateLimitBytes:  500,
+			burstLimitBytes: 500,
+			expectError:     "RATE_LIMITED: batch size (1100 bytes) exceeds ingestion limit (local: 500 bytes/s, global: 0 bytes/s, burst: 500 bytes) while adding 1100 bytes for user test-user. consider reducing batch size or increasing rate limit.",
+			errCode:         codes.ResourceExhausted,
+		},
+		{
+			name:            "size over rate limit and burst limit",
+			tracesSize:      1000,
+			rateLimitBytes:  500,
+			burstLimitBytes: 500,
+			expectError:     "RATE_LIMITED: batch size (1000 bytes) exceeds ingestion limit (local: 500 bytes/s, global: 0 bytes/s, burst: 500 bytes) while adding 1000 bytes for user test-user. consider reducing batch size or increasing rate limit.",
+			errCode:         codes.ResourceExhausted,
+		},
+		{
+			name:            "size exactly at rate limit but over the burst limit",
+			tracesSize:      500,
+			rateLimitBytes:  500,
+			burstLimitBytes: 200,
+			expectError:     "RATE_LIMITED: ingestion rate limit (local: 500 bytes/s, global: 0 bytes/s, burst: 200 bytes) exceeded while adding 500 bytes for user test-user. consider increasing the limit or reducing ingestion rate.",
+			errCode:         codes.ResourceExhausted,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			overridesConfig := overrides.Config{
+				Defaults: overrides.Overrides{
+					Ingestion: overrides.IngestionOverrides{
+						RateStrategy:   overrides.LocalIngestionRateStrategy,
+						RateLimitBytes: tc.rateLimitBytes,
+						BurstSizeBytes: tc.burstLimitBytes,
+					},
+				},
+			}
+
+			// Create a distributor with the overrides
+			logger := kitlog.NewNopLogger()
+			d := prepare(t, overridesConfig, logger)
+
+			// check if we can ingest the batch
+			err := d.checkForRateLimits(tc.tracesSize, 100, "test-user")
+			s, ok := status.FromError(err)
+			require.True(t, ok)
+			require.Equal(t, tc.errCode, s.Code())
+			require.Equal(t, tc.expectError, s.Message())
+		})
+	}
+}
+
+func TestRequestsByTraceID_SpanIDValidation(t *testing.T) {
+	validTraceID := []byte{0x0A, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F}
+	invalidSpanIDs := [][]byte{
+		{}, // empty
+		{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, // all zero
+		{0x01}, // too short
+		{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07},             // 7 bytes
+		{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09}, // 9 bytes
+	}
+	for _, spanID := range invalidSpanIDs {
+		batches := []*v1.ResourceSpans{
+			{
+				ScopeSpans: []*v1.ScopeSpans{
+					{
+						Spans: []*v1.Span{
+							{
+								TraceId: validTraceID,
+								SpanId:  spanID,
+							},
+						},
+					},
+				},
+			},
+		}
+		_, _, _, _, err := requestsByTraceID(batches, "test-tenant", 1, 1000)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "span ids must be 64 bit")
+	}
+	// Valid span id should not error
+	validSpanID := []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08}
+	batches := []*v1.ResourceSpans{
+		{
+			ScopeSpans: []*v1.ScopeSpans{
+				{
+					Spans: []*v1.Span{
+						{
+							TraceId: validTraceID,
+							SpanId:  validSpanID,
+						},
+					},
+				},
+			},
+		},
+	}
+	_, _, _, _, err := requestsByTraceID(batches, "test-tenant", 1, 1000)
+	require.NoError(t, err)
+}
+
+func TestRetryInfoEnabled(t *testing.T) {
+	tests := []struct {
+		name                          string
+		retryAfterOnResourceExhausted time.Duration
+		overrideRetryInfoEnabled      bool
+		expectedResult                bool
+		expectError                   bool
+		ctx                           context.Context
+	}{
+		{
+			name:                          "cluster level disabled with 0",
+			retryAfterOnResourceExhausted: 0,
+			overrideRetryInfoEnabled:      false,
+			expectedResult:                false, // disabled because retryAfterOnResourceExhausted is <= 0
+			expectError:                   false,
+			ctx:                           user.InjectOrgID(context.Background(), "test-tenant"),
+		},
+		{
+			name:                          "cluster level disabled with -1",
+			retryAfterOnResourceExhausted: -1,
+			overrideRetryInfoEnabled:      false,
+			expectedResult:                false, // disabled because retryAfterOnResourceExhausted is <= 0
+			expectError:                   false,
+			ctx:                           user.InjectOrgID(context.Background(), "test-tenant"),
+		},
+		{
+			name:                          "cluster level disabled, override enabled",
+			retryAfterOnResourceExhausted: 0,
+			overrideRetryInfoEnabled:      true,
+			expectedResult:                false, // cluster level disable, it takes priority over overrides
+			expectError:                   false,
+			ctx:                           user.InjectOrgID(context.Background(), "test-tenant"),
+		},
+		{
+			name:                          "cluster level enabled, override disabled",
+			retryAfterOnResourceExhausted: 10 * time.Second,
+			overrideRetryInfoEnabled:      false,
+			expectedResult:                false, // disabled because disabled in overrides
+			expectError:                   false,
+			ctx:                           user.InjectOrgID(context.Background(), "test-tenant"),
+		},
+		{
+			name:                          "cluster level enabled, override enabled",
+			retryAfterOnResourceExhausted: 10 * time.Second,
+			overrideRetryInfoEnabled:      true,
+			expectedResult:                true, // should be true because overrides is enabled.
+			expectError:                   false,
+			ctx:                           user.InjectOrgID(context.Background(), "test-tenant"),
+		},
+		{
+			name:                          "error extracting org ID",
+			retryAfterOnResourceExhausted: 10 * time.Second,
+			overrideRetryInfoEnabled:      false,
+			expectedResult:                false, // invalid org id, return false
+			expectError:                   true,
+			ctx:                           context.Background(), // no org ID
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			limits := overrides.Config{
+				Defaults: overrides.Overrides{
+					Ingestion: overrides.IngestionOverrides{
+						RetryInfoEnabled: new(tt.overrideRetryInfoEnabled),
+					},
+				},
+			}
+
+			d := prepare(t, limits, nil)
+			d.cfg.RetryAfterOnResourceExhausted = tt.retryAfterOnResourceExhausted
+
+			result, err := d.RetryInfoEnabled(tt.ctx)
+
+			if tt.expectError {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+				assert.Equal(t, tt.expectedResult, result)
+			}
+		})
+	}
+}
+
+func TestTracePushMiddlewareCalled(t *testing.T) {
+	limits := overrides.Config{}
+	limitCfg := &flag.FlagSet{}
+	limits.RegisterFlagsAndApplyDefaults(limitCfg)
+
+	distributorCfg, overridesSvc, loggingLevel, middleware := setupDependencies(t, limits)
+
+	// Track middleware calls
+	var middlewareCalled bool
+	var receivedTraces ptrace.Traces
+
+	// Create a test middleware
+	testMiddleware := func(_ context.Context, td ptrace.Traces) error {
+		middlewareCalled = true
+		receivedTraces = td
+		return nil
+	}
+
+	distributorCfg.TracePushMiddlewares = []TracePushMiddleware{testMiddleware}
+
+	d, err := New(
+		distributorCfg,
+		LocalPushTargets{},
+		nil,
+		overridesSvc,
+		middleware,
+		kitlog.NewLogfmtLogger(os.Stdout),
+		loggingLevel,
+		prometheus.NewRegistry(),
+	)
+	require.NoError(t, err)
+
+	// Create test traces
+	traces := batchesToTraces(t, []*v1.ResourceSpans{test.MakeBatch(10, nil)})
+
+	// Call PushTraces
+	_, err = d.PushTraces(ctx, traces)
+	require.NoError(t, err)
+
+	// Verify middleware was called
+	assert.True(t, middlewareCalled, "TracePushMiddleware should have been called")
+	assert.NotNil(t, receivedTraces, "Middleware should have received traces")
+	assert.Equal(t, traces.SpanCount(), receivedTraces.SpanCount(), "Middleware should receive the same traces")
+}
+
+func TestTracePushMiddlewareFailsOpen(t *testing.T) {
+	limits := overrides.Config{}
+	limitCfg := &flag.FlagSet{}
+	limits.RegisterFlagsAndApplyDefaults(limitCfg)
+
+	distributorCfg, overridesSvc, loggingLevel, middleware := setupDependencies(t, limits)
+
+	// Create a middleware that returns an error
+	expectedErr := errors.New("middleware error")
+	errorMiddleware := func(_ context.Context, _ ptrace.Traces) error {
+		return expectedErr
+	}
+
+	distributorCfg.TracePushMiddlewares = []TracePushMiddleware{errorMiddleware}
+
+	d, err := New(
+		distributorCfg,
+		LocalPushTargets{},
+		nil,
+		overridesSvc,
+		middleware,
+		kitlog.NewLogfmtLogger(os.Stdout),
+		loggingLevel,
+		prometheus.NewRegistry(),
+	)
+	require.NoError(t, err)
+
+	// Create test traces
+	traces := batchesToTraces(t, []*v1.ResourceSpans{test.MakeBatch(10, nil)})
+
+	// Call PushTraces - should succeed despite middleware error (fail open)
+	_, err = d.PushTraces(ctx, traces)
+	require.NoError(t, err, "PushTraces should succeed even when middleware returns an error")
+}

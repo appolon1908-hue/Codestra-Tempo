@@ -1,0 +1,540 @@
+package traceql
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"time"
+
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+
+	"github.com/grafana/tempo/pkg/tempopb"
+	common_v1 "github.com/grafana/tempo/pkg/tempopb/common/v1"
+	"github.com/grafana/tempo/pkg/util"
+)
+
+const (
+	DefaultSpansPerSpanSet int = 3
+)
+
+var ErrMathNotSupported = errors.New("math expressions not supported")
+
+type SpansetFilterFunc func(input []*Spanset) (result []*Spanset, err error)
+
+type Engine struct{}
+
+func NewEngine() *Engine {
+	return &Engine{}
+}
+
+// Compile parses and compiles a TraceQL query. Options specific to metrics queries are ignored. It does not support math expressions.
+func Compile(query string, opts ...CompileOption) (*RootExpr, Pipeline, SpansetFilterFunc, *FetchSpansRequest, error) {
+	expr, err := Parse(query, opts...)
+	if err != nil {
+		return nil, Pipeline{}, nil, nil, err
+	}
+	err = expr.validate()
+	if err != nil {
+		return nil, Pipeline{}, nil, nil, err
+	}
+	p, ok := expr.SinglePipeline()
+	if !ok {
+		return nil, Pipeline{}, nil, nil, ErrMathNotSupported
+	}
+	req := FetchSpansRequest{AllConditions: true}
+	requests := expr.extractConditions(req)
+	if len(requests) != 1 { // should never happen, but just in case
+		return nil, Pipeline{}, nil, nil, ErrMathNotSupported
+	}
+	for _, v := range requests {
+		req = v
+	}
+	return expr, p, p.evaluate, &req, nil
+}
+
+// CompileFetchSpanRequests parses a query and returns per-sub-query FetchSpansRequests.
+// This supports both plain spanset queries and math expressions (multiple sub-queries).
+func CompileFetchSpanRequests(query string, opts ...CompileOption) (*RootExpr, map[string]FetchSpansRequest, error) {
+	expr, err := Parse(query, opts...)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := expr.validate(); err != nil {
+		return nil, nil, err
+	}
+	return expr, expr.extractConditions(FetchSpansRequest{AllConditions: true}), nil
+}
+
+// ExecuteSearch executes a search query. Options control AST optimization and hint behavior.
+func (e *Engine) ExecuteSearch(ctx context.Context, searchReq *tempopb.SearchRequest, fetcher SpansetFetcher, opts ...CompileOption) (*tempopb.SearchResponse, error) {
+	ctx, span := tracer.Start(ctx, "traceql.Engine.ExecuteSearch")
+	defer span.End()
+
+	cfg := applyCompileOptions(opts...)
+	rootExpr, pipeline, eval, fetchSpansRequest, err := Compile(searchReq.Query, opts...)
+	if err != nil {
+		return nil, err
+	}
+
+	// Check for performance testing hints
+	if returnIn, ok := rootExpr.Hints.GetDuration(HintDebugReturnIn, cfg.allowUnsafeHints); ok {
+		var stdDev time.Duration
+		if stdDevDuration, ok := rootExpr.Hints.GetDuration(HintDebugStdDev, cfg.allowUnsafeHints); ok {
+			stdDev = stdDevDuration
+		}
+		simulateLatency(returnIn, stdDev)
+
+		var probability float64
+		if p, ok := rootExpr.Hints.GetFloat(HintDebugDataFactor, cfg.allowUnsafeHints); ok {
+			probability = p
+		}
+		return generateFakeSearchResponse(probability), nil
+	}
+
+	var mostRecent, ok bool
+	if mostRecent, ok = rootExpr.Hints.GetBool(HintMostRecent, cfg.allowUnsafeHints); !ok {
+		mostRecent = false
+	}
+
+	// Watchers are scoped to this Compile call. EngineBytesWatcher is installed fresh when enabled via
+	// WithEngineBytesTracking; additional watchers come from WithWatchers (e.g. per-tenant overrides).
+	var watchers spanWatchers
+	if cfg.engineBytesTracking {
+		watchers.Add(NewEngineBytesWatcher())
+	}
+	watchers.Add(cfg.watchers...)
+
+	if rootExpr.IsNoop() {
+		return &tempopb.SearchResponse{
+			Traces:  nil,
+			Metrics: &tempopb.SearchMetrics{},
+		}, nil
+	}
+
+	fetchSpansRequest.StartTimeUnixNanos = unixSecToNano(searchReq.Start)
+	fetchSpansRequest.EndTimeUnixNanos = unixSecToNano(searchReq.End)
+
+	span.SetAttributes(attribute.String("pipeline", pipeline.String()))
+	span.SetAttributes(attribute.String("fetchSpansRequest", fmt.Sprint(fetchSpansRequest)))
+
+	// calculate search meta conditions.
+	meta := SearchMetaConditionsWithout(fetchSpansRequest.Conditions, fetchSpansRequest.AllConditions)
+	fetchSpansRequest.SecondPassConditions = append(fetchSpansRequest.SecondPassConditions, meta...)
+
+	if watchers.Active() {
+		fetchSpansRequest.SecondPassConditions = append(fetchSpansRequest.SecondPassConditions, watchers.Conditions()...)
+	}
+
+	spansetsEvaluated := 0
+	// set up the expression evaluation as a filter to reduce data pulled
+	fetchSpansRequest.SecondPass = func(inSS *Spanset) ([]*Spanset, error) {
+		if inSS == nil || len(inSS.Spans) == 0 {
+			return nil, nil
+		}
+
+		evalSS, err := eval([]*Spanset{inSS})
+		if err != nil {
+			span.RecordError(err, trace.WithAttributes(attribute.String("msg", "pipeline.evaluate")))
+			return nil, err
+		}
+
+		spansetsEvaluated++
+		if len(evalSS) == 0 {
+			return nil, nil
+		}
+
+		if watchers.Active() {
+			watchers.WatchSpans(evalSS)
+		}
+
+		// reduce all evalSS to their max length to reduce meta data lookups
+		for i := range evalSS {
+			l := len(evalSS[i].Spans)
+			evalSS[i].AddAttribute(attributeMatched, NewStaticInt(l))
+
+			spansPerSpanSet := int(searchReq.SpansPerSpanSet)
+			if spansPerSpanSet == 0 {
+				spansPerSpanSet = DefaultSpansPerSpanSet
+			}
+			if l > spansPerSpanSet {
+				evalSS[i].Spans = evalSS[i].Spans[:spansPerSpanSet]
+			}
+		}
+
+		return evalSS, nil
+	}
+
+	fetchSpansResponse, err := fetcher.Fetch(ctx, *fetchSpansRequest)
+	if err != nil {
+		if errors.Is(err, util.ErrUnsupported) {
+			return &tempopb.SearchResponse{
+				Traces:  nil,
+				Metrics: &tempopb.SearchMetrics{},
+			}, nil
+		}
+		return nil, err
+	}
+
+	iterator := fetchSpansResponse.Results
+	defer iterator.Close()
+
+	res := &tempopb.SearchResponse{
+		Traces:  nil,
+		Metrics: &tempopb.SearchMetrics{},
+	}
+	combiner := NewMetadataCombiner(int(searchReq.Limit), mostRecent)
+	for {
+		spanset, err := iterator.Next(ctx)
+		if err != nil && !errors.Is(err, io.EOF) {
+			span.RecordError(err, trace.WithAttributes(attribute.String("msg", "iterator.Next")))
+			return nil, err
+		}
+		if spanset == nil {
+			break
+		}
+
+		combiner.addSpanset(spanset)
+		if combiner.IsCompleteFor(TimestampNever) {
+			break
+		}
+	}
+	res.Traces = combiner.Metadata()
+
+	span.SetAttributes(attribute.Int("spansets_evaluated", spansetsEvaluated))
+	span.SetAttributes(attribute.Int("spansets_found", len(res.Traces)))
+
+	// Stats can be nil when callback is not set.
+	if fetchSpansResponse.Stats != nil {
+		stats := fetchSpansResponse.Stats()
+		// InspectedBytes is used to compute query throughput and SLO metrics.
+		res.Metrics.InspectedBytes = stats.Bytes
+		populateMetricsFromFetchStats(res.Metrics, stats)
+		span.SetAttributes(attribute.Int64("inspectedBytes", int64(stats.Bytes)))
+	}
+
+	// Populate extra metrics from watchers
+	for k, v := range watchers.Stats() {
+		if res.Metrics.AdditionalMetrics == nil {
+			res.Metrics.AdditionalMetrics = make(map[string]int64)
+		}
+		res.Metrics.AdditionalMetrics[k] += v
+	}
+
+	return res, nil
+}
+
+func (e *Engine) ExecuteTagValues(
+	ctx context.Context,
+	tag Attribute,
+	conditionGroups [][]Condition,
+	cb FetchTagValuesCallback,
+	fetcher TagValuesFetcher,
+	maxConditionGroups int,
+) error {
+	ctx, span := tracer.Start(ctx, "traceql.Engine.ExecuteTagValues")
+	defer span.End()
+
+	if maxConditionGroups <= 0 {
+		maxConditionGroups = DefaultMaxConditionGroupsPerTagQuery
+	}
+
+	if len(conditionGroups) == 0 {
+		return fetcher.Fetch(ctx, FetchTagValuesRequest{
+			ConditionGroups: nil,
+			TagName:         tag,
+		}, cb)
+	}
+
+	finalConditionGroups := make([][]Condition, 0, len(conditionGroups))
+	for _, group := range conditionGroups {
+		skip := false
+		for _, c := range group {
+			if c.Attribute == tag && c.Op == OpEqual {
+				if len(c.Operands) > 0 {
+					if cb(c.Operands[0]) {
+						return nil // callback signalled stop (limit reached)
+					}
+				}
+				skip = true
+				break
+			}
+		}
+		if !skip {
+			groupCopy := make([]Condition, len(group))
+			copy(groupCopy, group)
+			finalConditionGroups = append(finalConditionGroups, groupCopy)
+		}
+	}
+
+	if len(finalConditionGroups) == 0 {
+		return nil
+	}
+
+	if tag.Scope == AttributeScopeNone && tag.Intrinsic == IntrinsicNone {
+		if (len(finalConditionGroups) * 2) > maxConditionGroups {
+			return fmt.Errorf("%w (limit: %d). Reduce the number of OR conditions in the query", ErrMaxConditionGroupsPerTagQueryReached, maxConditionGroups)
+		}
+		finalGroupOne := make([][]Condition, len(finalConditionGroups))
+		finalGroupTwo := make([][]Condition, len(finalConditionGroups))
+		for i := range finalConditionGroups {
+			tagResource := tag
+			tagResource.Scope = AttributeScopeResource
+			tagSpan := tag
+			tagSpan.Scope = AttributeScopeSpan
+			finalGroupOne[i] = append(append([]Condition(nil), finalConditionGroups[i]...), Condition{
+				Attribute: tagResource,
+				Op:        OpNone,
+			})
+			finalGroupTwo[i] = append(append([]Condition(nil), finalConditionGroups[i]...), Condition{
+				Attribute: tagSpan,
+				Op:        OpNone,
+			})
+		}
+		finalConditionGroups = append(append([][]Condition(nil), finalGroupOne...), finalGroupTwo...)
+	} else {
+		for i := range finalConditionGroups {
+			finalConditionGroups[i] = append(finalConditionGroups[i], Condition{
+				Attribute: tag,
+				Op:        OpNone,
+			})
+		}
+	}
+
+	autocompleteReq := FetchTagValuesRequest{
+		ConditionGroups: finalConditionGroups,
+		TagName:         tag,
+	}
+
+	span.SetAttributes(attribute.String("autocompleteReq", fmt.Sprint(autocompleteReq)))
+
+	return fetcher.Fetch(ctx, autocompleteReq, cb)
+}
+
+func (e *Engine) ExecuteTagNames(
+	ctx context.Context,
+	scope AttributeScope,
+	conditionGroups [][]Condition,
+	cb FetchTagsCallback,
+	fetcher TagNamesFetcher,
+) error {
+	ctx, span := tracer.Start(ctx, "traceql.Engine.ExecuteTagNames")
+	defer span.End()
+
+	autocompleteReq := FetchTagsRequest{
+		ConditionGroups: conditionGroups,
+		Scope:           scope,
+	}
+
+	span.SetAttributes(attribute.String("autocompleteReq", fmt.Sprint(autocompleteReq)))
+
+	return fetcher.Fetch(ctx, autocompleteReq, cb)
+}
+
+func asTraceSearchMetadata(spanset *Spanset) *tempopb.TraceSearchMetadata {
+	metadata := &tempopb.TraceSearchMetadata{
+		TraceID:           util.TraceIDToHexString(spanset.TraceID),
+		RootServiceName:   spanset.RootServiceName,
+		RootTraceName:     spanset.RootSpanName,
+		StartTimeUnixNano: spanset.StartTimeUnixNanos,
+		DurationMs:        uint32(spanset.DurationNanos / 1_000_000),
+		ServiceStats:      make(map[string]*tempopb.ServiceStats, len(spanset.ServiceStats)),
+		SpanSet:           &tempopb.SpanSet{},
+	}
+
+	for service, stats := range spanset.ServiceStats {
+		metadata.ServiceStats[service] = &tempopb.ServiceStats{
+			SpanCount:  stats.SpanCount,
+			ErrorCount: stats.ErrorCount,
+		}
+	}
+
+	for _, span := range spanset.Spans {
+		tempopbSpan := &tempopb.Span{
+			SpanID:            util.SpanIDToHexString(span.ID()),
+			StartTimeUnixNano: span.StartTimeUnixNanos(),
+			DurationNanos:     span.DurationNanos(),
+			Attributes:        nil,
+		}
+
+		atts := span.AllAttributes()
+
+		if name, ok := atts[NewIntrinsic(IntrinsicName)]; ok {
+			tempopbSpan.Name = name.EncodeToString(false)
+		}
+
+		for attribute, static := range atts {
+			if attribute.Intrinsic == IntrinsicName ||
+				attribute.Intrinsic == IntrinsicDuration ||
+				attribute.Intrinsic == IntrinsicTraceDuration ||
+				attribute.Intrinsic == IntrinsicTraceRootService ||
+				attribute.Intrinsic == IntrinsicTraceRootSpan ||
+				attribute.Intrinsic == IntrinsicTraceID ||
+				attribute.Intrinsic == IntrinsicSpanID {
+
+				continue
+			}
+
+			staticAnyValue := static.AsAnyValue()
+
+			keyValue := &common_v1.KeyValue{
+				Key:   attribute.Name,
+				Value: staticAnyValue,
+			}
+
+			tempopbSpan.Attributes = append(tempopbSpan.Attributes, keyValue)
+		}
+
+		metadata.SpanSet.Spans = append(metadata.SpanSet.Spans, tempopbSpan)
+	}
+
+	// create a new slice and add the spanset to it. eventually we will deprecate
+	//  metadata.SpanSet. populating both the SpanSet and the []SpanSets is for
+	//  backwards compatibility with Grafana. since this method only translates one
+	//  spanset into a TraceSearchMetadata Spansets[0] == Spanset. Higher up the chain
+	//  we will combine Spansets with the same trace id.
+	metadata.SpanSets = []*tempopb.SpanSet{metadata.SpanSet}
+
+	// add attributes
+	for _, att := range spanset.Attributes {
+		if att.Name == attributeMatched {
+			if n, ok := att.Val.Int(); ok {
+				metadata.SpanSet.Matched = uint32(n)
+			}
+			continue
+		}
+
+		staticAnyValue := att.Val.AsAnyValue()
+		keyValue := &common_v1.KeyValue{
+			Key:   att.Name,
+			Value: staticAnyValue,
+		}
+		metadata.SpanSet.Attributes = append(metadata.SpanSet.Attributes, keyValue)
+	}
+
+	return metadata
+}
+
+func unixSecToNano(ts uint32) uint64 {
+	return uint64(ts) * uint64(time.Second/time.Nanosecond)
+}
+
+func (s Static) AsAnyValue() *common_v1.AnyValue {
+	switch s.Type {
+	case TypeInt:
+		n, _ := s.Int()
+		return &common_v1.AnyValue{
+			Value: &common_v1.AnyValue_IntValue{
+				IntValue: int64(n),
+			},
+		}
+	case TypeFloat:
+		return &common_v1.AnyValue{
+			Value: &common_v1.AnyValue_DoubleValue{
+				DoubleValue: s.Float(),
+			},
+		}
+	case TypeBoolean:
+		b, _ := s.Bool()
+		return &common_v1.AnyValue{
+			Value: &common_v1.AnyValue_BoolValue{
+				BoolValue: b,
+			},
+		}
+	case TypeDuration:
+		d, _ := s.Duration()
+		return &common_v1.AnyValue{
+			Value: &common_v1.AnyValue_StringValue{
+				StringValue: d.String(),
+			},
+		}
+	case TypeString, TypeStatus, TypeNil, TypeKind:
+		return &common_v1.AnyValue{
+			Value: &common_v1.AnyValue_StringValue{
+				StringValue: s.EncodeToString(false),
+			},
+		}
+	case TypeIntArray:
+		ints, _ := s.IntArray()
+
+		anyInts := make([]common_v1.AnyValue_IntValue, len(ints))
+		anyVals := make([]common_v1.AnyValue, len(ints))
+		anyArray := common_v1.ArrayValue{
+			Values: make([]*common_v1.AnyValue, len(ints)),
+		}
+		for i, n := range ints {
+			anyInts[i].IntValue = int64(n)
+			anyVals[i].Value = &anyInts[i]
+			anyArray.Values[i] = &anyVals[i]
+		}
+
+		return &common_v1.AnyValue{Value: &common_v1.AnyValue_ArrayValue{ArrayValue: &anyArray}}
+	case TypeFloatArray:
+		floats, _ := s.FloatArray()
+
+		anyDouble := make([]common_v1.AnyValue_DoubleValue, len(floats))
+		anyVals := make([]common_v1.AnyValue, len(floats))
+		anyArray := common_v1.ArrayValue{
+			Values: make([]*common_v1.AnyValue, len(floats)),
+		}
+		for i, f := range floats {
+			anyDouble[i].DoubleValue = f
+			anyVals[i].Value = &anyDouble[i]
+			anyArray.Values[i] = &anyVals[i]
+		}
+
+		return &common_v1.AnyValue{Value: &common_v1.AnyValue_ArrayValue{ArrayValue: &anyArray}}
+	case TypeStringArray:
+		strs, _ := s.StringArray()
+
+		anyStrs := make([]common_v1.AnyValue_StringValue, len(strs))
+		anyVals := make([]common_v1.AnyValue, len(strs))
+		anyArray := common_v1.ArrayValue{
+			Values: make([]*common_v1.AnyValue, len(strs)),
+		}
+		for i, str := range strs {
+			anyStrs[i].StringValue = str
+			anyVals[i].Value = &anyStrs[i]
+			anyArray.Values[i] = &anyVals[i]
+		}
+
+		return &common_v1.AnyValue{Value: &common_v1.AnyValue_ArrayValue{ArrayValue: &anyArray}}
+	case TypeBooleanArray:
+		bools, _ := s.BooleanArray()
+
+		anyBools := make([]common_v1.AnyValue_BoolValue, len(bools))
+		anyVals := make([]common_v1.AnyValue, len(bools))
+		anyArray := common_v1.ArrayValue{
+			Values: make([]*common_v1.AnyValue, len(bools)),
+		}
+		for i, b := range bools {
+			anyBools[i].BoolValue = b
+			anyVals[i].Value = &anyBools[i]
+			anyArray.Values[i] = &anyVals[i]
+		}
+
+		return &common_v1.AnyValue{Value: &common_v1.AnyValue_ArrayValue{ArrayValue: &anyArray}}
+	default:
+		return &common_v1.AnyValue{
+			Value: &common_v1.AnyValue_StringValue{
+				StringValue: fmt.Sprintf("error formatting val: static has unexpected type %v", s.Type),
+			},
+		}
+	}
+}
+
+func StaticFromAnyValue(a *common_v1.AnyValue) Static {
+	switch v := a.Value.(type) {
+	case *common_v1.AnyValue_StringValue:
+		return NewStaticString(v.StringValue)
+	case *common_v1.AnyValue_IntValue:
+		return NewStaticInt(int(v.IntValue))
+	case *common_v1.AnyValue_BoolValue:
+		return NewStaticBool(v.BoolValue)
+	case *common_v1.AnyValue_DoubleValue:
+		return NewStaticFloat(v.DoubleValue)
+	default:
+		return NewStaticNil()
+	}
+}

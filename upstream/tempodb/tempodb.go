@@ -1,0 +1,1003 @@
+package tempodb
+
+import (
+	"bytes"
+	"context"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"sync"
+	"time"
+
+	"github.com/grafana/tempo/pkg/collector"
+	"github.com/grafana/tempo/pkg/util"
+	"go.opentelemetry.io/otel/attribute"
+
+	gkLog "github.com/go-kit/log"
+	"github.com/go-kit/log/level"
+	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+
+	"github.com/grafana/dskit/user"
+	"github.com/grafana/tempo/modules/cache/memcached"
+	"github.com/grafana/tempo/modules/cache/redis"
+	"github.com/grafana/tempo/pkg/cache"
+	"github.com/grafana/tempo/pkg/tempopb"
+	"github.com/grafana/tempo/pkg/traceql"
+	"github.com/grafana/tempo/pkg/util/log"
+	"github.com/grafana/tempo/tempodb/backend"
+	"github.com/grafana/tempo/tempodb/backend/azure"
+	backend_cache "github.com/grafana/tempo/tempodb/backend/cache"
+	"github.com/grafana/tempo/tempodb/backend/gcs"
+	"github.com/grafana/tempo/tempodb/backend/local"
+	"github.com/grafana/tempo/tempodb/backend/s3"
+	"github.com/grafana/tempo/tempodb/blocklist"
+	"github.com/grafana/tempo/tempodb/encoding"
+	"github.com/grafana/tempo/tempodb/encoding/common"
+	"github.com/grafana/tempo/tempodb/pool"
+	"github.com/grafana/tempo/tempodb/wal"
+)
+
+const (
+	// BlockIDMin is the minimum possible value for a block id as a string
+	BlockIDMin = "00000000-0000-0000-0000-000000000000"
+	// BlockIDMax is the maximum possible value for a block id as a string
+	BlockIDMax = "FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF"
+)
+
+var (
+	metricRetentionDuration = promauto.NewHistogram(prometheus.HistogramOpts{
+		Namespace:                       "tempodb",
+		Name:                            "retention_duration_seconds",
+		Help:                            "Records the amount of time to perform retention tasks.",
+		Buckets:                         prometheus.ExponentialBuckets(.25, 2, 6),
+		NativeHistogramBucketFactor:     1.1,
+		NativeHistogramMaxBucketNumber:  100,
+		NativeHistogramMinResetDuration: 1 * time.Hour,
+	})
+	metricRetentionErrors = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: "tempodb",
+		Name:      "retention_errors_total",
+		Help:      "Total number of times an error occurred while performing retention tasks.",
+	})
+	metricMarkedForDeletion = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: "tempodb",
+		Name:      "retention_marked_for_deletion_total",
+		Help:      "Total number of blocks marked for deletion.",
+	})
+	metricDeleted = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: "tempodb",
+		Name:      "retention_deleted_total",
+		Help:      "Total number of blocks deleted.",
+	})
+)
+
+type Writer interface {
+	WriteBlock(ctx context.Context, block WriteableBlock) error
+	CompleteBlock(ctx context.Context, block common.WALBlock) (common.BackendBlock, error)
+	CompleteBlockWithBackend(ctx context.Context, block common.WALBlock, r backend.Reader, w backend.Writer) (common.BackendBlock, error)
+	DeleteNoCompactFlag(ctx context.Context, tenantID string, blockID backend.UUID) error
+	WAL() *wal.WAL
+}
+
+type IterateObjectCallback func(id common.ID, obj []byte) bool
+
+type Reader interface {
+	Find(ctx context.Context, tenantID string, id common.ID, blockStart string, blockEnd string, timeStart, timeEnd time.Time, opts common.SearchOptions) ([]*tempopb.TraceByIDResponse, []error, error)
+	Search(ctx context.Context, meta *backend.BlockMeta, req *tempopb.SearchRequest, opts common.SearchOptions) (*tempopb.SearchResponse, error)
+	SearchTags(ctx context.Context, meta *backend.BlockMeta, req *tempopb.SearchTagsBlockRequest, opts common.SearchOptions) (*tempopb.SearchTagsV2Response, error)
+	SearchTagValues(ctx context.Context, meta *backend.BlockMeta, req *tempopb.SearchTagValuesBlockRequest, opts common.SearchOptions) (*tempopb.SearchTagValuesResponse, error)
+	SearchTagValuesV2(ctx context.Context, meta *backend.BlockMeta, req *tempopb.SearchTagValuesRequest, opts common.SearchOptions) (*tempopb.SearchTagValuesV2Response, error)
+
+	// TODO(suraj): use common.MetricsCallback in Fetch and remove the Stats callback from traceql.FetchSpansResponse
+	Fetch(ctx context.Context, meta *backend.BlockMeta, req traceql.FetchSpansRequest, opts common.SearchOptions) (traceql.FetchSpansResponse, error)
+	FetchSpans(ctx context.Context, meta *backend.BlockMeta, req traceql.FetchSpansRequest, opts common.SearchOptions) (traceql.FetchSpansOnlyResponse, error)
+	FetchTagValues(ctx context.Context, meta *backend.BlockMeta, req traceql.FetchTagValuesRequest, cb traceql.FetchTagValuesCallback, mcb common.MetricsCallback, opts common.SearchOptions) error
+	FetchTagNames(ctx context.Context, meta *backend.BlockMeta, req traceql.FetchTagsRequest, cb traceql.FetchTagsCallback, mcb common.MetricsCallback, opts common.SearchOptions) error
+
+	BlockMeta(ctx context.Context, tenantID string, blockID backend.UUID) (*backend.BlockMeta, *backend.CompactedBlockMeta, error)
+	BlockMetas(tenantID string) []*backend.BlockMeta
+
+	Tenants() []string
+
+	// EnablePolling in the background of the blocklists, with the given ownership of tenants.
+	EnablePolling(ctx context.Context, sharder blocklist.JobSharder, skipNoCompactBlocks bool)
+
+	// PollNow does an immediate poll of the blocklist and is for testing purposes. Must have already called EnablePolling.
+	PollNow(ctx context.Context)
+
+	// PollNotification returns a channel that will be closed when the blocklist
+	// is updated.  The received context is used as the parent, to avoid
+	// deadlocks.
+	PollNotification(ctx context.Context) <-chan struct{}
+
+	Shutdown()
+}
+
+type Compactor interface {
+	EnableCompaction(ctx context.Context, cfg *CompactorConfig, sharder CompactorSharder, overrides CompactorOverrides) error
+	MarkBlockCompacted(tenantID string, blockID backend.UUID) error
+	CompactWithConfig(ctx context.Context, metas []*backend.BlockMeta, tenantID string, cfg *CompactorConfig, sharder CompactorSharder, overrides CompactorOverrides) ([]*backend.BlockMeta, error)
+	MarkBlocklistCompacted(tenantID string, outputIDs, inputIDs []*backend.BlockMeta) error
+	RetainWithConfig(ctx context.Context, cfg *CompactorConfig, sharder CompactorSharder, overrides CompactorOverrides)
+	RetainTenantWithConfig(ctx context.Context, tenantID string, cfg *CompactorConfig, sharder CompactorSharder, overrides CompactorOverrides)
+
+	RedactBlock(ctx context.Context, meta *backend.BlockMeta, tenantID string, traceIDs []common.ID, query string, mode tempopb.RedactionMode, window RedactionWindow) (rewrote bool, found int, newMeta *backend.BlockMeta, err error)
+}
+
+type CompactorSharder interface {
+	Owns(hash string) bool
+	RecordDiscardedSpans(count int, tenantID string, traceID string, rootSpanName string, rootServiceName string)
+}
+
+type CompactorOverrides interface {
+	BlockRetentionForTenant(tenantID string) time.Duration
+	CompactionDisabledForTenant(tenantID string) bool
+	MaxBytesPerTraceForTenant(tenantID string) int
+	MaxCompactionRangeForTenant(tenantID string) time.Duration
+}
+
+type WriteableBlock interface {
+	BlockMeta() *backend.BlockMeta
+	Write(ctx context.Context, w backend.Writer) error
+}
+
+var _ Reader = (*readerWriter)(nil)
+
+type readerWriter struct {
+	r backend.Reader
+	w backend.Writer
+	c backend.Compactor
+
+	cacheProvider cache.Provider
+
+	wal  *wal.WAL
+	pool *pool.Pool
+
+	logger gkLog.Logger
+	cfg    *Config
+
+	blocklistPoller *blocklist.Poller
+	blocklist       *blocklist.List
+
+	compactorCfg          *CompactorConfig
+	compactorSharder      CompactorSharder
+	compactorOverrides    CompactorOverrides
+	compactorTenantOffset uint
+
+	pollerShutdownCh chan struct{}
+
+	pollerNotificationLock  sync.Mutex
+	pollerNotificationFuncs []func()
+}
+
+// New creates a new tempodb
+func New(cfg *Config, cacheProvider cache.Provider, logger gkLog.Logger) (Reader, Writer, Compactor, error) {
+	var rawR backend.RawReader
+	var rawW backend.RawWriter
+	var c backend.Compactor
+
+	err := validateConfig(cfg)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("invalid config while creating tempodb: %w", err)
+	}
+
+	switch cfg.Backend {
+	case backend.Local:
+		rawR, rawW, c, err = local.New(cfg.Local)
+	case backend.GCS:
+		rawR, rawW, c, err = gcs.New(cfg.GCS)
+	case backend.S3:
+		rawR, rawW, c, err = s3.New(cfg.S3)
+	case backend.Azure:
+		rawR, rawW, c, err = azure.New(cfg.Azure)
+	default:
+		err = fmt.Errorf("unknown backend %s", cfg.Backend)
+	}
+
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	// build a caching layer if we have a provider
+	if cacheProvider != nil {
+		legacyCache, roles, err := createLegacyCache(cfg, logger)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+
+		// inject legacy cache into the cache provider for the roles
+		for _, role := range roles {
+			err = cacheProvider.AddCache(role, legacyCache)
+			if err != nil {
+				return nil, nil, nil, fmt.Errorf("error adding legacy cache to provider: %w", err)
+			}
+		}
+
+		rawR, rawW, err = backend_cache.NewCache(&cfg.BloomCacheCfg, rawR, rawW, cacheProvider, logger)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+	}
+
+	r := backend.NewReader(rawR)
+	w := backend.NewWriter(rawW)
+	rw := &readerWriter{
+		c:                       c,
+		r:                       r,
+		w:                       w,
+		cacheProvider:           cacheProvider,
+		cfg:                     cfg,
+		logger:                  logger,
+		pool:                    pool.NewPool(cfg.Pool),
+		blocklist:               blocklist.New(),
+		pollerNotificationFuncs: make([]func(), 0),
+	}
+
+	rw.wal, err = wal.New(rw.cfg.WAL)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	return rw, rw, rw, nil
+}
+
+func (rw *readerWriter) WriteBlock(ctx context.Context, c WriteableBlock) error {
+	return c.Write(ctx, rw.w)
+}
+
+// CompleteBlock iterates the given WAL block and flushes it to the TempoDB backend.
+func (rw *readerWriter) CompleteBlock(ctx context.Context, block common.WALBlock) (common.BackendBlock, error) {
+	return rw.CompleteBlockWithBackend(ctx, block, rw.r, rw.w)
+}
+
+// CompleteBlockWithBackend iterates the given WAL block but flushes it to the given backend instead of the default TempoDB backend. The
+// new block will have the same ID as the input block.
+func (rw *readerWriter) CompleteBlockWithBackend(ctx context.Context, block common.WALBlock, r backend.Reader, w backend.Writer) (common.BackendBlock, error) {
+	// The destination block format:
+	vers, err := encoding.FromVersionForWrites(rw.cfg.Block.Version)
+	if err != nil {
+		return nil, err
+	}
+
+	// force flush anything left in the wal
+	err = block.Flush()
+	if err != nil {
+		return nil, fmt.Errorf("error flushing wal block: %w", err)
+	}
+
+	iter, err := block.Iterator(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer iter.Close()
+
+	walMeta := block.BlockMeta()
+
+	inMeta := &backend.BlockMeta{
+		// From the wal block
+		TenantID:         walMeta.TenantID,
+		BlockID:          walMeta.BlockID,
+		TotalObjects:     walMeta.TotalObjects,
+		StartTime:        walMeta.StartTime,
+		EndTime:          walMeta.EndTime,
+		DedicatedColumns: walMeta.DedicatedColumns,
+	}
+
+	newMeta, err := vers.CreateBlock(ctx, rw.cfg.Block, inMeta, iter, r, w)
+	if err != nil {
+		return nil, fmt.Errorf("error creating block: %w", err)
+	}
+
+	backendBlock, err := encoding.OpenBlock(newMeta, r)
+	if err != nil {
+		return nil, fmt.Errorf("error opening new block: %w", err)
+	}
+
+	return backendBlock, nil
+}
+
+func (rw *readerWriter) DeleteNoCompactFlag(ctx context.Context, tenantID string, blockID backend.UUID) error {
+	return rw.w.DeleteNoCompactFlag(ctx, uuid.UUID(blockID), tenantID)
+}
+
+func (rw *readerWriter) WAL() *wal.WAL {
+	return rw.wal
+}
+
+func (rw *readerWriter) BlockMeta(ctx context.Context, tenantID string, blockID backend.UUID) (*backend.BlockMeta, *backend.CompactedBlockMeta, error) {
+	meta, err := rw.r.BlockMeta(ctx, uuid.UUID(blockID), tenantID)
+	if err != nil && !errors.Is(err, backend.ErrDoesNotExist) {
+		return nil, nil, err
+	}
+
+	if meta != nil {
+		return meta, nil, nil
+	}
+
+	compactedMeta, err := rw.c.CompactedBlockMeta(uuid.UUID(blockID), tenantID)
+	if err != nil && !errors.Is(err, backend.ErrDoesNotExist) {
+		return nil, nil, err
+	}
+
+	return nil, compactedMeta, nil
+}
+
+func (rw *readerWriter) BlockMetas(tenantID string) []*backend.BlockMeta {
+	return rw.blocklist.Metas(tenantID)
+}
+
+func (rw *readerWriter) Tenants() []string {
+	return rw.blocklist.Tenants()
+}
+
+func (rw *readerWriter) Find(ctx context.Context, tenantID string, id common.ID, blockStart string, blockEnd string, timeStart, timeEnd time.Time, opts common.SearchOptions) ([]*tempopb.TraceByIDResponse, []error, error) {
+	// tracing instrumentation
+	logger := log.WithContext(ctx, log.Logger)
+	ctx, span := tracer.Start(ctx, "store.Find")
+	defer span.End()
+
+	blockStartUUID, err := uuid.Parse(blockStart)
+	if err != nil {
+		return nil, nil, err
+	}
+	blockStartBytes, err := blockStartUUID.MarshalBinary()
+	if err != nil {
+		return nil, nil, err
+	}
+	blockEndUUID, err := uuid.Parse(blockEnd)
+	if err != nil {
+		return nil, nil, err
+	}
+	blockEndBytes, err := blockEndUUID.MarshalBinary()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// gather appropriate blocks
+	blocklist := rw.blocklist.Metas(tenantID)
+	compactedBlocklist := rw.blocklist.CompactedMetas(tenantID)
+	copiedBlocklist := make([]interface{}, 0, len(blocklist))
+	blocksSearched := 0
+	compactedBlocksSearched := 0
+
+	for _, b := range blocklist {
+		if includeBlock(b, id, blockStartBytes, blockEndBytes, timeStart, timeEnd) {
+			copiedBlocklist = append(copiedBlocklist, b)
+			blocksSearched++
+		}
+	}
+	for _, c := range compactedBlocklist {
+		if includeCompactedBlock(c, id, blockStartBytes, blockEndBytes, rw.cfg.BlocklistPoll, timeStart, timeEnd) {
+			copiedBlocklist = append(copiedBlocklist, &c.BlockMeta)
+			compactedBlocksSearched++
+		}
+	}
+	if len(copiedBlocklist) == 0 {
+		return nil, nil, nil
+	}
+
+	if rw.cfg != nil && rw.cfg.Search != nil {
+		rw.cfg.Search.ApplyToOptions(&opts)
+	}
+
+	partialTraces, funcErrs, err := rw.pool.RunJobs(ctx, copiedBlocklist, func(ctx context.Context, payload interface{}) (interface{}, error) {
+		meta := payload.(*backend.BlockMeta)
+		block, err := encoding.OpenBlock(meta, rw.r)
+		if err != nil {
+			return nil, fmt.Errorf("error opening block for reading, blockID: %s: %w", meta.BlockID.String(), err)
+		}
+
+		foundObject, err := block.FindTraceByID(ctx, id, opts)
+		if err != nil {
+			if errors.Is(err, util.ErrUnsupported) {
+				return nil, nil
+			}
+			return nil, fmt.Errorf("error finding trace by id, blockID: %s: %w", meta.BlockID.String(), err)
+		}
+
+		level.Debug(logger).Log("msg", "searching for trace in block", "findTraceID", hex.EncodeToString(id), "block", meta.BlockID, "found", foundObject != nil)
+		return foundObject, nil
+	})
+
+	partialTraceObjs := make([]*tempopb.TraceByIDResponse, 0)
+	for i := range partialTraces {
+		if trace, ok := partialTraces[i].(*tempopb.TraceByIDResponse); ok {
+			if trace == nil {
+				continue
+			}
+			partialTraceObjs = append(partialTraceObjs, trace)
+		}
+	}
+
+	span.SetAttributes(attribute.Int("blockErrs", len(funcErrs)))
+	span.SetAttributes(attribute.Int("liveBlocks", len(blocklist)))
+	span.SetAttributes(attribute.Int("liveBlocksSearched", blocksSearched))
+	span.SetAttributes(attribute.Int("compactedBlocks", len(compactedBlocklist)))
+	span.SetAttributes(attribute.Int("compactedBlocksSearched", compactedBlocksSearched))
+
+	return partialTraceObjs, funcErrs, err
+}
+
+// Search the given block.  This method takes the pre-loaded block meta instead of a block ID, which
+// eliminates a read per search request.
+func (rw *readerWriter) Search(ctx context.Context, meta *backend.BlockMeta, req *tempopb.SearchRequest, opts common.SearchOptions) (*tempopb.SearchResponse, error) {
+	block, err := encoding.OpenBlock(meta, rw.r)
+	if err != nil {
+		return nil, err
+	}
+
+	rw.cfg.Search.ApplyToOptions(&opts)
+	return block.Search(ctx, req, opts)
+}
+
+func (rw *readerWriter) SearchTags(ctx context.Context, meta *backend.BlockMeta, req *tempopb.SearchTagsBlockRequest, opts common.SearchOptions) (*tempopb.SearchTagsV2Response, error) {
+	scope := req.SearchReq.Scope
+	attributeScope := traceql.AttributeScopeFromString(scope)
+
+	if attributeScope == traceql.AttributeScopeUnknown {
+		return nil, fmt.Errorf("unknown scope: %s", scope)
+	}
+
+	block, err := encoding.OpenBlock(meta, rw.r)
+	if err != nil {
+		return nil, err
+	}
+
+	distinctValues := collector.NewScopedDistinctString(0, req.SearchReq.MaxTagsPerScope, req.SearchReq.StaleValuesThreshold)
+	mc := collector.NewMetricsCollector()
+
+	rw.cfg.Search.ApplyToOptions(&opts)
+	err = block.SearchTags(ctx, attributeScope, func(s string, scope traceql.AttributeScope) {
+		distinctValues.Collect(scope.String(), s)
+	}, mc.Add, opts)
+	if err != nil {
+		return nil, err
+	}
+
+	orgID, _ := user.ExtractOrgID(ctx)
+	if distinctValues.Exceeded() {
+		level.Warn(log.Logger).Log("msg", "Search tags exceeded limit, reduce cardinality or size of tags", "orgID", orgID, "stopReason", distinctValues.StopReason())
+	}
+
+	// build response
+	collected := distinctValues.Strings()
+	resp := &tempopb.SearchTagsV2Response{
+		Scopes:  make([]*tempopb.SearchTagsV2Scope, 0, len(collected)),
+		Metrics: &tempopb.MetadataMetrics{InspectedBytes: mc.TotalValue()},
+	}
+	for scope, vals := range collected {
+		resp.Scopes = append(resp.Scopes, &tempopb.SearchTagsV2Scope{
+			Name: scope,
+			Tags: vals,
+		})
+	}
+
+	return resp, nil
+}
+
+func (rw *readerWriter) SearchTagValues(ctx context.Context, meta *backend.BlockMeta, req *tempopb.SearchTagValuesBlockRequest, opts common.SearchOptions) (response *tempopb.SearchTagValuesResponse, err error) {
+	block, err := encoding.OpenBlock(meta, rw.r)
+	if err != nil {
+		return &tempopb.SearchTagValuesResponse{}, err
+	}
+
+	dv := collector.NewDistinctString(0, req.SearchReq.MaxTagValues, req.SearchReq.StaleValueThreshold)
+	mc := collector.NewMetricsCollector()
+	rw.cfg.Search.ApplyToOptions(&opts)
+	err = block.SearchTagValues(ctx, req.SearchReq.TagName, dv.Collect, mc.Add, opts)
+
+	orgID, _ := user.ExtractOrgID(ctx)
+	if dv.Exceeded() {
+		level.Warn(log.Logger).Log("msg", "Search tags exceeded limit, reduce cardinality or size of tags", "orgID", orgID, "stopReason", dv.StopReason())
+	}
+
+	return &tempopb.SearchTagValuesResponse{
+		TagValues: dv.Strings(),
+		Metrics:   &tempopb.MetadataMetrics{InspectedBytes: mc.TotalValue()},
+	}, err
+}
+
+func (rw *readerWriter) SearchTagValuesV2(ctx context.Context, meta *backend.BlockMeta, req *tempopb.SearchTagValuesRequest, opts common.SearchOptions) (*tempopb.SearchTagValuesV2Response, error) {
+	block, err := encoding.OpenBlock(meta, rw.r)
+	if err != nil {
+		return nil, err
+	}
+
+	tag, err := traceql.ParseIdentifier(req.TagName)
+	if err != nil {
+		return nil, err
+	}
+
+	dv := collector.NewDistinctValue(0, req.MaxTagValues, req.StaleValueThreshold, func(v tempopb.TagValue) int { return len(v.Type) + len(v.Value) })
+	mc := collector.NewMetricsCollector()
+	rw.cfg.Search.ApplyToOptions(&opts)
+	err = block.SearchTagValuesV2(ctx, tag, traceql.MakeCollectTagValueFunc(dv.Collect), mc.Add, opts)
+	if err != nil {
+		return nil, err
+	}
+
+	orgID, _ := user.ExtractOrgID(ctx)
+	if dv.Exceeded() {
+		level.Warn(log.Logger).Log("msg", "Search tags exceeded limit, reduce cardinality or size of tags", "orgID", orgID, "stopReason", dv.StopReason())
+	}
+
+	resp := &tempopb.SearchTagValuesV2Response{
+		Metrics: &tempopb.MetadataMetrics{InspectedBytes: mc.TotalValue()},
+	}
+	for _, v := range dv.Values() {
+		v2 := v
+		resp.TagValues = append(resp.TagValues, &v2)
+	}
+
+	return resp, nil
+}
+
+// Fetch only uses rw.r which has caching enabled
+func (rw *readerWriter) Fetch(ctx context.Context, meta *backend.BlockMeta, req traceql.FetchSpansRequest, opts common.SearchOptions) (traceql.FetchSpansResponse, error) {
+	block, err := encoding.OpenBlock(meta, rw.r)
+	if err != nil {
+		return traceql.FetchSpansResponse{}, err
+	}
+
+	rw.cfg.Search.ApplyToOptions(&opts)
+	return block.Fetch(ctx, req, opts)
+}
+
+func (rw *readerWriter) FetchSpans(ctx context.Context, meta *backend.BlockMeta, req traceql.FetchSpansRequest, opts common.SearchOptions) (traceql.FetchSpansOnlyResponse, error) {
+	block, err := encoding.OpenBlock(meta, rw.r)
+	if err != nil {
+		return traceql.FetchSpansOnlyResponse{}, err
+	}
+
+	rw.cfg.Search.ApplyToOptions(&opts)
+	return block.FetchSpans(ctx, req, opts)
+}
+
+func (rw *readerWriter) FetchTagValues(ctx context.Context, meta *backend.BlockMeta, req traceql.FetchTagValuesRequest, cb traceql.FetchTagValuesCallback, mcb common.MetricsCallback, opts common.SearchOptions) error {
+	block, err := encoding.OpenBlock(meta, rw.r)
+	if err != nil {
+		return err
+	}
+
+	rw.cfg.Search.ApplyToOptions(&opts)
+	return block.FetchTagValues(ctx, req, cb, mcb, opts)
+}
+
+func (rw *readerWriter) FetchTagNames(ctx context.Context, meta *backend.BlockMeta, req traceql.FetchTagsRequest, cb traceql.FetchTagsCallback, mcb common.MetricsCallback, opts common.SearchOptions) error {
+	block, err := encoding.OpenBlock(meta, rw.r)
+	if err != nil {
+		return err
+	}
+
+	rw.cfg.Search.ApplyToOptions(&opts)
+	return block.FetchTagNames(ctx, req, cb, mcb, opts)
+}
+
+func (rw *readerWriter) Shutdown() {
+	// Closed only by context cancelation when the poller is finished.
+	if rw.pollerShutdownCh != nil {
+		<-rw.pollerShutdownCh
+	}
+	rw.pool.Shutdown()
+	rw.r.Shutdown()
+}
+
+// EnableCompaction activates the compaction/retention loops
+func (rw *readerWriter) EnableCompaction(ctx context.Context, cfg *CompactorConfig, c CompactorSharder, overrides CompactorOverrides) error {
+	// If compactor configuration is not as expected, no need to go any further
+	err := cfg.validate()
+	if err != nil {
+		return err
+	}
+
+	// Set default if needed. This is mainly for tests.
+	if cfg.RetentionConcurrency == 0 {
+		cfg.RetentionConcurrency = DefaultRetentionConcurrency
+	}
+
+	rw.compactorCfg = cfg
+	rw.compactorSharder = c
+	rw.compactorOverrides = overrides
+
+	if rw.cfg.BlocklistPoll == 0 {
+		level.Info(rw.logger).Log("msg", "polling cycle unset. compaction and retention disabled")
+		return nil
+	}
+
+	if cfg != nil {
+		level.Info(rw.logger).Log("msg", "compaction and retention enabled.")
+		go rw.compactionLoop(ctx)
+		go rw.retentionLoop(ctx)
+	}
+
+	return nil
+}
+
+func (rw *readerWriter) MarkBlockCompacted(tenantID string, blockID backend.UUID) error {
+	return rw.c.MarkBlockCompacted(uuid.UUID(blockID), tenantID)
+}
+
+// redactionIDsFromQuery evaluates a TraceQL query against a single open block and returns
+// the set of trace IDs (keyed by raw ID bytes) whose spans satisfy it. The full boolean expression is applied as
+// the fetch second pass, so only truly-matching spansets are returned — a trace is never
+// selected (and therefore never dropped) unless it actually matches the query. Iterating
+// the spanset stream directly avoids the search result-cap that ExecuteSearch imposes.
+//
+// The query must already be validated to the redaction subset (see validateRedactionQuery).
+func redactionIDsFromQuery(ctx context.Context, block common.BackendBlock, query string, window RedactionWindow, opts common.SearchOptions) (map[string]struct{}, error) {
+	// filter is the compiled TraceQL boolean expression (a SpansetFilterFunc), not a
+	// code-eval primitive; it decides whether a spanset satisfies the query.
+	_, _, filter, req, err := traceql.Compile(query)
+	if err != nil {
+		return nil, fmt.Errorf("compiling redaction query: %w", err)
+	}
+
+	// Bound the scan to the redaction window so each block is read only over the requested
+	// range. See RedactionWindow.fetchBounds for why both fetch fields move together.
+	if start, end, ok := window.fetchBounds(); ok {
+		req.StartTimeUnixNanos = start
+		req.EndTimeUnixNanos = end
+	}
+
+	// Request trace-level metadata in the second pass so each returned spanset carries its
+	// TraceID (the first pass only fetches the columns needed to satisfy the conditions).
+	req.SecondPassConditions = traceql.SearchMetaConditionsWithout(req.Conditions, req.AllConditions)
+	req.SecondPass = func(inSS *traceql.Spanset) ([]*traceql.Spanset, error) {
+		if inSS == nil || len(inSS.Spans) == 0 {
+			return nil, nil
+		}
+		return filter([]*traceql.Spanset{inSS})
+	}
+
+	resp, err := block.Fetch(ctx, *req, opts)
+	if err != nil {
+		return nil, fmt.Errorf("fetching spans: %w", err)
+	}
+	defer resp.Results.Close()
+
+	// Collect matches into a single set keyed by the raw trace ID bytes. The map insert
+	// copies the key, so we neither retain a second ID slice nor rebuild a set later; the
+	// set also dedups a trace that appears in more than one spanset. In dry-run the caller
+	// reads len() only, so memory stays bounded to this one set.
+	dropSet := make(map[string]struct{})
+	for {
+		ss, err := resp.Results.Next(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("iterating results: %w", err)
+		}
+		if ss == nil {
+			break
+		}
+		dropSet[string(ss.TraceID)] = struct{}{}
+		if ss.ReleaseFn != nil {
+			ss.ReleaseFn(ss)
+		}
+	}
+	return dropSet, nil
+}
+
+// RedactBlock rewrites a block excluding the traces selected by either an explicit trace ID list or a
+// TraceQL query (never both). If none are present in the block, no rewrite is performed. In dry-run mode
+// it reports the match count without rewriting.
+//
+// window bounds which traces inside the block are candidates; the zero value scans the block in full.
+// It applies to the query selector only — see RedactionWindow — and is refused alongside traceIDs
+// rather than silently ignored. An unusable window is an error, not a scan that matches nothing.
+//
+// On error, found is 0 and newMeta is nil; newMeta is also nil in dry-run mode, where nothing is written.
+func (rw *readerWriter) RedactBlock(ctx context.Context, meta *backend.BlockMeta, tenantID string, traceIDs []common.ID, query string, mode tempopb.RedactionMode, window RedactionWindow) (rewrote bool, found int, newMeta *backend.BlockMeta, err error) {
+	// Refuse a window this block cannot be scanned with, rather than scanning with it and
+	// reporting the empty result as a completed redaction.
+	if err := window.Validate(); err != nil {
+		return false, 0, nil, fmt.Errorf("redaction window for block %s: %w", meta.BlockID.String(), err)
+	}
+
+	// A window cannot scope an explicit trace-ID list: the ID path resolves each trace with no time
+	// bound, so honouring the window here is impossible and accepting it would delete the listed traces
+	// from this block regardless of when their spans occurred. SubmitRedaction refuses the pair at the
+	// API edge, but this is the layer that would do the deleting, and it is reachable by any other
+	// caller of the exported Compactor interface.
+	if len(traceIDs) > 0 && !window.IsZero() {
+		return false, 0, nil, fmt.Errorf("redaction of block %s: a time window cannot be combined with an explicit trace ID list", meta.BlockID.String())
+	}
+
+	block, err := encoding.OpenBlock(meta, rw.r)
+	if err != nil {
+		return false, 0, nil, fmt.Errorf("error opening block for redaction, blockID: %s: %w", meta.BlockID.String(), err)
+	}
+
+	searchOpts := common.DefaultSearchOptions()
+	if rw.cfg != nil && rw.cfg.Search != nil {
+		rw.cfg.Search.ApplyToOptions(&searchOpts)
+	}
+
+	// The selector is either an explicit trace ID list or a TraceQL query, never both
+	// (enforced at submission). Resolve it to the set of trace IDs present in this block,
+	// keyed by raw ID bytes: one structure that dedups, drives the dry-run count, and backs
+	// the O(1) DropObject membership check in the rewrite below.
+	var dropSet map[string]struct{}
+	if query != "" {
+		dropSet, err = redactionIDsFromQuery(ctx, block, query, window, searchOpts)
+		if err != nil {
+			return false, 0, nil, fmt.Errorf("error selecting traces by query in block %s: %w", meta.BlockID.String(), err)
+		}
+	} else {
+		dropSet = make(map[string]struct{}, len(traceIDs))
+		for _, traceID := range traceIDs {
+			result, err := block.FindTraceByID(ctx, traceID, searchOpts)
+			if err != nil {
+				return false, 0, nil, fmt.Errorf("error finding trace in block, blockID: %s: %w", meta.BlockID.String(), err)
+			}
+			if result != nil && result.Trace != nil {
+				dropSet[string(traceID)] = struct{}{}
+			}
+		}
+	}
+	if len(dropSet) == 0 {
+		return false, 0, nil, nil
+	}
+
+	// Dry-run: report how many traces would be dropped without rewriting the block.
+	if mode == tempopb.RedactionMode_REDACTION_MODE_DRY_RUN {
+		return false, len(dropSet), nil, nil
+	}
+
+	enc, err := encoding.FromVersion(meta.Version)
+	if err != nil {
+		return false, 0, nil, fmt.Errorf("error getting encoding for version %s: %w", meta.Version, err)
+	}
+
+	opts := common.CompactionOptions{
+		BlockConfig: common.BlockConfig{
+			BloomFP:             common.DefaultBloomFP,
+			BloomShardSizeBytes: common.DefaultBloomShardSizeBytes,
+			Version:             meta.Version,
+			RowGroupSizeBytes:   100_000_000,
+			DedicatedColumns:    meta.DedicatedColumns,
+		},
+		OutputBlocks:     1,
+		MaxBytesPerTrace: 0,
+		DropObject: func(id common.ID) bool {
+			if _, ok := dropSet[string(id)]; ok {
+				level.Debug(rw.logger).Log("msg", "redact dropping trace", "traceID", hex.EncodeToString(id))
+				return true
+			}
+			return false
+		},
+		BytesWritten:      func(_, _ int) {},
+		ObjectsCombined:   func(_, _ int) {},
+		ObjectsWritten:    func(_, _ int) {},
+		SpansDiscarded:    func(_, _, _ string, _ int) {},
+		DisconnectedTrace: func() {},
+		RootlessTrace:     func() {},
+		DedupedSpans:      func(_, _ int) {},
+	}
+
+	nFound := len(dropSet)
+
+	compactor := enc.NewCompactor(opts)
+	out, err := compactor.Compact(ctx, rw.logger, rw.r, rw.w, []*backend.BlockMeta{meta})
+	if err != nil {
+		return false, 0, nil, fmt.Errorf("error compacting block %s: %w", meta.BlockID.String(), err)
+	}
+
+	if len(out) == 0 {
+		err = rw.c.MarkBlockCompacted(uuid.UUID(meta.BlockID), tenantID)
+		if err != nil {
+			return false, 0, nil, fmt.Errorf("error marking block compacted, blockID: %s: %w", meta.BlockID.String(), err)
+		}
+		return true, nFound, nil, nil
+	}
+
+	if len(out) != 1 {
+		if meta.TotalObjects == int64(nFound) {
+			err = rw.c.MarkBlockCompacted(uuid.UUID(meta.BlockID), tenantID)
+			if err != nil {
+				return false, 0, nil, fmt.Errorf("error marking block compacted, blockID: %s: %w", meta.BlockID.String(), err)
+			}
+			return true, nFound, nil, nil
+		}
+		return false, 0, nil, fmt.Errorf("expected 1 output block, got %d", len(out))
+	}
+
+	err = rw.c.MarkBlockCompacted(uuid.UUID(meta.BlockID), tenantID)
+	if err != nil {
+		return false, 0, nil, fmt.Errorf("error marking block compacted, blockID: %s: %w", meta.BlockID.String(), err)
+	}
+	return true, nFound, out[0], nil
+}
+
+// EnablePolling activates the polling loop. Pass nil if this component
+//
+//	should never be a tenant index builder.
+func (rw *readerWriter) EnablePolling(ctx context.Context, sharder blocklist.JobSharder, skipNoCompactBlocks bool) {
+	if sharder == nil {
+		sharder = blocklist.OwnsNothingSharder
+	}
+
+	if rw.cfg.BlocklistPoll == 0 {
+		rw.cfg.BlocklistPoll = DefaultBlocklistPoll
+	}
+
+	if rw.cfg.BlocklistPollConcurrency == 0 {
+		rw.cfg.BlocklistPollConcurrency = DefaultBlocklistPollConcurrency
+	}
+
+	if rw.cfg.BlocklistPollTenantConcurrency == 0 {
+		rw.cfg.BlocklistPollTenantConcurrency = DefaultBlocklistPollTenantConcurrency
+	}
+
+	if rw.cfg.BlocklistPollTenantIndexBuilders <= 0 {
+		rw.cfg.BlocklistPollTenantIndexBuilders = DefaultTenantIndexBuilders
+	}
+
+	if rw.cfg.EmptyTenantDeletionAge <= 0 {
+		rw.cfg.EmptyTenantDeletionAge = DefaultEmptyTenantDeletionAge
+	}
+
+	level.Info(rw.logger).Log("msg", "polling enabled", "interval", rw.cfg.BlocklistPoll, "blocklist_concurrency", rw.cfg.BlocklistPollConcurrency)
+
+	blocklistPoller := blocklist.NewPoller(&blocklist.PollerConfig{
+		PollConcurrency:            rw.cfg.BlocklistPollConcurrency,
+		PollFallback:               rw.cfg.BlocklistPollFallback,
+		TenantIndexBuilders:        rw.cfg.BlocklistPollTenantIndexBuilders,
+		StaleTenantIndex:           rw.cfg.BlocklistPollStaleTenantIndex,
+		PollJitterMs:               rw.cfg.BlocklistPollJitterMs,
+		TolerateConsecutiveErrors:  rw.cfg.BlocklistPollTolerateConsecutiveErrors,
+		TolerateTenantFailures:     rw.cfg.BlocklistPollTolerateTenantFailures,
+		TenantPollConcurrency:      rw.cfg.BlocklistPollTenantConcurrency,
+		EmptyTenantDeletionAge:     rw.cfg.EmptyTenantDeletionAge,
+		EmptyTenantDeletionEnabled: rw.cfg.EmptyTenantDeletionEnabled,
+		SkipNoCompactBlocks:        skipNoCompactBlocks,
+	}, sharder, rw.r, rw.c, rw.w, rw.logger)
+
+	rw.blocklistPoller = blocklistPoller
+	rw.pollerShutdownCh = make(chan struct{})
+
+	// do the first poll cycle synchronously. this will allow the caller to know
+	// that when this method returns the block list is updated
+	rw.pollBlocklist(ctx)
+
+	go rw.pollingLoop(ctx)
+}
+
+func (rw *readerWriter) PollNow(ctx context.Context) {
+	rw.pollBlocklist(ctx)
+}
+
+// PollNotification returns a context.Done() channel, the closure of which indicates
+// that the blocklist has been updated.  The channel is never written to, but
+// allows waiting more precisely for updated information from the backend.
+func (rw *readerWriter) PollNotification(ctx context.Context) <-chan struct{} {
+	ctx, cancel := context.WithCancel(ctx)
+
+	rw.pollerNotificationLock.Lock()
+	defer rw.pollerNotificationLock.Unlock()
+
+	rw.pollerNotificationFuncs = append(rw.pollerNotificationFuncs, cancel)
+
+	return ctx.Done()
+}
+
+func (rw *readerWriter) pollingLoop(ctx context.Context) {
+	ticker := time.NewTicker(rw.cfg.BlocklistPoll)
+
+	for {
+		select {
+		case <-ctx.Done():
+			close(rw.pollerShutdownCh)
+			return
+		case <-ticker.C:
+			rw.pollBlocklist(ctx)
+		}
+	}
+}
+
+func (rw *readerWriter) pollBlocklist(ctx context.Context) {
+	blocklist, compactedBlocklist, err := rw.blocklistPoller.Do(ctx, rw.blocklist)
+	if err != nil {
+		if ctx.Err() == nil {
+			level.Error(rw.logger).Log("msg", "failed to poll blocklist", "err", err)
+		}
+
+		return
+	}
+
+	rw.blocklist.ApplyPollResults(blocklist, compactedBlocklist)
+
+	rw.pollerNotificationLock.Lock()
+	defer rw.pollerNotificationLock.Unlock()
+
+	for _, fn := range rw.pollerNotificationFuncs {
+		fn()
+	}
+
+	rw.pollerNotificationFuncs = rw.pollerNotificationFuncs[:0]
+}
+
+// includeBlock indicates whether a given block should be included in a backend search
+func includeBlock(b *backend.BlockMeta, _ common.ID, blockStart, blockEnd []byte, timeStart, timeEnd time.Time) bool {
+	// todo: restore this functionality once it works. min/max ids are currently not recorded
+	//    https://github.com/grafana/tempo/issues/1903
+	//  correctly in a block
+	// if bytes.Compare(id, b.MinID) == -1 || bytes.Compare(id, b.MaxID) == 1 {
+	// 	return false
+	// }
+
+	if !timeStart.IsZero() && !timeEnd.IsZero() {
+		if !b.StartTime.Before(timeEnd) || !b.EndTime.After(timeStart) {
+			return false
+		}
+	}
+
+	blockIDBytes, _ := b.BlockID.Marshal()
+	// check block is in shard boundaries
+	// blockStartBytes <= blockIDBytes <= blockEndBytes
+	if bytes.Compare(blockIDBytes, blockStart) == -1 || bytes.Compare(blockIDBytes, blockEnd) == 1 {
+		return false
+	}
+
+	return true
+}
+
+// if block is compacted within lookback period, and is within shard ranges, include it in search
+func includeCompactedBlock(c *backend.CompactedBlockMeta, id common.ID, blockStart, blockEnd []byte, poll time.Duration, timeStart, timeEnd time.Time) bool {
+	lookback := time.Now().Add(-(2 * poll))
+	if c.CompactedTime.Before(lookback) {
+		return false
+	}
+	return includeBlock(&c.BlockMeta, id, blockStart, blockEnd, timeStart, timeEnd)
+}
+
+// createLegacyCache uses the config to return a cache and a list of roles.
+func createLegacyCache(cfg *Config, logger gkLog.Logger) (cache.Cache, []cache.Role, error) {
+	var legacyCache cache.Cache
+	// if there's any cache configured, it always handles bloom filters and the trace id index
+	roles := []cache.Role{cache.RoleBloom, cache.RoleTraceIDIdx}
+
+	switch cfg.Cache {
+	case "redis":
+		var err error
+		legacyCache, err = redis.NewClient(cfg.Redis, cfg.BackgroundCache, "legacy", logger)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to create legacy redis cache: %w", err)
+		}
+	case "memcached":
+		legacyCache = memcached.NewClient(cfg.Memcached, cfg.BackgroundCache, "legacy", logger)
+	}
+
+	if legacyCache == nil {
+		if cfg.Search != nil &&
+			(cfg.Search.CacheControl.ColumnIndex ||
+				cfg.Search.CacheControl.Footer ||
+				cfg.Search.CacheControl.OffsetIndex) {
+			return nil, nil, errors.New("no legacy cache configured, but cache_control is enabled. Please use the new top level cache configuration")
+		}
+
+		return nil, nil, nil
+	}
+
+	// accumulate additional search roles
+	if cfg.Search != nil {
+		if cfg.Search.CacheControl.ColumnIndex {
+			roles = append(roles, cache.RoleParquetColumnIdx)
+		}
+		if cfg.Search.CacheControl.Footer {
+			roles = append(roles, cache.RoleParquetFooter)
+		}
+		if cfg.Search.CacheControl.OffsetIndex {
+			roles = append(roles, cache.RoleParquetOffsetIdx)
+		}
+	}
+
+	// log the roles
+	rolesStr := make([]string, len(roles))
+	for i, role := range roles {
+		rolesStr[i] = string(role)
+	}
+	level.Warn(logger).Log("msg", "legacy cache configured with the following roles. Please migrate to the new top level cache configuration.", "roles", rolesStr)
+
+	return legacyCache, roles, nil
+}

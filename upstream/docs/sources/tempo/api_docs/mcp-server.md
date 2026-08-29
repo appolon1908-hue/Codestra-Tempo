@@ -1,0 +1,98 @@
+---
+title: Tempo MCP server
+description: Grafana Tempo exposes an MCP server to allow LLMs and AI assistants to interact with your trace data.
+menuTitle: MCP server
+weight: 800
+---
+
+# Model Context Protocol (MCP) Server
+
+Tempo includes an MCP (Model Context Protocol) server that provides AI assistants and large language models (LLMs) with direct access to distributed tracing data through TraceQL queries and other endpoints.
+
+For examples on how you can use the MCP server, refer to [LLM-powered insights into your tracing data: introducing MCP support in Grafana Cloud Traces](https://grafana.com/blog/2025/08/13/llm-powered-insights-into-your-tracing-data-introducing-mcp-support-in-grafana-cloud-traces/).
+
+For more information on MCP, refer to the [MCP documentation](https://modelcontextprotocol.io/docs/getting-started/intro).
+
+## Configuration
+
+You can enable the MCP server in your Tempo configuration via YAML:
+
+```yaml
+query_frontend:
+  mcp_server:
+    enabled: true
+```
+
+Or via a command-line flag: `--query-frontend.mcp-server.enabled=true`.
+
+{{< admonition type="warning" >}}
+Be aware that using this feature may cause tracing data to be passed to an LLM or LLM provider. Consider the content of your tracing data and organizational policies when enabling this feature.
+{{< /admonition >}}
+
+The MCP server uses the same authentication and [multi-tenancy](../../operations/manage-advanced-systems/multitenancy/) behavior as other Tempo API endpoints.
+
+## Available tools
+
+The MCP server exposes the following tools that AI assistants can use to interact with your tracing data:
+
+| Tool                      | Description                                                             |
+| ------------------------- | ----------------------------------------------------------------------- |
+| `traceql-search`          | Search for traces using TraceQL queries                                 |
+| `traceql-metrics-instant` | Retrieve a single metric value given a TraceQL metrics query            |
+| `traceql-metrics-range`   | Retrieve a metric series given a TraceQL metrics query                  |
+| `get-trace`               | Retrieve a specific trace by ID                                         |
+| `trace-diff`              | Compare two complete traces and return their differences                |
+| `get-attribute-names`     | Get available attribute names for use in TraceQL queries                |
+| `get-attribute-values`    | Get values for a specific scoped attribute name                         |
+| `docs-traceql`            | Retrieve TraceQL documentation (basic, aggregates, structural, metrics) |
+| `docs-config`             | Retrieve Tempo configuration documentation (overview, reference)        |
+
+### Compare traces
+
+The experimental `trace-diff` tool compares a baseline trace with another complete trace.
+Provide `base_trace_id` and `compare_trace_id`. By default, the tool returns
+`trace-summary-v0-composed`, which always contains a compact summary and includes the full
+span-level patch when the patch is no larger than 64 KiB. The 64 KiB limit applies only
+to the attached patch, not to the complete composed response.
+
+Omit `format` to use the composed response. Set it to `trace-summary-v0-native` to
+return only the compact summary, or to `trace-patch-v0` when you need the complete
+span-level patch. An explicitly empty `format` is invalid. If a composed response
+contains `patchOmitted`, use the summary for initial analysis. Request `trace-patch-v0`
+only when span-level evidence is required and the client can accept a patch of
+`patchOmitted.bytes` bytes. Full patch responses have no output-size guarantee.
+
+The optional `base_start` and `base_end` arguments limit the baseline lookup to an
+RFC3339 time range; both must be provided together. The same rule applies to
+`compare_start` and `compare_end` for the comparison trace. Tempo searches all blocks
+for a trace when its range is omitted. Partial traces are rejected because their
+comparison could be inaccurate.
+
+## Available resources
+
+The MCP server also provides the following resources containing TraceQL and configuration documentation:
+
+| Resource URI                | Description                                                          |
+| --------------------------- | -------------------------------------------------------------------- |
+| `docs://traceql/basic`      | Basic TraceQL syntax, intrinsics, operators, and attributes          |
+| `docs://traceql/aggregates` | TraceQL aggregate functions (count, sum, etc.)                       |
+| `docs://traceql/structural` | Advanced structural query patterns                                   |
+| `docs://traceql/metrics`    | Generating metrics from tracing data with TraceQL                    |
+| `docs://config/overview`    | Orientation map of what each top-level configuration block controls  |
+| `docs://config/reference`   | Complete reference of all configuration options and their defaults   |
+
+## Quick start
+
+To experiment with the MCP server using dummy data and Claude Code:
+
+1. Run the local docker-compose example in `/example/docker-compose/single-binary`. This exposes the MCP server at `http://localhost:3200/api/mcp`
+1. Run `claude mcp add --transport=http tempo http://localhost:3200/api/mcp` to add a reference to Claude Code.
+1. Run `claude` and ask some questions.
+
+The Tempo MCP server uses the Streamable HTTP transport.
+Any MCP client that supports this transport can connect directly using the URL `http://<tempo-host>:<port>/api/mcp`.
+For example, in Cursor you can add the server with `type: "streamableHttp"` in your MCP configuration.
+
+If your client doesn't support Streamable HTTP natively, you can use the [`mcp-remote`](https://www.npmjs.com/package/mcp-remote) package as a bridge.
+
+![Claude Code interacting with the Tempo MCP server](/static/img/docs/tempo/claude-code-tempo-mcp.png)
