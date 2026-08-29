@@ -1,0 +1,43 @@
+name: codestra-tempo
+
+services:
+  tempo:
+    image: ${TEMPO_IMAGE:?TEMPO_IMAGE must be an immutable image digest}
+    restart: unless-stopped
+    user: "10001:10001"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    command:
+      - -config.file=/etc/tempo/tempo.yaml
+      - -config.expand-env=true
+    env_file:
+      - ${TEMPO_RUNTIME_ENV_FILE:?OpenBao must render the Tempo runtime environment file}
+    environment:
+      CODESTRA_ENVIRONMENT: ${CODESTRA_ENVIRONMENT:?set environment}
+    volumes:
+      - ./tempo-codestra.yaml:/etc/tempo/tempo.yaml:ro
+      - tempo_data:/var/tempo
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    networks:
+      - codestra_observability
+    stop_grace_period: 90s
+    deploy:
+      resources:
+        limits:
+          cpus: "4.0"
+          memory: 8G
+        reservations:
+          cpus: "1.0"
+          memory: 2G
+
+volumes:
+  tempo_data:
+
+networks:
+  codestra_observability:
+    external: true
+    name: codestra-observability
