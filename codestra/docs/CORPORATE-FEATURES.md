@@ -2,38 +2,87 @@
 
 ## Mission
 
-Tempo is the distributed tracing authority for Codestra. It connects browser/API activity, edge/gateway processing, Middleware commands, workers, databases and downstream provider calls into one incident path.
+Tempo is the private trace storage, search, service-graph, span-metric and correlation authority for Codestra. It connects browser/API activity, Caddy, Kong, Middleware, Odoo, n8n, workers, PostgreSQL, Redis and approved providers into one operational request path without becoming a business-action system.
 
-## Required path coverage
+## Corporate path coverage
 
-Target traces include frontend/API entry, Caddy, Kong, Middleware, Odoo, n8n, provider adapters, asynchronous workers, PostgreSQL, Redis and other material dependencies. Async work must preserve trace/correlation context where technically possible.
+Target trace paths include:
 
-## Corporate trace contract
+- browser or mobile client to public API;
+- Caddy to Kong to Middleware;
+- Middleware to Odoo and n8n;
+- queues, outbox/inbox and asynchronous workers;
+- PostgreSQL, Redis and other bounded dependencies;
+- approved email, SMS, voice, scraper and external-provider adapters;
+- deployment, capability and reconciliation control paths;
+- Beyvra market-data and order-path health using safe metadata only.
 
-Every trace must carry safe resource attributes for service, version, environment, Codestra business, region and deployment. `correlation_id` remains a first-class application field alongside W3C trace context.
+Async boundaries preserve W3C trace context and a protected `correlation_id` when the protocol supports it.
 
-## Enterprise features
+## Corporate resource contract
 
-- OTLP ingestion;
-- service graphs;
-- span-metric generation support;
-- Grafana trace-to-log and trace-to-metric links;
-- tail sampling that retains errors and high-latency traces;
-- environment-specific trace retention;
-- deployment/version correlation;
-- dependency latency analysis;
-- provider failure tracing;
-- asynchronous queue/worker trace continuity;
-- incident trace search by safe business/service attributes.
+Every accepted trace carries bounded resource attributes:
 
-## Privacy
+- `service.name`
+- `service.namespace`
+- `service.version`
+- `deployment.environment.name`
+- `deployment.id`
+- `cloud.region`
+- `codestra.business`
 
-Never collect Authorization headers, API keys, passwords, private keys, session tokens, raw PII or full sensitive request/response bodies. Instrumentation should record operation names, safe status/error information and timing instead of payloads.
+`codestra.business` is one of the approved Codestra business domains. It is not a customer, user, account or campaign identifier.
 
-## Beyvra trading rule
+Tempo tenant IDs are business domains enforced through `X-Scope-OrgID`. The approved ingress layer must authenticate the workload, overwrite any caller-supplied tenant header, map it to exactly one approved business and deny unknown businesses.
 
-Beyvra traces may show the safe order/request lifecycle, market-data/provider latency, reconciliation and dependency errors. They must never record broker/exchange credentials, signing material, account secrets, raw order payloads or authoritative balances/positions/executions.
+## Corporate features
+
+- OTLP/gRPC and OTLP/HTTP ingestion on private networks;
+- business-level multi-tenancy and deny-by-default cross-business access;
+- S3-compatible Parquet v4 storage with durable local WAL;
+- per-business retention, ingestion, trace-size, query and active-series budgets;
+- TraceQL search and trace-by-ID investigation;
+- service graph generation;
+- span metrics with Prometheus exemplars;
+- Grafana trace-to-metric and trace-to-redacted-log links;
+- deployment/version, region and business correlation;
+- bounded dependency and provider latency analysis;
+- queue/worker and webhook continuity;
+- private readiness and self-metrics endpoints;
+- runtime secret-file credentials and TLS verification;
+- source-native configuration verification against the locked Tempo code.
+
+## Sampling authority
+
+OpenTelemetry, not Tempo, owns sampling. Tail-sampling policy must preserve errors, high latency, security or reconciliation failures and low-rate critical paths while bounding routine successful traffic. Tempo stores the already governed trace stream and does not silently apply a second sampling authority.
+
+## Privacy and cardinality
+
+OpenTelemetry and Alloy redact before Tempo ingestion. Tempo must never receive:
+
+- Authorization, cookie or session headers;
+- passwords, API keys, private keys, client secrets or database DSNs;
+- raw request or response bodies by default;
+- raw payment, lending, email, SMS, voice, identity or customer payloads;
+- broker or exchange credentials and signing material;
+- authoritative balances, positions, executions or ledgers.
+
+Customer IDs, account IDs, user IDs, email addresses, phone numbers, message IDs, order IDs, request IDs, correlation IDs, trace IDs, span IDs, raw URLs, query strings, SQL text, exception messages, container IDs and process IDs are forbidden as tenant IDs and derived-metric dimensions. Trace/span IDs remain protected correlation fields, not labels.
+
+## Retention model
+
+- Default business and platform traces: 30 days.
+- MoneyBee, Beyvra and Provisioning: 60 days.
+- High-volume Kyqra traces: 14 days.
+
+Any increase requires privacy, storage-cost, recovery and legal review. Retention is not a substitute for an audit ledger or business system of record.
+
+## Beyvra trading boundary
+
+Beyvra traces may show safe operation names, aggregate latency, provider health, reconciliation result, market-data freshness and externally effective capability state. Tempo never stores credentials or signing material, never exposes raw order payloads or customer financial state and never receives authority to place, replace, cancel or approve a trade.
 
 ## Release rule
 
-`temp.codestra.media` remains private/internal. Codestra configuration stays outside `upstream/`; merge does not authorize deployment or network exposure.
+The current source candidate is a single-binary test/staging topology because it can be validated against the locked source without inventing an unproven Kafka control plane. Production requires a separately reviewed distributed-HA topology, ingestion failover, query continuity, object-store restore and capacity evidence.
+
+`temp.codestra.media` remains internal/private. Promotion is `feature/* -> development -> test -> staging -> production -> main`. Merge or CI success does not deploy Tempo, expose OTLP publicly or authorize any business mutation.
