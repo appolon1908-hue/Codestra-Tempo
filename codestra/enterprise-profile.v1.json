@@ -1,0 +1,40 @@
+{
+  "schemaVersion": "1.0",
+  "component": "tempo",
+  "role": "distributed-trace-authority",
+  "canonicalHostname": "temp.codestra.media",
+  "exposure": "internal_private",
+  "status": "SOURCE_PREPARED_NOT_DEPLOYED",
+  "businessScope": ["codestra", "moneybee", "beyvra", "breero", "larim-a", "transportation", "booked4seasons", "social", "klyrow", "telnexa", "kyqra", "restaurant", "provisioning"],
+  "requiredResourceAttributes": ["service.name", "service.version", "deployment.environment", "codestra.business", "codestra.region", "codestra.deployment"],
+  "requiredCorrelation": ["trace_id", "span_id", "correlation_id"],
+  "requiredTracePaths": [
+    "frontend-to-api",
+    "caddy-to-kong-to-middleware",
+    "middleware-to-odoo",
+    "middleware-to-n8n",
+    "middleware-to-provider",
+    "worker-and-queue-processing",
+    "database-and-cache-dependencies"
+  ],
+  "features": {
+    "otlpIngestion": true,
+    "serviceGraphSupport": true,
+    "spanMetricsSupport": true,
+    "traceToLogs": true,
+    "traceToMetrics": true,
+    "errorTraceRetention": true,
+    "tailSamplingPolicy": true,
+    "deploymentCorrelation": true
+  },
+  "privacy": {
+    "captureRequestBodies": false,
+    "captureAuthorizationHeaders": false,
+    "captureSecrets": false,
+    "captureRawPii": false
+  },
+  "financialTradingBoundary": {
+    "business": "beyvra",
+    "rule": "Trace the trading request path and provider latency using safe metadata only; never record credentials, signing material, raw order payloads, account secrets or authoritative financial state."
+  }
+}
