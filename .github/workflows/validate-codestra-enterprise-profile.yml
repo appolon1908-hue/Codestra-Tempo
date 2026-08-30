@@ -6,6 +6,7 @@ on:
       - 'codestra/**'
       - 'scripts/validate_codestra_enterprise_profile.py'
       - 'scripts/validate_codestra_corporate_tempo.py'
+      - 'scripts/validate_codestra_profile_privacy.py'
       - '.github/workflows/validate-codestra-enterprise-profile.yml'
       - 'upstream/go.mod'
       - 'upstream/go.sum'
@@ -15,6 +16,7 @@ on:
       - 'codestra/**'
       - 'scripts/validate_codestra_enterprise_profile.py'
       - 'scripts/validate_codestra_corporate_tempo.py'
+      - 'scripts/validate_codestra_profile_privacy.py'
       - '.github/workflows/validate-codestra-enterprise-profile.yml'
       - 'upstream/go.mod'
       - 'upstream/go.sum'
@@ -43,7 +45,15 @@ jobs:
         run: python -m pip install --disable-pip-version-check --no-cache-dir PyYAML==6.0.3
 
       - name: Validate Codestra profile, tenants, privacy, packaging, and runtime policy
-        run: python scripts/validate_codestra_corporate_tempo.py
+        env:
+          PYTHONPYCACHEPREFIX: /tmp/codestra-tempo-pycache
+        run: |
+          python -m py_compile \
+            scripts/validate_codestra_enterprise_profile.py \
+            scripts/validate_codestra_corporate_tempo.py \
+            scripts/validate_codestra_profile_privacy.py
+          python scripts/validate_codestra_profile_privacy.py
+          python scripts/validate_codestra_corporate_tempo.py
 
       - name: Render hardened Compose candidate
         env:
@@ -81,7 +91,9 @@ jobs:
 
       - name: Build Tempo verifier from locked source
         working-directory: upstream
-        run: go build -trimpath -o ../.bin/tempo ./cmd/tempo
+        run: |
+          mkdir -p ../.bin
+          go build -trimpath -o ../.bin/tempo ./cmd/tempo
 
       - name: Verify Tempo configuration with locked source
         env:
@@ -106,3 +118,9 @@ jobs:
         run: |
           test "$(python -c 'import json; print(json.load(open("codestra/enterprise-profile.v1.json"))["status"])')" = "CONFIG_PREPARED_NOT_DEPLOYED"
           test "$(python -c 'import json; print(json.load(open("codestra/enterprise-profile.v1.json"))["topology"]["productionApproved"])')" = "False"
+          python - <<'PY'
+          import json
+          profile = json.load(open('codestra/enterprise-profile.v1.json', encoding='utf-8'))
+          assert profile['exposure'] == 'internal_private'
+          assert profile['privacy'] and all(value is False for value in profile['privacy'].values())
+          PY
