@@ -1,0 +1,94 @@
+multitenancy_enabled: true
+
+server:
+  http_listen_address: 0.0.0.0
+  http_listen_port: 3200
+  grpc_listen_address: 0.0.0.0
+  grpc_listen_port: 9095
+  log_level: info
+  log_format: json
+
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: 0.0.0.0:4317
+        http:
+          endpoint: 0.0.0.0:4318
+  log_received_spans:
+    enabled: false
+
+ingester:
+  trace_idle_period: 10s
+  max_block_duration: 5m
+  flush_check_period: 10s
+
+compactor:
+  compaction:
+    block_retention: 168h
+    compacted_block_retention: 1h
+    compaction_window: 1h
+    max_block_bytes: 107374182400
+
+storage:
+  trace:
+    backend: s3
+    wal:
+      path: /var/tempo/wal
+    local:
+      path: /var/tempo/blocks
+    s3:
+      bucket: ${TEMPO_S3_BUCKET}
+      endpoint: ${TEMPO_S3_ENDPOINT}
+      access_key: ${TEMPO_S3_ACCESS_KEY}
+      secret_key: ${TEMPO_S3_SECRET_KEY}
+      insecure: false
+      forcepathstyle: true
+
+metrics_generator:
+  registry:
+    external_labels:
+      source: tempo
+      environment: ${CODESTRA_ENVIRONMENT}
+  storage:
+    path: /var/tempo/generator/wal
+    remote_write:
+      - url: http://prometheus:9090/api/v1/write
+        send_exemplars: true
+  processor:
+    service_graphs:
+      dimensions:
+        - codestra_business
+        - application
+        - service
+        - environment
+        - deployment
+    span_metrics:
+      dimensions:
+        - codestra_business
+        - application
+        - service
+        - environment
+        - deployment
+        - http.method
+        - http.status_code
+    local_blocks:
+      filter_server_spans: false
+
+overrides:
+  defaults:
+    metrics_generator:
+      processors:
+        - service-graphs
+        - span-metrics
+        - local-blocks
+    ingestion:
+      rate_strategy: local
+      rate_limit_bytes: 15000000
+      burst_size_bytes: 20000000
+      max_traces_per_user: 100000
+      max_attribute_bytes: 4096
+
+usage_report:
+  reporting_enabled: false
