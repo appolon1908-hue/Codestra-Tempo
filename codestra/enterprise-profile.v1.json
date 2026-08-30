@@ -80,7 +80,10 @@
   ],
   "redaction": {
     "requiredBeforeIngestion": true,
-    "authorities": ["opentelemetry", "alloy"],
+    "authorities": [
+      "opentelemetry",
+      "alloy"
+    ],
     "forbiddenContent": [
       "authorization_headers",
       "cookies",
@@ -93,6 +96,16 @@
       "broker_or_exchange_signing_material",
       "customer_financial_payloads"
     ]
+  },
+  "privacy": {
+    "captureSecrets": false,
+    "captureAuthorizationHeaders": false,
+    "captureCookies": false,
+    "captureRawPii": false,
+    "captureRequestBodies": false,
+    "captureResponseBodies": false,
+    "captureDatabaseStatements": false,
+    "captureBrokerSigningMaterial": false
   },
   "sampling": {
     "authority": "opentelemetry",
@@ -131,10 +144,19 @@
     "selfMonitoring": true
   },
   "integrations": {
-    "ingestion": ["opentelemetry", "alloy"],
-    "query": ["grafana"],
-    "derivedMetrics": ["prometheus"],
-    "logCorrelation": ["loki"]
+    "ingestion": [
+      "opentelemetry",
+      "alloy"
+    ],
+    "query": [
+      "grafana"
+    ],
+    "derivedMetrics": [
+      "prometheus"
+    ],
+    "logCorrelation": [
+      "loki"
+    ]
   },
   "financialTradingBoundary": {
     "business": "beyvra",
