@@ -80,9 +80,11 @@ def validate_workflow(source: str) -> None:
         "actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
         "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065",
         "persist-credentials: false",
+        "fetch-depth: 0",
         "Bind vendored Git tree to exact official commit",
         "git rev-parse 'HEAD:upstream'",
         '[[ "$vendored_tree" == "$official_tree" ]]',
+        'git diff --check "$base_sha" "$GITHUB_SHA" -- . \':(exclude)upstream\'',
     )
     for token in required:
         if token not in source:
@@ -91,6 +93,8 @@ def validate_workflow(source: str) -> None:
         raise ValueError("mutable_action_reference")
     if re.search(r"pull_request:\s*\n\s+paths:", source):
         raise ValueError("pull_request_validation_must_be_unconditional")
+    if re.search(r"^\s*git diff --check\s*$", source, re.MULTILINE):
+        raise ValueError("whitespace_check_must_use_committed_range")
 
 
 def validate_gitmodules(source: str) -> None:
