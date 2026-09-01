@@ -71,6 +71,14 @@ class RepositorySecurityTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "pull_request_validation_must_be_unconditional"):
             VALIDATOR.validate_workflow(unsafe)
 
+    def test_root_gitmodule_maps_only_the_exact_upstream_gitlink(self) -> None:
+        source = (ROOT / ".gitmodules").read_text()
+        VALIDATOR.validate_gitmodules(source)
+        with self.assertRaisesRegex(ValueError, "root_gitmodule_mapping_drift"):
+            VALIDATOR.validate_gitmodules(
+                source.replace("open-telemetry/opentelemetry-proto", "example/drift")
+            )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -10,6 +10,10 @@ from pathlib import Path
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
+EXPECTED_GITMODULES = """[submodule \"upstream/opentelemetry-proto\"]
+\tpath = upstream/opentelemetry-proto
+\turl = https://github.com/open-telemetry/opentelemetry-proto
+"""
 
 
 def validate_upstream(source: dict, lock: dict) -> None:
@@ -89,12 +93,18 @@ def validate_workflow(source: str) -> None:
         raise ValueError("pull_request_validation_must_be_unconditional")
 
 
+def validate_gitmodules(source: str) -> None:
+    if source != EXPECTED_GITMODULES:
+        raise ValueError("root_gitmodule_mapping_drift")
+
+
 def validate_repository() -> None:
     source_path = ROOT / "CODESTRA_UPSTREAM.json"
     lock_path = ROOT / "CODESTRA_UPSTREAM_LOCK.json"
     sync_path = ROOT / ".github/workflows/upstream-source-sync.yml"
     workflow_path = ROOT / ".github/workflows/validate.yml"
-    for path in (source_path, lock_path, sync_path, workflow_path):
+    gitmodules_path = ROOT / ".gitmodules"
+    for path in (source_path, lock_path, sync_path, workflow_path, gitmodules_path):
         if not path.is_file() or path.is_symlink():
             raise ValueError(f"required_regular_file_missing:{path.relative_to(ROOT)}")
     source = json.loads(source_path.read_text())
@@ -105,6 +115,7 @@ def validate_repository() -> None:
     validate_sync(sync_source, yaml.safe_load(sync_source))
     yaml.safe_load(workflow_source)
     validate_workflow(workflow_source)
+    validate_gitmodules(gitmodules_path.read_text())
     if (ROOT / "upstream/.git").exists():
         raise ValueError("nested_upstream_git_metadata_forbidden")
 
