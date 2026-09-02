@@ -34,10 +34,10 @@ jobs:
     timeout-minutes: 35
     steps:
       - name: Check out exact head
-        uses: actions/checkout@v4
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
           python-version: '3.13'
 
@@ -57,12 +57,12 @@ jobs:
 
       - name: Render hardened Compose candidate
         env:
-          GO_BUILDER_IMAGE: golang:9.9@sha256:0000000000000000000000000000000000000000000000000000000000000000
-          TEMPO_BASE_IMAGE: grafana/tempo:99.0.0@sha256:1111111111111111111111111111111111111111111111111111111111111111
           CODESTRA_TEMPO_IMAGE: ghcr.io/appolon1908-hue/codestra-tempo:ci@sha256:2222222222222222222222222222222222222222222222222222222222222222
           CODESTRA_ENVIRONMENT: test
           CODESTRA_REGION: ci
           CODESTRA_DEPLOYMENT_ID: exact-head-ci
+          CODESTRA_SOURCE_SHA: 0000000000000000000000000000000000000000
+          CODESTRA_IMAGE_DIGEST: sha256:2222222222222222222222222222222222222222222222222222222222222222
           TEMPO_S3_ENDPOINT: s3.internal.example:443
           TEMPO_S3_BUCKET: codestra-tempo-ci
           TEMPO_S3_REGION: us-east-1
@@ -70,6 +70,8 @@ jobs:
           TEMPO_MEMCACHED_ADDRESSES: dns+memcached:11211
           TEMPO_PROMETHEUS_REMOTE_WRITE_URL: http://prometheus:9090/api/v1/write
           TEMPO_QUERY_HOST_PORT: '3200'
+          TEMPO_S3_CREDENTIALS_FILE: /tmp/tempo-s3-credentials
+          TEMPO_S3_CA_FILE: /tmp/tempo-s3-ca.pem
         run: |
           docker compose -f codestra/deploy/compose.candidate.yaml config > /tmp/codestra-tempo-compose.yaml
           test -s /tmp/codestra-tempo-compose.yaml
@@ -77,15 +79,14 @@ jobs:
           ! grep -Eq 'host_ip:[[:space:]]*(0\.0\.0\.0|::)|:latest([[:space:]]|$)|privileged: true|/var/run/docker\.sock' /tmp/codestra-tempo-compose.yaml
 
       - name: Set up Go from locked upstream source
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
         with:
           go-version-file: upstream/go.mod
           cache-dependency-path: upstream/go.sum
 
       - name: Compile and vet native readiness probe
         run: |
-          gofmt -w codestra/deploy/healthcheck.go
-          git diff --exit-code -- codestra/deploy/healthcheck.go
+          test -z "$(gofmt -d codestra/deploy/healthcheck.go)"
           go vet codestra/deploy/healthcheck.go
           CGO_ENABLED=0 go build -trimpath -o /tmp/tempo-healthcheck codestra/deploy/healthcheck.go
 

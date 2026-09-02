@@ -2,12 +2,6 @@ name: codestra-tempo
 
 services:
   tempo:
-    build:
-      context: ../..
-      dockerfile: codestra/deploy/Dockerfile
-      args:
-        GO_BUILDER_IMAGE: ${GO_BUILDER_IMAGE:?set an immutable Go builder image including sha256 digest}
-        TEMPO_BASE_IMAGE: ${TEMPO_BASE_IMAGE:?set an immutable official Tempo image including sha256 digest}
     image: ${CODESTRA_TEMPO_IMAGE:?set the immutable Codestra Tempo image reference including sha256 digest}
     command:
       - -config.file=/etc/tempo/tempo.yaml
@@ -22,6 +16,8 @@ services:
       CODESTRA_ENVIRONMENT: ${CODESTRA_ENVIRONMENT:?required}
       CODESTRA_REGION: ${CODESTRA_REGION:?required}
       CODESTRA_DEPLOYMENT_ID: ${CODESTRA_DEPLOYMENT_ID:?required}
+      CODESTRA_SOURCE_SHA: ${CODESTRA_SOURCE_SHA:?required protected source SHA}
+      CODESTRA_IMAGE_DIGEST: ${CODESTRA_IMAGE_DIGEST:?required sha256 image digest}
       TEMPO_S3_ENDPOINT: ${TEMPO_S3_ENDPOINT:?required}
       TEMPO_S3_BUCKET: ${TEMPO_S3_BUCKET:?required}
       TEMPO_S3_REGION: ${TEMPO_S3_REGION:-us-east-1}
@@ -98,8 +94,6 @@ volumes:
 
 secrets:
   tempo_s3_credentials:
-    external: true
-    name: ${TEMPO_S3_CREDENTIALS_SECRET_NAME:-tempo-s3-credentials}
+    file: ${TEMPO_S3_CREDENTIALS_FILE:?mount an OpenBao-rendered AWS shared-credentials file}
   tempo_s3_ca:
-    external: true
-    name: ${TEMPO_S3_CA_SECRET_NAME:-tempo-s3-ca}
+    file: ${TEMPO_S3_CA_FILE:?mount the approved private object-store CA bundle}
