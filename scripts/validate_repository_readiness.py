@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
 from pathlib import Path
 
 import yaml
@@ -51,6 +52,15 @@ def main() -> None:
     source_map = {"sourceAuthorityCommit": "upstream_commit", "sourceOfficialTreeSha": "official_tree_sha", "sourceImportedTreeSha": "imported_tree_sha"}
     for lock_key, upstream_key in source_map.items():
         if lock.get(lock_key) != upstream.get(upstream_key): fail(f"source tree mismatch: {lock_key}")
+    imported_tree = subprocess.run(
+        ["git", "rev-parse", "HEAD:upstream"],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    if imported_tree != upstream.get("imported_tree_sha"):
+        fail("vendored upstream tree differs from imported_tree_sha")
     source_authority = contract.get("sourceAuthority", {})
     if source_authority.get("upstreamCommit") != lock["sourceAuthorityCommit"] or source_authority.get("importedTreeSha") != lock["sourceImportedTreeSha"]:
         fail("source image contract mismatch")
