@@ -367,6 +367,11 @@ def validate_packaging() -> None:
         fail("Tempo must attach only to the observability network")
     if set(service.get("secrets", [])) != {"tempo_s3_credentials", "tempo_s3_ca"}:
         fail("Tempo external secret-file contract is incomplete")
+    top_level_secrets = compose.get("secrets", {})
+    if set(top_level_secrets) != {"tempo_s3_credentials", "tempo_s3_ca"}:
+        fail("Tempo top-level secret-file contract is incomplete")
+    if any("file" not in value or "external" in value for value in top_level_secrets.values()):
+        fail("Tempo credentials and trust must use mounted files")
     if service.get("healthcheck", {}).get("test") != ["CMD", "/tempo-healthcheck"]:
         fail("Tempo must use the native readiness probe")
 
@@ -382,9 +387,8 @@ def validate_packaging() -> None:
     image = str(service.get("image", ""))
     if "${CODESTRA_TEMPO_IMAGE:" not in image or "sha256" not in image:
         fail("Tempo runtime must require an immutable final image")
-    build_args = service.get("build", {}).get("args", {})
-    if set(build_args) != {"GO_BUILDER_IMAGE", "TEMPO_BASE_IMAGE"}:
-        fail("Tempo build must pin its builder and upstream base images")
+    if "build" in service:
+        fail("deployment candidate may not build on the target host")
     limits = service.get("deploy", {}).get("resources", {}).get("limits", {})
     for field in ("cpus", "memory", "pids"):
         if field not in limits:
@@ -396,12 +400,17 @@ def validate_packaging() -> None:
     for fragment in (
         "ARG GO_BUILDER_IMAGE",
         "ARG TEMPO_BASE_IMAGE",
+        "COPY upstream /src/upstream",
+        "-o /out/tempo",
+        "COPY --from=tempo-builder",
         "CGO_ENABLED=0",
         "-trimpath",
         "/tempo-healthcheck",
         "/etc/tempo/tempo.yaml",
         "/etc/tempo/overrides.yaml",
+        "CODESTRA_UPSTREAM_LOCK.json",
         "USER 10001:10001",
+        'ENTRYPOINT ["/tempo"]',
     ):
         if fragment not in dockerfile:
             fail(f"Tempo Dockerfile is missing {fragment}")
