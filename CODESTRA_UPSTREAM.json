@@ -4,7 +4,7 @@
   "codestra_repository": "appolon1908-hue/Codestra-Tempo",
   "upstream_repository": "grafana/tempo",
   "upstream_clone_url": "https://github.com/grafana/tempo.git",
-  "upstream_ref": "main",
+  "upstream_ref": "049347c455383b93cd8557760f18c1f269cccc2b",
   "import_path": "upstream",
   "import_mode": "shallow-source-snapshot",
   "preserve_upstream_license": true,
